@@ -1,0 +1,15 @@
+.git
+.DS_Store
+backend/bin
+backend/data
+frontend
+scripts
+**/*_test.go
+frontend/.next
+frontend/.next.bak-*
+frontend/node_modules
+frontend/playwright-report
+frontend/test-results
+frontend/coverage
+frontend/.tmp-tests
+frontend/.artifacts

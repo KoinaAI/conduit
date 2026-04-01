@@ -4,7 +4,6 @@ backend/bin
 backend/data
 frontend
 scripts
-**/*_test.go
 frontend/.next
 frontend/.next.bak-*
 frontend/node_modules

@@ -4,33 +4,42 @@
 
 ![Backend Tests](https://github.com/KoinaAI/conduit/actions/workflows/backend-tests.yml/badge.svg)
 
-`Conduit`, Chinese brand name `汇流`, is a self-hosted multi-protocol AI gateway backend. It consolidates OpenAI Compatible, OpenAI Responses, Anthropic Messages, Gemini, and account-based relay integrations such as NewAPI and OneHub into a single control plane and request plane with route mapping, usage extraction, billing, admin APIs, request history, and scheduled maintenance.
+`Conduit`, Chinese brand name `汇流`, is a self-hosted AI gateway focused primarily on personal use. Its main purpose is not to act as a shared team platform, but to let you choose between multiple upstream sources, protocols, and accounts from a single stable entrypoint, typically deployed on your own server for use across your own devices.
 
-This public repository contains the backend only. It does not include the frontend console, private operational scripts, or environment-specific assets.
+The current public repository prioritizes the backend, but the product itself is not intended to remain backend-only. The frontend console is still part of the overall project; it is simply not the first public artifact in this repository.
 
-## Project scope
+## Intended usage
 
-Conduit is designed for teams or individuals who need a unified AI gateway in front of multiple upstream providers and multiple wire protocols.
+Conduit is mainly designed for personal deployment scenarios such as:
 
-Typical use cases:
+- consolidating multiple upstream AI sources behind one endpoint
+- using the same gateway from laptops, phones, tablets, or remote shells
+- avoiding repeated switching between upstream Base URLs, API keys, and model names
+- exposing your own stable model aliases instead of upstream vendor identifiers
+- collecting unified usage, token, cost, and request history data
+- managing relay-style integrations that require sync or scheduled maintenance
 
-- exposing a single internal gateway instead of leaking upstream vendor details into application code
-- mapping multiple upstream models to stable public aliases
-- collecting unified token usage, request history, and cost accounting
-- separating management access keys from relay API keys
-- automating sync and maintenance flows for relay-style integrations
+## Feature overview
 
-## Core capabilities
+### Protocol compatibility
 
-### Gateway surfaces
+Conduit currently supports:
 
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `GET /v1/realtime`
-- `POST /v1/messages`
-- `POST /v1beta/models/{model}:generateContent`
-- `POST /v1beta/models/{model}:streamGenerateContent`
-- `GET /v1/models`
+- OpenAI Compatible `chat/completions`
+- OpenAI `responses`
+- OpenAI realtime
+- Anthropic `messages`
+- Gemini `generateContent`
+- Gemini `streamGenerateContent`
+- models listing
+
+### Routing and billing
+
+- alias-based route mapping
+- multiple upstream targets per alias
+- usage extraction from JSON, SSE, and WebSocket responses
+- local cost calculation through pricing profiles
+- request history and per-request attempt tracking
 
 ### Control plane
 
@@ -39,19 +48,16 @@ Typical use cases:
 - pricing profile management
 - integration management
 - gateway key management
-- request history inspection
 - active provider probes
-- OpenAPI document export
+- OpenAPI document output
 
-### Runtime behavior
+### Integration support
 
-- alias-to-target route mapping
-- protocol-aware route selection
-- usage extraction from JSON, SSE, and WebSocket responses
-- local billing calculation
-- request history and per-request upstream attempt recording
-- scheduled sync and check-in maintenance jobs
-- legacy JSON state import into SQLite
+- NewAPI integrations
+- OneHub integrations
+- separate management credentials and request credentials
+- sync workflows
+- scheduled check-in maintenance
 
 ## Repository layout
 
@@ -62,43 +68,62 @@ Typical use cases:
 - `.github/workflows/`
   GitHub Actions workflows. The repository runs backend unit tests on every `push` and `pull_request`.
 
-## Architecture overview
+## What the public repository contains
 
-Conduit is organized into three major layers:
+The current public repository includes:
+
+- core backend implementation
+- unit tests
+- Docker deployment assets
+- baseline project documentation
+
+The current public repository does not include:
+
+- private operational scripts
+- environment-specific sample data
+- real upstream credentials
+- the full public release of the frontend codebase
+
+That does not mean the frontend is abandoned. It only means the backend is being published first as the stable foundation.
+
+## Architecture
+
+Conduit is easiest to think of as three layers:
 
 1. Request plane
-   Exposes public compatibility endpoints such as `chat/completions`, `responses`, `messages`, Gemini generation endpoints, and realtime.
+   Exposes unified compatibility endpoints to clients.
 2. Control plane
-   Manages providers, routes, pricing profiles, integrations, gateway keys, and OpenAPI output.
-3. Persistence and background tasks
-   Stores configuration and request records in SQLite and executes scheduled maintenance tasks such as sync, check-in, and active probes.
+   Manages providers, routes, pricing profiles, integrations, and gateway keys.
+3. Persistence and background jobs
+   Stores runtime state in SQLite and runs scheduled sync, check-in, and probe tasks.
 
-Key implementation entry points:
+Key entry points:
 
-- application assembly and route wiring: `backend/internal/app/app.go`
-- environment configuration: `backend/internal/config/config.go`
-- admin API: `backend/internal/admin/handlers.go`
+- application assembly and route registration: `backend/internal/app/app.go`
+- admin API handlers: `backend/internal/admin/handlers.go`
 - gateway runtime: `backend/internal/gateway/`
-- integration sync and check-in logic: `backend/internal/integration/service.go`
+- integration sync and maintenance: `backend/internal/integration/service.go`
 - persistence layer: `backend/internal/store/store.go`
+- environment configuration: `backend/internal/config/config.go`
 
 ## Prerequisites
 
 ### Runtime dependencies
 
-- Go `1.24.x` for local development
-- Docker and Docker Compose for recommended deployment
+- Go `1.24.x`
+- Docker
+- Docker Compose
 
-### Network and security recommendations
+### Deployment recommendations
 
-- terminate TLS at a reverse proxy in production
-- always configure a strong `GATEWAY_ADMIN_TOKEN`
-- store the database on a dedicated persistent volume
-- place `/api/admin/*` behind an additional network boundary when exposed outside localhost
+- run Conduit on your own VPS or home server
+- put it behind a reverse proxy with HTTPS
+- store the SQLite database on a persistent volume
+- restrict `/api/admin/*` to your own devices or trusted networks
 
-## Quick start
+## Quick deployment
 
-### Option 1: Docker Compose
+### Docker Compose
 
 ```bash
 cd deploy
@@ -109,7 +134,7 @@ docker compose up --build -d
 
 Default port:
 
-- gateway endpoint: `http://127.0.0.1:18092`
+- `http://127.0.0.1:18092`
 
 Health check:
 
@@ -117,7 +142,7 @@ Health check:
 curl http://127.0.0.1:18092/healthz
 ```
 
-### Option 2: Run locally
+### Run locally
 
 ```bash
 cd backend
@@ -125,232 +150,92 @@ GATEWAY_ADMIN_TOKEN='replace-with-a-strong-admin-token' \
 go run ./cmd/gateway
 ```
 
-Default bind address:
+Default behavior:
 
-- `:8080`
+- bind address: `:8080`
+- state file: `./data/gateway.db`
 
-Default state path:
-
-- `./data/gateway.db`
-
-## Detailed deployment guide
+## Detailed deployment notes
 
 ### Environment variables
 
-The primary deployment variables exposed by `deploy/compose.yaml` are:
+Primary variables exposed through `deploy/compose.yaml`:
 
 - `GATEWAY_ADMIN_TOKEN`
-  Admin token for `/api/admin/*`. Accepted via `X-Admin-Token` or `Authorization: Bearer ...`.
+  Authentication token for admin routes.
 - `GATEWAY_BOOTSTRAP_GATEWAY_KEY`
-  Optional. Creates a bootstrap gateway key during startup.
+  Creates an initial gateway key at startup.
 - `GATEWAY_BIND`
-  Backend bind address. Default: `:8080`.
+  Backend bind address, default `:8080`.
 - `GATEWAY_STATE_PATH`
-  SQLite database location. Default: `/data/gateway.db`.
+  SQLite database path.
 - `GATEWAY_ENABLE_REALTIME`
-  Enables or disables `/v1/realtime`.
+  Enables or disables realtime support.
 - `GATEWAY_REQUEST_HISTORY`
-  Maximum retained request history entries.
+  Maximum retained request-history entries.
 - `GATEWAY_PROBE_INTERVAL_SECONDS`
-  Probe interval for scheduled provider health checks.
+  Provider probe interval in seconds.
 
-### Recommended production layout
+### Reverse proxy guidance
 
-1. run the backend with Docker Compose
-2. mount `/data` to persistent storage
-3. terminate TLS with Nginx, Caddy, or Traefik
-4. expose `/v1/*` to application clients
-5. restrict `/api/admin/*` to trusted operators
-6. back up `gateway.db` regularly
+If you expose Conduit publicly, place it behind Nginx, Caddy, or Traefik and follow these rules:
 
-### Reverse proxy notes
+- proxy `/v1/*` and `/healthz` to the backend
+- add extra access control for `/api/admin/*`
+- preserve long-lived connection settings for SSE and websocket traffic
+- always terminate TLS properly
 
-- proxy `/v1/*` and `/healthz` directly to the backend
-- avoid exposing `/api/admin/*` publicly without additional controls
-- preserve long-lived connections and upgrade headers for SSE and websocket traffic
+### Storage guidance
 
-## Usage guide
+Conduit currently uses SQLite for persistence. Recommended practices:
 
-### 1. Verify service health
+- store the database on durable storage
+- take regular backups
+- snapshot the database before upgrades
+- do not rely on container layers for long-term state
 
-```bash
-curl http://127.0.0.1:18092/healthz
-```
+## How to use it
 
-Expected response:
+A typical usage flow is:
 
-```json
-{"status":"ok"}
-```
+1. start the backend
+2. create providers or integrations through the admin surface
+3. configure routes and pricing profiles
+4. create gateway keys
+5. use Conduit as the single endpoint from your own clients and devices
 
-### 2. Inspect admin metadata
+For personal multi-device usage, a practical setup is:
 
-```bash
-curl \
-  -H 'X-Admin-Token: replace-with-a-strong-admin-token' \
-  http://127.0.0.1:18092/api/admin/meta
-```
+- run one Conduit instance on your server
+- issue separate gateway keys for different clients if needed
+- use your own model aliases everywhere
+- inspect request history when comparing usage across devices or tools
 
-### 3. Fetch the OpenAPI document
+## API documentation policy
 
-```bash
-curl \
-  -H 'X-Admin-Token: replace-with-a-strong-admin-token' \
-  http://127.0.0.1:18092/api/admin/openapi.json
-```
+This README intentionally does not duplicate the full API reference.
 
-### 4. Create a provider
+Detailed API information should come from:
 
-```bash
-curl -X POST \
-  -H 'Content-Type: application/json' \
-  -H 'X-Admin-Token: replace-with-a-strong-admin-token' \
-  http://127.0.0.1:18092/api/admin/providers \
-  -d '{
-    "id": "provider-primary",
-    "name": "Primary OpenAI-Compatible Provider",
-    "kind": "openai-compatible",
-    "base_url": "https://provider.example.com",
-    "api_key": "replace-with-provider-key",
-    "enabled": true,
-    "capabilities": ["openai.chat", "openai.responses"]
-  }'
-```
+- `/api/admin/openapi.json` on a running instance
+- source-level Go comments
+- route registration and handler implementations
 
-### 5. Create a pricing profile
+If you want to generate your own API reference or SDK, build it from the OpenAPI output and source comments rather than treating the README as a static API manual.
 
-```bash
-curl -X POST \
-  -H 'Content-Type: application/json' \
-  -H 'X-Admin-Token: replace-with-a-strong-admin-token' \
-  http://127.0.0.1:18092/api/admin/pricing-profiles \
-  -d '{
-    "id": "pricing-default",
-    "name": "Default Pricing",
-    "currency": "USD",
-    "input_per_million": 2.5,
-    "output_per_million": 10.0,
-    "cached_input_per_million": 0.5,
-    "reasoning_per_million": 0.0,
-    "request_flat": 0.0
-  }'
-```
+## Frontend note
 
-### 6. Create a route
+Conduit is not intended to remain a backend-focused release forever. The frontend console remains part of the overall product direction and is meant to provide a more convenient way to manage providers, routes, integrations, gateway keys, and history.
 
-```bash
-curl -X POST \
-  -H 'Content-Type: application/json' \
-  -H 'X-Admin-Token: replace-with-a-strong-admin-token' \
-  http://127.0.0.1:18092/api/admin/routes \
-  -d '{
-    "alias": "gpt-main",
-    "pricing_profile_id": "pricing-default",
-    "targets": [
-      {
-        "id": "target-primary",
-        "account_id": "provider-primary",
-        "upstream_model": "gpt-4.1",
-        "weight": 1,
-        "enabled": true,
-        "markup_multiplier": 1.2,
-        "protocols": ["openai.chat", "openai.responses"]
-      }
-    ]
-  }'
-```
+The backend is published first because:
 
-### 7. Create a gateway key
-
-```bash
-curl -X POST \
-  -H 'Content-Type: application/json' \
-  -H 'X-Admin-Token: replace-with-a-strong-admin-token' \
-  http://127.0.0.1:18092/api/admin/gateway-keys \
-  -d '{
-    "name": "client-key",
-    "allowed_models": ["gpt-main"],
-    "allowed_protocols": ["openai.chat", "openai.responses"],
-    "max_concurrency": 8,
-    "rate_limit_rpm": 300
-  }'
-```
-
-The response includes a plaintext `secret`. Use that value for client-side access to the request plane.
-
-### 8. Call the gateway
-
-```bash
-curl -X POST \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: replace-with-gateway-secret' \
-  http://127.0.0.1:18092/v1/chat/completions \
-  -d '{
-    "model": "gpt-main",
-    "messages": [
-      {"role": "user", "content": "hello"}
-    ]
-  }'
-```
-
-### 9. Inspect request history
-
-```bash
-curl \
-  -H 'X-Admin-Token: replace-with-a-strong-admin-token' \
-  http://127.0.0.1:18092/api/admin/request-history
-```
-
-### 10. Inspect upstream attempts for one request
-
-```bash
-curl \
-  -H 'X-Admin-Token: replace-with-a-strong-admin-token' \
-  http://127.0.0.1:18092/api/admin/request-history/{request_id}/attempts
-```
-
-## Integration guide
-
-Conduit can manage account-style relay platforms through the admin API. Supported integration kinds:
-
-- `newapi`
-- `onehub`
-
-Typical flow:
-
-1. create an integration
-2. trigger a sync or let the scheduler maintain it
-3. materialize the integration as a provider
-4. optionally auto-create routes
-5. attach pricing profiles for local billing
-
-For dual-credential integrations, Conduit supports:
-
-- `access_key` for management-side synchronization
-- `relay_api_key` for request-side provider traffic
-
-## Persistence model
-
-Conduit uses SQLite as its current persistence backend. Default locations:
-
-- local development: `./data/gateway.db`
-- Docker Compose: `/data/gateway.db`
-
-Persisted entities include:
-
-- providers
-- routes
-- pricing profiles
-- integrations
-- gateway keys
-- request history
-- request attempt records
-
-If a legacy JSON state file is detected, the service attempts to import it automatically and leaves a `*.legacy.json` backup.
+- it is the system foundation
+- protocol compatibility and persistence need to stabilize first
+- frontend work is still ongoing, not cancelled
 
 ## Development and testing
 
-### Run backend unit tests locally
+### Run unit tests locally
 
 ```bash
 cd backend
@@ -363,22 +248,24 @@ The repository includes a backend unit test workflow:
 
 - file: `.github/workflows/backend-tests.yml`
 - triggers: `push`, `pull_request`
-- job: runs `go test ./...` inside `backend/`
+- behavior: runs the full backend unit-test suite inside `backend/`
 
-## Operational recommendations
+## Security and operational notes
 
 - use a strong random `GATEWAY_ADMIN_TOKEN`
-- do not bake provider keys into images
-- back up `gateway.db` regularly
-- protect `/api/admin/*` behind a reverse proxy or network boundary
-- size `GATEWAY_REQUEST_HISTORY` according to your retention needs
-- correlate gateway logs, request history, and reverse-proxy logs during incident analysis
+- never commit real upstream credentials
+- protect the database file because it may contain sensitive runtime state
+- do not expose `/api/admin/*` directly to untrusted networks
+- review request history, probe results, and scheduler behavior regularly
 
-## Security notes
+## Version
 
-- the local state database may contain sensitive upstream credentials and must be handled as secret material
-- the plaintext gateway `secret` returned at creation time should only be distributed via a secure channel
-- this public repository contains only the generic backend implementation and excludes private operational assets or environment-specific material
+The current public milestone is `v0.1.0`, focused on:
+
+- establishing the backend structure
+- stabilizing protocol compatibility layers
+- stabilizing the persistence model
+- ensuring backend unit tests run continuously
 
 ## License
 

@@ -5,13 +5,21 @@ import (
 	"strconv"
 )
 
+// Config describes the runtime settings for a Conduit instance.
 type Config struct {
-	BindAddress          string
-	StatePath            string
-	AdminToken           string
-	EnableRealtime       bool
-	RequestHistory       int
-	BootstrapGatewayKey  string
+	// BindAddress controls the HTTP listen address for the gateway service.
+	BindAddress string
+	// StatePath is the SQLite database path used for persistent state.
+	StatePath string
+	// AdminToken protects the administrative API under /api/admin/*.
+	AdminToken string
+	// EnableRealtime toggles support for the realtime compatibility endpoint.
+	EnableRealtime bool
+	// RequestHistory controls how many request-history entries are retained.
+	RequestHistory int
+	// BootstrapGatewayKey creates an initial request-plane key at startup.
+	BootstrapGatewayKey string
+	// ProbeIntervalSeconds sets the background provider probe interval.
 	ProbeIntervalSeconds int
 }
 

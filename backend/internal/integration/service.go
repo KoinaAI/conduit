@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -15,12 +16,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/example/universal-ai-gateway/internal/model"
 )
 
 type Service struct {
-	client *http.Client
+	client               *http.Client
+	allowPrivateBaseURLs bool
 }
+
+type Option func(*Service)
 
 type SyncResult struct {
 	Snapshot   model.IntegrationSnapshot
@@ -40,9 +44,20 @@ type DailyCheckinResult struct {
 	Result        CheckinResult
 }
 
-func NewService() *Service {
-	return &Service{
+func NewService(options ...Option) *Service {
+	service := &Service{
 		client: &http.Client{Timeout: 20 * time.Second},
+	}
+	for _, option := range options {
+		option(service)
+	}
+	return service
+}
+
+// WithAllowPrivateBaseURLForTests relaxes SSRF protection for local tests only.
+func WithAllowPrivateBaseURLForTests() Option {
+	return func(service *Service) {
+		service.allowPrivateBaseURLs = true
 	}
 }
 
@@ -62,6 +77,11 @@ func (s *Service) CheckinState(ctx context.Context, state *model.State, integrat
 	}
 
 	return s.ApplyCheckinResult(state, integrationID, s.PrepareCheckin(ctx, integration))
+}
+
+// ValidateBaseURL rejects unsafe integration management endpoints.
+func (s *Service) ValidateBaseURL(baseURL string) error {
+	return s.validateBaseURL(baseURL)
 }
 
 func (s *Service) PrepareSync(ctx context.Context, integration model.Integration) SyncResult {
@@ -234,7 +254,7 @@ func buildProviderFromIntegration(integration model.Integration) model.Provider 
 			Headers: map[string]string{},
 		}},
 		CircuitBreaker: model.CircuitBreakerConfig{
-			Enabled:             true,
+			Enabled:             pointerBool(true),
 			FailureThreshold:    3,
 			CooldownSeconds:     60,
 			HalfOpenMaxRequests: 1,
@@ -459,6 +479,9 @@ func (s *Service) getEnvelope(ctx context.Context, baseURL, rawPath string, head
 }
 
 func (s *Service) postEnvelope(ctx context.Context, baseURL, rawPath string, headers map[string]string, body any) (map[string]any, error) {
+	if err := s.validateBaseURL(baseURL); err != nil {
+		return nil, err
+	}
 	reqURL, err := joinURL(baseURL, rawPath)
 	if err != nil {
 		return nil, err
@@ -501,6 +524,9 @@ func (s *Service) postEnvelope(ctx context.Context, baseURL, rawPath string, hea
 }
 
 func (s *Service) getRawJSON(ctx context.Context, baseURL, rawPath string, headers map[string]string) (map[string]any, error) {
+	if err := s.validateBaseURL(baseURL); err != nil {
+		return nil, err
+	}
 	reqURL, err := joinURL(baseURL, rawPath)
 	if err != nil {
 		return nil, err
@@ -629,10 +655,11 @@ func extractModelNames(payload map[string]any) []string {
 	queue := []queueItem{{value: payload}}
 	seen := map[string]bool{}
 	models := []string{}
+	head := 0
 
-	for len(queue) > 0 {
-		current := queue[0].value
-		queue = queue[1:]
+	for head < len(queue) {
+		current := queue[head].value
+		head++
 
 		switch value := current.(type) {
 		case map[string]any:
@@ -674,6 +701,42 @@ func extractModelNames(payload map[string]any) []string {
 
 	slices.Sort(models)
 	return models
+}
+
+func pointerBool(value bool) *bool {
+	v := value
+	return &v
+}
+
+func (s *Service) validateBaseURL(baseURL string) error {
+	if s.allowPrivateBaseURLs {
+		return nil
+	}
+
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return fmt.Errorf("invalid integration base_url: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("integration base_url must use http or https")
+	}
+
+	host := strings.TrimSpace(parsed.Hostname())
+	if host == "" {
+		return errors.New("integration base_url host is required")
+	}
+	lowerHost := strings.ToLower(host)
+	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") {
+		return errors.New("integration base_url must not target localhost")
+	}
+	if ip := net.ParseIP(host); ip != nil && blockedBaseURLIP(ip) {
+		return errors.New("integration base_url must not target private or local addresses")
+	}
+	return nil
+}
+
+func blockedBaseURLIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
 }
 
 func extractPricingHints(payload map[string]any) map[string]model.IntegrationPricing {

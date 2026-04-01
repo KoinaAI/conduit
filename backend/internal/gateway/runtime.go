@@ -1,11 +1,12 @@
 package gateway
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/example/universal-ai-gateway/internal/model"
 )
 
 type endpointRuntimeState struct {
@@ -130,7 +131,7 @@ func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int
 	endpoint.LastStatusCode = statusCode
 	endpoint.LastError = errMessage
 	endpoint.LastCheckedAt = now
-	if candidate.provider.CircuitBreaker.Enabled && endpoint.ConsecutiveFailures >= candidate.provider.CircuitBreaker.FailureThreshold {
+	if candidate.provider.CircuitBreaker.IsEnabled() && endpoint.ConsecutiveFailures >= candidate.provider.CircuitBreaker.FailureThreshold {
 		endpoint.OpenUntil = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second)
 	}
 
@@ -144,7 +145,10 @@ func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int
 }
 
 func (r *runtimeState) stickyKey(gatewayKeyID, alias, sessionID string) string {
-	return strings.ToLower(strings.TrimSpace(gatewayKeyID) + "|" + strings.TrimSpace(alias) + "|" + strings.TrimSpace(sessionID))
+	left := strings.ToLower(strings.TrimSpace(gatewayKeyID))
+	middle := strings.ToLower(strings.TrimSpace(alias))
+	right := strings.ToLower(strings.TrimSpace(sessionID))
+	return fmt.Sprintf("%d:%s\x00%d:%s\x00%d:%s", len(left), left, len(middle), middle, len(right), right)
 }
 
 func (r *runtimeState) stickyBindingFor(gatewayKeyID, alias, sessionID string, now time.Time) (stickyBinding, bool) {

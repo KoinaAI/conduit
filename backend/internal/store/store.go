@@ -14,7 +14,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/example/universal-ai-gateway/internal/model"
 )
 
 const (
@@ -162,7 +162,7 @@ func (s *FileStore) load(legacyState *model.State) error {
 			initial = legacyState.Clone()
 		}
 		initial.Normalize()
-		if err := s.persistConfigLocked(initial); err != nil {
+		if err := s.persistStateLocked(initial, true); err != nil {
 			return err
 		}
 		s.state = initial
@@ -254,7 +254,7 @@ func (s *FileStore) Update(fn func(*model.State) error) (model.State, error) {
 	}
 	next.UpdatedAt = time.Now().UTC()
 	next.Normalize()
-	if err := s.persistStateLocked(next, true); err != nil {
+	if err := s.persistConfigLocked(next); err != nil {
 		return model.State{}, err
 	}
 	s.state = next
@@ -263,10 +263,17 @@ func (s *FileStore) Update(fn func(*model.State) error) (model.State, error) {
 
 // Replace replaces the full snapshot.
 func (s *FileStore) Replace(next model.State) (model.State, error) {
-	return s.Update(func(state *model.State) error {
-		*state = next
-		return nil
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next = next.Clone()
+	next.UpdatedAt = time.Now().UTC()
+	next.Normalize()
+	if err := s.persistStateLocked(next, true); err != nil {
+		return model.State{}, err
+	}
+	s.state = next
+	return next.Clone(), nil
 }
 
 // AppendRequestRecord appends one request record and its upstream attempts.
@@ -353,9 +360,6 @@ func (s *FileStore) AppendRequestRecord(record model.RequestRecord, attempts []m
 	next.RequestHistory = model.TrimHistory(next.RequestHistory, maxItems)
 	next.UpdatedAt = time.Now().UTC()
 	next.Normalize()
-	if err = s.persistConfigLocked(next); err != nil {
-		return err
-	}
 	s.state = next
 	return nil
 }

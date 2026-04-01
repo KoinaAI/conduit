@@ -78,6 +78,7 @@ type Provider struct {
 	Kind                    ProviderKind         `json:"kind"`
 	BaseURL                 string               `json:"base_url"`
 	APIKey                  string               `json:"api_key"`
+	APIKeyPreview           string               `json:"api_key_preview,omitempty"`
 	Enabled                 bool                 `json:"enabled"`
 	Weight                  int                  `json:"weight"`
 	TimeoutSeconds          int                  `json:"timeout_seconds"`
@@ -113,21 +114,22 @@ type ProviderEndpoint struct {
 // credentials under one provider enables key cooldown and request-level
 // failover without duplicating the whole provider definition.
 type ProviderCredential struct {
-	ID      string            `json:"id"`
-	Label   string            `json:"label,omitempty"`
-	APIKey  string            `json:"api_key"`
-	Enabled bool              `json:"enabled"`
-	Weight  int               `json:"weight"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Notes   string            `json:"notes,omitempty"`
+	ID            string            `json:"id"`
+	Label         string            `json:"label,omitempty"`
+	APIKey        string            `json:"api_key"`
+	APIKeyPreview string            `json:"api_key_preview,omitempty"`
+	Enabled       bool              `json:"enabled"`
+	Weight        int               `json:"weight"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	Notes         string            `json:"notes,omitempty"`
 }
 
 // CircuitBreakerConfig controls passive endpoint protection on the hot path.
 type CircuitBreakerConfig struct {
-	Enabled             bool `json:"enabled"`
-	FailureThreshold    int  `json:"failure_threshold"`
-	CooldownSeconds     int  `json:"cooldown_seconds"`
-	HalfOpenMaxRequests int  `json:"half_open_max_requests"`
+	Enabled             *bool `json:"enabled,omitempty"`
+	FailureThreshold    int   `json:"failure_threshold"`
+	CooldownSeconds     int   `json:"cooldown_seconds"`
+	HalfOpenMaxRequests int   `json:"half_open_max_requests"`
 }
 
 // ModelRoute maps one public alias to one or more upstream targets.
@@ -170,7 +172,9 @@ type Integration struct {
 	BaseURL                 string              `json:"base_url"`
 	UserID                  string              `json:"user_id,omitempty"`
 	AccessKey               string              `json:"access_key"`
+	AccessKeyPreview        string              `json:"access_key_preview,omitempty"`
 	RelayAPIKey             string              `json:"relay_api_key,omitempty"`
+	RelayAPIKeyPreview      string              `json:"relay_api_key_preview,omitempty"`
 	Enabled                 bool                `json:"enabled"`
 	LinkedProviderID        string              `json:"linked_provider_id,omitempty"`
 	AutoCreateRoutes        bool                `json:"auto_create_routes"`
@@ -207,6 +211,7 @@ type GatewayKey struct {
 	ID               string     `json:"id"`
 	Name             string     `json:"name"`
 	SecretHash       string     `json:"-"`
+	SecretLookupHash string     `json:"secret_lookup_hash,omitempty"`
 	SecretPreview    string     `json:"secret_preview"`
 	Enabled          bool       `json:"enabled"`
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
@@ -354,8 +359,8 @@ func (s *State) Normalize() {
 		if p.CircuitBreaker.HalfOpenMaxRequests <= 0 {
 			p.CircuitBreaker.HalfOpenMaxRequests = 1
 		}
-		if !p.CircuitBreaker.Enabled {
-			p.CircuitBreaker.Enabled = true
+		if p.CircuitBreaker.Enabled == nil {
+			p.CircuitBreaker.Enabled = boolPointer(true)
 		}
 
 		if len(p.Endpoints) == 0 && strings.TrimSpace(p.BaseURL) != "" {
@@ -662,6 +667,7 @@ func TrimHistory(records []RequestRecord, maxItems int) []RequestRecord {
 func (p Provider) clone() Provider {
 	p.Capabilities = slices.Clone(p.Capabilities)
 	p.Headers = maps.Clone(p.Headers)
+	p.CircuitBreaker.Enabled = cloneBoolPointer(p.CircuitBreaker.Enabled)
 	endpoints := make([]ProviderEndpoint, len(p.Endpoints))
 	for i, endpoint := range p.Endpoints {
 		endpoint.Headers = maps.Clone(endpoint.Headers)
@@ -702,4 +708,21 @@ func (s IntegrationSnapshot) clone() IntegrationSnapshot {
 	s.ModelNames = slices.Clone(s.ModelNames)
 	s.Prices = maps.Clone(s.Prices)
 	return s
+}
+
+// IsEnabled reports whether the circuit breaker should actively trip.
+func (c CircuitBreakerConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+func boolPointer(value bool) *bool {
+	v := value
+	return &v
+}
+
+func cloneBoolPointer(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	return boolPointer(*value)
 }

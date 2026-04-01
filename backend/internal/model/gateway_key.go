@@ -2,7 +2,9 @@ package model
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -33,6 +35,17 @@ func VerifyGatewaySecret(hashedSecret, presentedSecret string) bool {
 		return false
 	}
 	return bcrypt.CompareHashAndPassword([]byte(hashedSecret), []byte(strings.TrimSpace(presentedSecret))) == nil
+}
+
+// GatewaySecretLookupHash returns a deterministic lookup digest for the secret.
+// It is used only to narrow candidate keys before the expensive bcrypt check.
+func GatewaySecretLookupHash(secret string) string {
+	trimmed := strings.TrimSpace(secret)
+	if trimmed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(sum[:])
 }
 
 // SecretPreview formats a short non-sensitive preview for the admin console.

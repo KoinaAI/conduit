@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/example/universal-ai-gateway/internal/model"
 )
 
 func TestServiceSyncStateNewAPI(t *testing.T) {
@@ -71,7 +71,7 @@ func TestServiceSyncStateNewAPI(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{
 		{
@@ -172,7 +172,7 @@ func TestServiceSyncStateOneHub(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{
 		{
@@ -236,7 +236,7 @@ func TestServiceSyncStateNewAPIFallsBackToRelayInventory(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{{
 		ID:               "integration-fallback",
@@ -322,7 +322,7 @@ func TestServicePrepareAndApplyDailyCheckins(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{
 		{
@@ -423,7 +423,7 @@ func TestServiceCheckinStateRecognizesCheckedInToday(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{{
 		ID:        "checked",
@@ -446,5 +446,26 @@ func TestServiceCheckinStateRecognizesCheckedInToday(t *testing.T) {
 	}
 	if integration.Snapshot.LastCheckinAt == nil {
 		t.Fatalf("expected checkin timestamp to be recorded")
+	}
+}
+
+func TestValidateBaseURLRejectsLocalAddresses(t *testing.T) {
+	t.Parallel()
+
+	service := NewService()
+	cases := []string{
+		"http://127.0.0.1:8080",
+		"http://localhost:8080",
+		"ftp://relay.example",
+	}
+
+	for _, baseURL := range cases {
+		if err := service.ValidateBaseURL(baseURL); err == nil {
+			t.Fatalf("expected %q to be rejected", baseURL)
+		}
+	}
+
+	if err := service.ValidateBaseURL("https://relay.example"); err != nil {
+		t.Fatalf("expected public https base URL to be allowed: %v", err)
 	}
 }

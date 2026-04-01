@@ -6,15 +6,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/KoinaAI/conduit/backend/internal/config"
-	"github.com/KoinaAI/conduit/backend/internal/integration"
-	"github.com/KoinaAI/conduit/backend/internal/model"
-	"github.com/KoinaAI/conduit/backend/internal/store"
+	"github.com/example/universal-ai-gateway/internal/config"
+	"github.com/example/universal-ai-gateway/internal/integration"
+	"github.com/example/universal-ai-gateway/internal/model"
+	"github.com/example/universal-ai-gateway/internal/store"
 )
 
 func TestRunCheckinsSkipsAlreadyCheckedInIntegrations(t *testing.T) {
@@ -66,7 +67,7 @@ func TestRunCheckinsSkipsAlreadyCheckedInIntegrations(t *testing.T) {
 		},
 	})
 
-	handlers := New(config.Config{}, fileStore, integration.NewService())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
 	handlers.RunCheckins(context.Background())
 	handlers.RunCheckins(context.Background())
 
@@ -84,6 +85,100 @@ func TestRunCheckinsSkipsAlreadyCheckedInIntegrations(t *testing.T) {
 	}
 	if saved.Integrations[0].Snapshot.LastError != "" {
 		t.Fatalf("expected no persisted error, got %q", saved.Integrations[0].Snapshot.LastError)
+	}
+}
+
+func TestGetStateRedactsSensitiveFields(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		Providers: []model.Provider{{
+			ID:      "provider-1",
+			Name:    "Provider",
+			Kind:    model.ProviderKindOpenAICompatible,
+			BaseURL: "https://provider.example",
+			APIKey:  "provider-secret-key",
+			Enabled: true,
+			Credentials: []model.ProviderCredential{{
+				ID:      "cred-1",
+				APIKey:  "credential-secret-key",
+				Enabled: true,
+			}},
+		}},
+		Integrations: []model.Integration{{
+			ID:          "integration-1",
+			Name:        "NewAPI",
+			Kind:        model.IntegrationKindNewAPI,
+			BaseURL:     "https://relay.example",
+			AccessKey:   "access-secret-key",
+			RelayAPIKey: "relay-secret-key",
+			Enabled:     true,
+		}},
+		GatewayKeys: []model.GatewayKey{{
+			ID:               "gk-1",
+			Name:             "gateway",
+			SecretLookupHash: "lookup-hash",
+			SecretPreview:    "uag-12...abcd",
+			Enabled:          true,
+		}},
+	})
+
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/state", nil)
+	recorder := httptest.NewRecorder()
+	handlers.GetState(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", recorder.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	providers := payload["providers"].([]any)
+	provider := providers[0].(map[string]any)
+	if got := provider["api_key"]; got != "" && got != nil {
+		t.Fatalf("expected provider api_key to be redacted, got %v", got)
+	}
+	if provider["api_key_preview"] == "" {
+		t.Fatalf("expected provider api_key preview, got %+v", provider)
+	}
+
+	integrations := payload["integrations"].([]any)
+	integrationPayload := integrations[0].(map[string]any)
+	if got := integrationPayload["access_key"]; got != "" && got != nil {
+		t.Fatalf("expected integration access_key to be redacted, got %v", got)
+	}
+	if got := integrationPayload["relay_api_key"]; got != "" && got != nil {
+		t.Fatalf("expected integration relay_api_key to be redacted, got %v", got)
+	}
+	if integrationPayload["access_key_preview"] == "" || integrationPayload["relay_api_key_preview"] == "" {
+		t.Fatalf("expected integration previews, got %+v", integrationPayload)
+	}
+
+	gatewayKeys := payload["gateway_keys"].([]any)
+	key := gatewayKeys[0].(map[string]any)
+	if _, ok := key["secret_lookup_hash"]; ok {
+		t.Fatalf("did not expect secret_lookup_hash in admin response: %+v", key)
+	}
+}
+
+func TestCreateGatewayKeyRejectsWeakCustomSecret(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/gateway-keys", strings.NewReader(`{"name":"weak","secret":"short"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.CreateGatewayKey(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for weak secret, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -127,7 +222,7 @@ func TestRunCheckinsPersistsCheckinErrors(t *testing.T) {
 		},
 	})
 
-	handlers := New(config.Config{}, fileStore, integration.NewService())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
 	handlers.RunCheckins(context.Background())
 
 	saved := fileStore.Snapshot()
@@ -193,7 +288,7 @@ func TestRunCheckinsDoesNotBlockSnapshotsWhileWaitingOnUpstream(t *testing.T) {
 		},
 	})
 
-	handlers := New(config.Config{}, fileStore, integration.NewService())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

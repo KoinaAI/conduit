@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,9 +14,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/KoinaAI/conduit/backend/internal/app"
-	"github.com/KoinaAI/conduit/backend/internal/config"
-	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/example/universal-ai-gateway/internal/app"
+	"github.com/example/universal-ai-gateway/internal/config"
+	"github.com/example/universal-ai-gateway/internal/model"
 )
 
 const testGatewaySecret = "test-gateway-secret"
@@ -102,9 +101,10 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 	geminiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		geminiRequests <- observedRequest{
-			Path:  r.URL.Path,
-			Query: r.URL.RawQuery,
-			Body:  string(body),
+			Path:   r.URL.Path,
+			Query:  r.URL.RawQuery,
+			APIKey: r.Header.Get("x-goog-api-key"),
+			Body:   string(body),
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"usageMetadata\":{\"promptTokenCount\":6,\"candidatesTokenCount\":8,\"totalTokenCount\":14}}\n\n"))
@@ -261,12 +261,11 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		if seen.Path != "/v1beta/models/gem-up:streamGenerateContent" {
 			t.Fatalf("unexpected upstream path: %s", seen.Path)
 		}
-		values, err := url.ParseQuery(seen.Query)
-		if err != nil {
-			t.Fatalf("parse query: %v", err)
+		if seen.APIKey != "gemini-key" {
+			t.Fatalf("expected gemini api key header, got: %s", seen.APIKey)
 		}
-		if values.Get("key") != "gemini-key" {
-			t.Fatalf("expected gemini key in query, got: %s", seen.Query)
+		if seen.Query != "" {
+			t.Fatalf("expected gemini request query to stay empty, got: %s", seen.Query)
 		}
 		if res.Trailer.Get("X-Gateway-Total-Tokens") != "14" {
 			t.Fatalf("expected gemini usage trailer, got %+v", res.Trailer)
@@ -294,6 +293,18 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		seen := <-openAIRequests
 		if !strings.Contains(seen.Query, "model=up-openai") {
 			t.Fatalf("expected rewritten realtime query: %s", seen.Query)
+		}
+	})
+
+	t.Run("realtime rejects disallowed browser origin", func(t *testing.T) {
+		wsURL := "ws" + strings.TrimPrefix(gatewayServer.URL, "http") + "/v1/realtime?model=gpt-5.4"
+		headers := http.Header{}
+		headers.Set("X-API-Key", testGatewaySecret)
+		headers.Set("Origin", "https://evil.example")
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
+		if err == nil {
+			conn.Close()
+			t.Fatal("expected websocket origin check to reject the request")
 		}
 	})
 

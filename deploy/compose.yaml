@@ -4,7 +4,7 @@ services:
       context: ..
       dockerfile: deploy/docker/backend.Dockerfile
     environment:
-      GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:-change-this-admin-token}
+      GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:-}
       GATEWAY_BOOTSTRAP_GATEWAY_KEY: ${GATEWAY_BOOTSTRAP_GATEWAY_KEY:-}
       GATEWAY_BIND: :8080
       GATEWAY_STATE_PATH: /data/gateway.db
@@ -15,6 +15,20 @@ services:
       - gateway-data:/data
     ports:
       - "${GATEWAY_BACKEND_PORT:-18092}:8080"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/docker/frontend.Dockerfile
+    environment:
+      GATEWAY_BASE_URL: ${GATEWAY_PUBLIC_BACKEND_URL:-https://api.synara.quest}
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    depends_on:
+      - backend
+    ports:
+      - "${GATEWAY_FRONTEND_PORT:-18093}:3000"
     restart: unless-stopped
 
 volumes:

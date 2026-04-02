@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"strings"
@@ -53,6 +54,11 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 		return model.GatewayKey{}, errUnauthorized
 	}
 	now := time.Now().UTC()
+	lookupHash := model.GatewaySecretLookupHash(secret, s.cfg.SecretLookupPepper())
+	legacyLookupHash := model.LegacyGatewaySecretLookupHash(secret)
+	legacyCandidates := make([]model.GatewayKey, 0, len(state.GatewayKeys))
+	fastCandidates := make([]model.GatewayKey, 0, 1)
+	legacyLookupCandidates := make([]model.GatewayKey, 0, 1)
 
 	for _, key := range state.GatewayKeys {
 		if !key.Enabled || key.IsExpired(now) {
@@ -64,6 +70,38 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 		if alias != "" && !key.AllowsModel(alias) {
 			continue
 		}
+		if key.SecretLookupHash == "" {
+			legacyCandidates = append(legacyCandidates, key)
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(lookupHash)) == 1 {
+			fastCandidates = append(fastCandidates, key)
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(legacyLookupHash)) == 1 {
+			legacyLookupCandidates = append(legacyLookupCandidates, key)
+		}
+	}
+
+	for _, key := range fastCandidates {
+		if !model.VerifyGatewaySecret(key.SecretHash, secret) {
+			continue
+		}
+		if err := s.runtime.acquireGatewayKey(key, now); err != nil {
+			return model.GatewayKey{}, err
+		}
+		return key, nil
+	}
+	for _, key := range legacyLookupCandidates {
+		if !model.VerifyGatewaySecret(key.SecretHash, secret) {
+			continue
+		}
+		if err := s.runtime.acquireGatewayKey(key, now); err != nil {
+			return model.GatewayKey{}, err
+		}
+		return key, nil
+	}
+	for _, key := range legacyCandidates {
 		if !model.VerifyGatewaySecret(key.SecretHash, secret) {
 			continue
 		}

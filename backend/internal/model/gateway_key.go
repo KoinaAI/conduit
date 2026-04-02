@@ -1,8 +1,11 @@
 package model
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -33,6 +36,33 @@ func VerifyGatewaySecret(hashedSecret, presentedSecret string) bool {
 		return false
 	}
 	return bcrypt.CompareHashAndPassword([]byte(hashedSecret), []byte(strings.TrimSpace(presentedSecret))) == nil
+}
+
+// GatewaySecretLookupHash returns a deterministic keyed lookup digest for the
+// secret. It is used only to narrow candidate keys before the expensive bcrypt
+// check.
+func GatewaySecretLookupHash(secret, pepper string) string {
+	trimmed := strings.TrimSpace(secret)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.TrimSpace(pepper) == "" {
+		return LegacyGatewaySecretLookupHash(trimmed)
+	}
+	mac := hmac.New(sha256.New, []byte(strings.TrimSpace(pepper)))
+	_, _ = mac.Write([]byte(trimmed))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// LegacyGatewaySecretLookupHash preserves the original unhasalted SHA-256
+// lookup digest for backwards-compatible key matching during upgrades.
+func LegacyGatewaySecretLookupHash(secret string) string {
+	trimmed := strings.TrimSpace(secret)
+	if trimmed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(sum[:])
 }
 
 // SecretPreview formats a short non-sensitive preview for the admin console.

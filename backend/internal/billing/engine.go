@@ -1,6 +1,10 @@
 package billing
 
-import "github.com/KoinaAI/conduit/backend/internal/model"
+import (
+	"math"
+
+	"github.com/KoinaAI/conduit/backend/internal/model"
+)
 
 func Calculate(profile model.PricingProfile, usage model.UsageSummary, multiplier float64, source string) model.BillingSummary {
 	if multiplier <= 0 {
@@ -34,8 +38,5 @@ func round(value float64) float64 {
 	if value == 0 {
 		return 0
 	}
-	if value > 0 {
-		return float64(int64(value*scale+0.5)) / scale
-	}
-	return float64(int64(value*scale-0.5)) / scale
+	return math.Round(value*scale) / scale
 }

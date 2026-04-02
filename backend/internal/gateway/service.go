@@ -184,7 +184,9 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			return
 		}
 		var finalCost float64
-		defer s.runtime.releaseGatewayKey(gatewayKey.ID, finalCost)
+		defer func() {
+			s.runtime.releaseGatewayKey(gatewayKey.ID, finalCost)
+		}()
 
 		candidates, _, pricing, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, gatewayKey.ID, parsedRequest.sessionID)
 		if err != nil {
@@ -283,8 +285,10 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 
 			observer := NewUsageObserver(protocol)
 			setBillingTrailers(w.Header())
-			if err := s.writeProxyResponse(w, resp, observer, exchange, parsedRequest.routeAlias); err != nil {
-				lastErr = err
+			writeErr := s.writeProxyResponse(w, resp, observer, exchange, parsedRequest.routeAlias)
+			_ = resp.Body.Close()
+			if writeErr != nil {
+				lastErr = writeErr
 				lastStatusCode = http.StatusBadGateway
 				attempts = append(attempts, model.RequestAttemptRecord{
 					RequestID:     record.ID,
@@ -300,12 +304,11 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 					Decision:      "abort",
 					StartedAt:     attemptStarted,
 					DurationMS:    time.Since(attemptStarted).Milliseconds(),
-					Error:         err.Error(),
+					Error:         writeErr.Error(),
 				})
-				s.runtime.reportFailure(candidate, resp.StatusCode, err.Error())
+				s.runtime.reportFailure(candidate, resp.StatusCode, writeErr.Error())
 				break
 			}
-			_ = resp.Body.Close()
 
 			record.DurationMS = time.Since(started).Milliseconds()
 			record.Usage = observer.Summary()
@@ -342,6 +345,9 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			record.Error = lastErr.Error()
 		}
 		s.appendRecord(record, attempts)
+		if responseWriteStarted(lastErr) {
+			return
+		}
 		writeError(w, http.StatusBadGateway, record.Error)
 	}
 }
@@ -360,7 +366,10 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		writeGatewayAuthError(w, err)
 		return
 	}
-	defer s.runtime.releaseGatewayKey(gatewayKey.ID, 0)
+	var finalCost float64
+	defer func() {
+		s.runtime.releaseGatewayKey(gatewayKey.ID, finalCost)
+	}()
 
 	candidates, _, pricing, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, gatewayKey.ID, "")
 	if err != nil {
@@ -387,7 +396,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	query.Set("model", effectiveUpstreamModel(candidate))
 	upstreamURL.RawQuery = query.Encode()
 
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upgrader := websocket.Upgrader{CheckOrigin: s.allowRealtimeOrigin}
 	clientConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -437,6 +446,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	record.DurationMS = time.Since(started).Milliseconds()
 	record.Usage = observer.Summary()
 	record.Billing = billing.Calculate(pricing, record.Usage, candidate.multiplier, pricing.Name)
+	finalCost = record.Billing.FinalCost
 	if err != nil && !isNormalClose(err) {
 		record.Error = err.Error()
 	}
@@ -485,11 +495,6 @@ func (s *Service) doProxyRequest(ctx context.Context, candidate resolvedCandidat
 	}
 	for key, value := range candidate.credential.Headers {
 		req.Header.Set(key, value)
-	}
-	if candidate.provider.Kind == model.ProviderKindGemini {
-		query := req.URL.Query()
-		query.Set("key", candidate.credential.APIKey)
-		req.URL.RawQuery = query.Encode()
 	}
 	req.Header.Del("Content-Length")
 	req.ContentLength = int64(len(exchange.Body))
@@ -757,11 +762,6 @@ func (s *Service) newProbeRequest(ctx context.Context, provider model.Provider, 
 	}
 	for key, value := range credential.Headers {
 		req.Header.Set(key, value)
-	}
-	if provider.Kind == model.ProviderKindGemini {
-		query := req.URL.Query()
-		query.Set("key", credential.APIKey)
-		req.URL.RawQuery = query.Encode()
 	}
 	return req, nil
 }
@@ -1066,8 +1066,14 @@ func isNormalClose(err error) bool {
 }
 
 func routeAliasTimestamp(alias string) int64 {
-	if alias == "" {
-		return time.Now().Unix()
+	const modelListEpochUnix = 1_775_001_600
+	return modelListEpochUnix
+}
+
+func (s *Service) allowRealtimeOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
 	}
-	return int64(len(alias))
+	return s.cfg.AllowsRealtimeOrigin(origin)
 }

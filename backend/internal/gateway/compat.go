@@ -8,9 +8,27 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/model"
 )
+
+type proxyResponseWriteError struct {
+	err error
+}
+
+func (e proxyResponseWriteError) Error() string {
+	return e.err.Error()
+}
+
+func (e proxyResponseWriteError) Unwrap() error {
+	return e.err
+}
+
+func responseWriteStarted(err error) bool {
+	var writeErr proxyResponseWriteError
+	return errors.As(err, &writeErr)
+}
 
 func prepareUpstreamExchange(protocol model.Protocol, providerKind model.ProviderKind, currentPath string, request parsedProxyRequest, upstreamModel string) (upstreamExchange, error) {
 	switch protocol {
@@ -330,18 +348,26 @@ func flattenGeminiParts(value any) string {
 func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string) error {
 	switch exchange.ResponseMode {
 	case responseModePassthrough:
-		copyResponseHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-			return copyStreamingResponse(w, resp.Body, observer)
+			clearWriteDeadline(w)
+			copyResponseHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			if err := copyStreamingResponse(w, resp.Body, observer); err != nil {
+				return proxyResponseWriteError{err: err}
+			}
+			return nil
 		}
 		payload, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
 		}
 		observer.ObserveJSON(payload)
-		_, err = w.Write(payload)
-		return err
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if _, err = w.Write(payload); err != nil {
+			return proxyResponseWriteError{err: err}
+		}
+		return nil
 	case responseModeAnthropicJSON:
 		return writeAnthropicJSON(w, resp, observer, publicAlias)
 	case responseModeAnthropicSSE:
@@ -381,10 +407,14 @@ func writeAnthropicJSON(w http.ResponseWriter, resp *http.Response, observer *Us
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	return json.NewEncoder(w).Encode(body)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		return proxyResponseWriteError{err: err}
+	}
+	return nil
 }
 
 func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string) error {
+	clearWriteDeadline(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -438,7 +468,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 								"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
 							},
 						}); err != nil {
-							return err
+							return proxyResponseWriteError{err: err}
 						}
 						messageStarted = true
 						flush()
@@ -451,7 +481,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 								"index":         0,
 								"content_block": map[string]any{"type": "text", "text": ""},
 							}); err != nil {
-								return err
+								return proxyResponseWriteError{err: err}
 							}
 							contentStarted = true
 						}
@@ -460,7 +490,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 							"index": 0,
 							"delta": map[string]any{"type": "text_delta", "text": deltaText},
 						}); err != nil {
-							return err
+							return proxyResponseWriteError{err: err}
 						}
 						flush()
 					}
@@ -474,7 +504,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return err
+			return proxyResponseWriteError{err: err}
 		}
 	}
 
@@ -492,7 +522,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
 			},
 		}); err != nil {
-			return err
+			return proxyResponseWriteError{err: err}
 		}
 	}
 	if contentStarted {
@@ -500,7 +530,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 			"type":  "content_block_stop",
 			"index": 0,
 		}); err != nil {
-			return err
+			return proxyResponseWriteError{err: err}
 		}
 	}
 	usage := observer.Summary()
@@ -514,10 +544,10 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 			"output_tokens": usage.OutputTokens,
 		},
 	}); err != nil {
-		return err
+		return proxyResponseWriteError{err: err}
 	}
 	if err := writeSSEEvent(w, "message_stop", map[string]any{"type": "message_stop"}); err != nil {
-		return err
+		return proxyResponseWriteError{err: err}
 	}
 	flush()
 	return nil
@@ -549,10 +579,14 @@ func writeGeminiJSON(w http.ResponseWriter, resp *http.Response, observer *Usage
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	return json.NewEncoder(w).Encode(body)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		return proxyResponseWriteError{err: err}
+	}
+	return nil
 }
 
 func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string) error {
+	clearWriteDeadline(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -602,7 +636,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 								},
 							},
 						}); err != nil {
-							return err
+							return proxyResponseWriteError{err: err}
 						}
 						flush()
 					}
@@ -613,7 +647,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return err
+			return proxyResponseWriteError{err: err}
 		}
 	}
 
@@ -628,7 +662,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 		"usageMetadata": usageSummaryMap(observer.Summary()),
 		"modelVersion":  publicAlias,
 	}); err != nil {
-		return err
+		return proxyResponseWriteError{err: err}
 	}
 	flush()
 	return nil
@@ -659,6 +693,11 @@ func writeSSEData(w http.ResponseWriter, payload any) error {
 		return err
 	}
 	return nil
+}
+
+func clearWriteDeadline(w http.ResponseWriter) {
+	controller := http.NewResponseController(w)
+	_ = controller.SetWriteDeadline(time.Time{})
 }
 
 func fallbackID(value, prefix string) string {

@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,7 +72,7 @@ func TestServiceSyncStateNewAPI(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{
 		{
@@ -172,7 +173,7 @@ func TestServiceSyncStateOneHub(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{
 		{
@@ -236,7 +237,7 @@ func TestServiceSyncStateNewAPIFallsBackToRelayInventory(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{{
 		ID:               "integration-fallback",
@@ -322,7 +323,7 @@ func TestServicePrepareAndApplyDailyCheckins(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{
 		{
@@ -423,7 +424,7 @@ func TestServiceCheckinStateRecognizesCheckedInToday(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService()
+	service := NewService(WithAllowPrivateBaseURLForTests())
 	state := model.DefaultState()
 	state.Integrations = []model.Integration{{
 		ID:        "checked",
@@ -446,5 +447,37 @@ func TestServiceCheckinStateRecognizesCheckedInToday(t *testing.T) {
 	}
 	if integration.Snapshot.LastCheckinAt == nil {
 		t.Fatalf("expected checkin timestamp to be recorded")
+	}
+}
+
+func TestValidateBaseURLRejectsLocalAddresses(t *testing.T) {
+	t.Parallel()
+
+	service := NewService()
+	service.lookupIPs = func(_ context.Context, _, host string) ([]net.IP, error) {
+		switch host {
+		case "relay.example":
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		case "internal.example":
+			return []net.IP{net.ParseIP("10.0.0.5")}, nil
+		default:
+			return nil, nil
+		}
+	}
+	cases := []string{
+		"http://127.0.0.1:8080",
+		"http://localhost:8080",
+		"https://internal.example",
+		"ftp://relay.example",
+	}
+
+	for _, baseURL := range cases {
+		if err := service.ValidateBaseURL(baseURL); err == nil {
+			t.Fatalf("expected %q to be rejected", baseURL)
+		}
+	}
+
+	if err := service.ValidateBaseURL("https://relay.example"); err != nil {
+		t.Fatalf("expected public https base URL to be allowed: %v", err)
 	}
 }

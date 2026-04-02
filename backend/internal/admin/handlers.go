@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -678,7 +679,7 @@ func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		Name             *string          `json:"name"`
 		Secret           *string          `json:"secret"`
 		Enabled          *bool            `json:"enabled"`
-		ExpiresAt        *time.Time       `json:"expires_at"`
+		ExpiresAt        json.RawMessage  `json:"expires_at"`
 		AllowedModels    []string         `json:"allowed_models"`
 		AllowedProtocols []model.Protocol `json:"allowed_protocols"`
 		MaxConcurrency   *int             `json:"max_concurrency"`
@@ -705,8 +706,15 @@ func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
 				current.Enabled = *payload.Enabled
 			}
 			if payload.ExpiresAt != nil {
-				expiresAt := *payload.ExpiresAt
-				current.ExpiresAt = &expiresAt
+				if bytes.Equal(bytes.TrimSpace(payload.ExpiresAt), []byte("null")) {
+					current.ExpiresAt = nil
+				} else {
+					var expiresAt time.Time
+					if err := json.Unmarshal(payload.ExpiresAt, &expiresAt); err != nil {
+						return errValidation("expires_at must be a valid RFC3339 timestamp or null")
+					}
+					current.ExpiresAt = &expiresAt
+				}
 			}
 			if payload.AllowedModels != nil {
 				current.AllowedModels = payload.AllowedModels
@@ -1185,17 +1193,24 @@ func removeGatewayKeyModelReferences(keys []model.GatewayKey, aliases map[string
 	if len(aliases) == 0 {
 		return
 	}
+	updatedAt := time.Now().UTC()
 	for keyIndex := range keys {
 		if len(keys[keyIndex].AllowedModels) == 0 {
 			continue
 		}
-		filtered := keys[keyIndex].AllowedModels[:0]
-		for _, alias := range keys[keyIndex].AllowedModels {
+		original := keys[keyIndex].AllowedModels
+		filtered := original[:0]
+		removedAny := false
+		for _, alias := range original {
 			if _, removed := aliases[strings.ToLower(strings.TrimSpace(alias))]; removed {
+				removedAny = true
 				continue
 			}
 			filtered = append(filtered, alias)
 		}
-		keys[keyIndex].AllowedModels = slices.Clone(filtered)
+		if removedAny {
+			keys[keyIndex].AllowedModels = slices.Clone(filtered)
+			keys[keyIndex].UpdatedAt = updatedAt
+		}
 	}
 }

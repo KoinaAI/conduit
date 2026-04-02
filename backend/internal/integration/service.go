@@ -24,6 +24,8 @@ type Service struct {
 	transport            *http.Transport
 	allowPrivateBaseURLs bool
 	lookupIPs            func(context.Context, string, string) ([]net.IP, error)
+	pinnedClientsMu      sync.Mutex
+	pinnedClients        map[string]*http.Client
 }
 
 type resolvedBaseURL struct {
@@ -54,9 +56,10 @@ type DailyCheckinResult struct {
 func NewService(options ...Option) *Service {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	service := &Service{
-		client:    &http.Client{Timeout: 20 * time.Second, Transport: transport},
-		transport: transport,
-		lookupIPs: net.DefaultResolver.LookupIP,
+		client:        &http.Client{Timeout: 20 * time.Second, Transport: transport},
+		transport:     transport,
+		lookupIPs:     net.DefaultResolver.LookupIP,
+		pinnedClients: map[string]*http.Client{},
 	}
 	for _, option := range options {
 		option(service)
@@ -528,26 +531,7 @@ func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath st
 	}
 	applyHeaders(req.Header, headers)
 
-	client := s.client
-	if resolved.DialAddress != "" {
-		transport := s.transport
-		if transport == nil {
-			transport = http.DefaultTransport.(*http.Transport).Clone()
-		} else {
-			transport = transport.Clone()
-		}
-		dialAddress := resolved.DialAddress
-		transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-			var dialer net.Dialer
-			return dialer.DialContext(ctx, network, dialAddress)
-		}
-		client = &http.Client{
-			Timeout:   s.client.Timeout,
-			Transport: transport,
-		}
-	}
-
-	resp, err := client.Do(req)
+	resp, err := s.clientForResolved(resolved).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -569,6 +553,42 @@ func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath st
 		return nil, errors.New(readString(payload, "message"))
 	}
 	return payload, nil
+}
+
+func (s *Service) clientForResolved(resolved resolvedBaseURL) *http.Client {
+	dialAddress := strings.TrimSpace(resolved.DialAddress)
+	if dialAddress == "" {
+		return s.client
+	}
+
+	s.pinnedClientsMu.Lock()
+	defer s.pinnedClientsMu.Unlock()
+
+	if client := s.pinnedClients[dialAddress]; client != nil {
+		return client
+	}
+
+	baseTransport := s.transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
+	} else {
+		baseTransport = baseTransport.Clone()
+	}
+	baseTransport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, dialAddress)
+	}
+
+	timeout := 20 * time.Second
+	if s.client != nil && s.client.Timeout > 0 {
+		timeout = s.client.Timeout
+	}
+	client := &http.Client{
+		Timeout:   timeout,
+		Transport: baseTransport,
+	}
+	s.pinnedClients[dialAddress] = client
+	return client
 }
 
 func applyHeaders(dst http.Header, values map[string]string) {

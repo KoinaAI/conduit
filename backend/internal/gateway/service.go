@@ -575,11 +575,6 @@ func (s *Service) RunProbes(ctx context.Context) map[string]any {
 			if err != nil {
 				result["status"] = "down"
 				result["error"] = err.Error()
-				s.runtime.reportFailure(resolvedCandidate{
-					provider:   provider,
-					endpoint:   endpoint,
-					credential: credential,
-				}, 0, err.Error(), 0)
 				results = append(results, result)
 				continue
 			}
@@ -588,18 +583,8 @@ func (s *Service) RunProbes(ctx context.Context) map[string]any {
 			_ = resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				result["status"] = "ok"
-				s.runtime.reportSuccess(resolvedCandidate{
-					provider:   provider,
-					endpoint:   endpoint,
-					credential: credential,
-				}, time.Since(started))
 			} else {
 				result["status"] = "degraded"
-				s.runtime.reportFailure(resolvedCandidate{
-					provider:   provider,
-					endpoint:   endpoint,
-					credential: credential,
-				}, resp.StatusCode, "probe returned non-success status", parseRetryAfter(resp.Header))
 			}
 			results = append(results, result)
 		}

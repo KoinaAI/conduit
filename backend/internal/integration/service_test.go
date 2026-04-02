@@ -176,6 +176,32 @@ func TestApplySyncResultPreservesCheckinMetadata(t *testing.T) {
 	}
 }
 
+func TestClientForResolvedReusesPinnedClient(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(WithAllowPrivateBaseURLForTests())
+	resolved := resolvedBaseURL{
+		BaseURL:     "https://relay.example",
+		DialAddress: "203.0.113.10:443",
+	}
+
+	first := service.clientForResolved(resolved)
+	second := service.clientForResolved(resolved)
+
+	if first == nil || second == nil {
+		t.Fatal("expected pinned clients to be created")
+	}
+	if first != second {
+		t.Fatal("expected pinned client to be reused for the same dial address")
+	}
+	if first == service.client {
+		t.Fatal("expected pinned client to be distinct from the shared base client")
+	}
+	if got := len(service.pinnedClients); got != 1 {
+		t.Fatalf("expected exactly one cached pinned client, got %d", got)
+	}
+}
+
 func TestServiceSyncStateOneHub(t *testing.T) {
 	t.Parallel()
 

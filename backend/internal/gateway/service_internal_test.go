@@ -1,13 +1,17 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 func TestParseAndRewriteJSONProxyRequest(t *testing.T) {
@@ -162,4 +166,93 @@ func TestRuntimeStickySweepRemovesExpiredEntries(t *testing.T) {
 	if _, ok := runtime.sticky["expired"]; ok {
 		t.Fatalf("expected expired sticky entry to be swept")
 	}
+}
+
+func TestRunProbesDoesNotMutateLiveRuntimeState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/models" {
+				t.Fatalf("unexpected probe path: %s", r.URL.Path)
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		service := newProbeTestService(t, model.ProviderKindOpenAICompatible, server.URL)
+		result := service.RunProbes(context.Background())
+		if len(result["results"].([]map[string]any)) != 1 {
+			t.Fatalf("expected one probe result, got %+v", result)
+		}
+
+		service.runtime.mu.Lock()
+		defer service.runtime.mu.Unlock()
+		if len(service.runtime.endpoints) != 0 {
+			t.Fatalf("expected probe success to avoid live endpoint mutations, got %+v", service.runtime.endpoints)
+		}
+		if len(service.runtime.credentials) != 0 {
+			t.Fatalf("expected probe success to avoid live credential mutations, got %+v", service.runtime.credentials)
+		}
+		if len(service.runtime.sticky) != 0 {
+			t.Fatalf("expected probe success to avoid sticky mutations, got %+v", service.runtime.sticky)
+		}
+	})
+
+	t.Run("auth failure", func(t *testing.T) {
+		t.Parallel()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}))
+		defer server.Close()
+
+		service := newProbeTestService(t, model.ProviderKindOpenAICompatible, server.URL)
+		result := service.RunProbes(context.Background())
+		if len(result["results"].([]map[string]any)) != 1 {
+			t.Fatalf("expected one probe result, got %+v", result)
+		}
+
+		service.runtime.mu.Lock()
+		defer service.runtime.mu.Unlock()
+		if len(service.runtime.credentials) != 0 {
+			t.Fatalf("expected probe auth failure to avoid disabling live credentials, got %+v", service.runtime.credentials)
+		}
+		if len(service.runtime.endpoints) != 0 {
+			t.Fatalf("expected probe auth failure to avoid tripping live endpoint state, got %+v", service.runtime.endpoints)
+		}
+	})
+}
+
+func newProbeTestService(t *testing.T, kind model.ProviderKind, baseURL string) *Service {
+	t.Helper()
+
+	fileStore, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	state := model.DefaultState()
+	state.Providers = []model.Provider{{
+		ID:      "provider-1",
+		Name:    "Provider 1",
+		Kind:    kind,
+		Enabled: true,
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-1",
+			BaseURL: baseURL,
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-1",
+			APIKey:  "provider-key",
+			Enabled: true,
+		}},
+	}}
+	if _, err := fileStore.Replace(state); err != nil {
+		t.Fatalf("replace state: %v", err)
+	}
+
+	return NewService(config.Config{}, fileStore)
 }

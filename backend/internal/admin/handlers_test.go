@@ -230,6 +230,7 @@ func TestCreateRouteRejectsDuplicateAliasCaseInsensitive(t *testing.T) {
 func TestDeleteProviderPrunesEmptyRoutesAndGatewayKeyReferences(t *testing.T) {
 	t.Parallel()
 
+	updatedAt := time.Date(2026, time.April, 1, 8, 0, 0, 0, time.UTC)
 	fileStore := openTestStore(t, model.State{
 		Version: "2026-04-01",
 		Providers: []model.Provider{{
@@ -267,6 +268,7 @@ func TestDeleteProviderPrunesEmptyRoutesAndGatewayKeyReferences(t *testing.T) {
 			Name:          "gateway",
 			Enabled:       true,
 			AllowedModels: []string{"gpt-5.4", "claude-3.7"},
+			UpdatedAt:     updatedAt,
 		}},
 	})
 	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
@@ -290,6 +292,9 @@ func TestDeleteProviderPrunesEmptyRoutesAndGatewayKeyReferences(t *testing.T) {
 	}
 	if len(key.AllowedModels) != 1 || key.AllowedModels[0] != "claude-3.7" {
 		t.Fatalf("expected deleted route alias to be removed from gateway key references, got %+v", key.AllowedModels)
+	}
+	if !key.UpdatedAt.After(updatedAt) {
+		t.Fatalf("expected gateway key updated_at to advance after allowed model pruning, got %s", key.UpdatedAt)
 	}
 }
 
@@ -353,6 +358,46 @@ func TestUpdateGatewayKeyRotatesSecretAndEditableFields(t *testing.T) {
 	}
 	if key.SecretLookupHash == "" {
 		t.Fatalf("expected lookup hash to be populated")
+	}
+}
+
+func TestUpdateGatewayKeyClearsExpiresAtWhenNull(t *testing.T) {
+	t.Parallel()
+
+	hash, err := model.HashGatewaySecret("original-secret-123")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	expiresAt := time.Date(2026, time.April, 10, 12, 0, 0, 0, time.UTC)
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:         "gk-1",
+			Name:       "expiring",
+			SecretHash: hash,
+			Enabled:    true,
+			ExpiresAt:  &expiresAt,
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/gateway-keys/gk-1", strings.NewReader(`{"expires_at":null}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("id", "gk-1")
+	recorder := httptest.NewRecorder()
+	handlers.UpdateGatewayKey(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected ok, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	key, ok := saved.FindGatewayKey("gk-1")
+	if !ok {
+		t.Fatal("expected updated gateway key")
+	}
+	if key.ExpiresAt != nil {
+		t.Fatalf("expected expires_at to be cleared, got %v", *key.ExpiresAt)
 	}
 }
 

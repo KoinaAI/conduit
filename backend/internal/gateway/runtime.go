@@ -9,6 +9,11 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
+const (
+	defaultStickySweepInterval = 64
+	defaultRetryAfterCooldown  = 2 * time.Minute
+)
+
 type endpointRuntimeState struct {
 	LastLatencyMS       int64
 	ConsecutiveFailures int
@@ -19,7 +24,8 @@ type endpointRuntimeState struct {
 }
 
 type credentialRuntimeState struct {
-	CooldownUntil       time.Time
+	DisabledUntil       time.Time
+	PermanentlyDisabled bool
 	ConsecutiveFailures int
 	LastStatusCode      int
 	LastError           string
@@ -41,11 +47,12 @@ type gatewayKeyWindow struct {
 }
 
 type runtimeState struct {
-	mu          sync.Mutex
-	endpoints   map[string]*endpointRuntimeState
-	credentials map[string]*credentialRuntimeState
-	sticky      map[string]stickyBinding
-	keyWindows  map[string]*gatewayKeyWindow
+	mu           sync.Mutex
+	endpoints    map[string]*endpointRuntimeState
+	credentials  map[string]*credentialRuntimeState
+	sticky       map[string]stickyBinding
+	stickyWrites int
+	keyWindows   map[string]*gatewayKeyWindow
 }
 
 func newRuntimeState() *runtimeState {
@@ -57,76 +64,86 @@ func newRuntimeState() *runtimeState {
 	}
 }
 
-func (r *runtimeState) endpointState(id string) *endpointRuntimeState {
-	state := r.endpoints[id]
+func (r *runtimeState) endpointState(key string) *endpointRuntimeState {
+	state := r.endpoints[key]
 	if state == nil {
 		state = &endpointRuntimeState{}
-		r.endpoints[id] = state
+		r.endpoints[key] = state
 	}
 	return state
 }
 
-func (r *runtimeState) credentialState(id string) *credentialRuntimeState {
-	state := r.credentials[id]
+func (r *runtimeState) credentialState(key string) *credentialRuntimeState {
+	state := r.credentials[key]
 	if state == nil {
 		state = &credentialRuntimeState{}
-		r.credentials[id] = state
+		r.credentials[key] = state
 	}
 	return state
 }
 
-func (r *runtimeState) endpointLatency(id string) int64 {
+func (r *runtimeState) endpointLatency(candidate resolvedCandidate) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.endpointState(id).LastLatencyMS
+	return r.endpointState(endpointRuntimeKey(candidate)).LastLatencyMS
 }
 
-func (r *runtimeState) endpointOpen(id string, now time.Time) bool {
+func (r *runtimeState) endpointOpen(candidate resolvedCandidate, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.endpointState(id).OpenUntil.After(now)
+	return r.endpointState(endpointRuntimeKey(candidate)).OpenUntil.After(now)
 }
 
-func (r *runtimeState) credentialCoolingDown(id string, now time.Time) bool {
+func (r *runtimeState) credentialCoolingDown(candidate resolvedCandidate, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.credentialState(id).CooldownUntil.After(now)
+	state := r.credentialState(credentialRuntimeKey(candidate))
+	return state.PermanentlyDisabled || state.DisabledUntil.After(now)
 }
 
 func (r *runtimeState) reportSuccess(candidate resolvedCandidate, latency time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	endpoint := r.endpointState(candidate.endpoint.ID)
+	now := time.Now().UTC()
+	endpoint := r.endpointState(endpointRuntimeKey(candidate))
 	endpoint.LastLatencyMS = latency.Milliseconds()
 	endpoint.ConsecutiveFailures = 0
 	endpoint.OpenUntil = time.Time{}
 	endpoint.LastStatusCode = 200
 	endpoint.LastError = ""
-	endpoint.LastCheckedAt = time.Now().UTC()
+	endpoint.LastCheckedAt = now
 
-	credential := r.credentialState(candidate.credential.ID)
+	credential := r.credentialState(credentialRuntimeKey(candidate))
 	credential.ConsecutiveFailures = 0
-	credential.CooldownUntil = time.Time{}
+	credential.DisabledUntil = time.Time{}
+	credential.PermanentlyDisabled = false
 	credential.LastStatusCode = 200
 	credential.LastError = ""
 
-	if candidate.sessionID != "" {
-		r.sticky[r.stickyKey(candidate.gatewayKeyID, candidate.route.Alias, candidate.sessionID)] = stickyBinding{
-			ProviderID:   candidate.provider.ID,
-			EndpointID:   candidate.endpoint.ID,
-			CredentialID: candidate.credential.ID,
-			ExpiresAt:    time.Now().UTC().Add(time.Duration(candidate.provider.StickySessionTTLSeconds) * time.Second),
-		}
+	if candidate.sessionID == "" {
+		return
+	}
+
+	r.sticky[r.stickyKey(candidate.gatewayKeyID, candidate.route.Alias, candidate.sessionID)] = stickyBinding{
+		ProviderID:   candidate.provider.ID,
+		EndpointID:   candidate.endpoint.ID,
+		CredentialID: candidate.credential.ID,
+		ExpiresAt:    now.Add(time.Duration(candidate.provider.StickySessionTTLSeconds) * time.Second),
+	}
+	r.stickyWrites++
+	if r.stickyWrites >= defaultStickySweepInterval {
+		r.sweepExpiredStickyLocked(now)
+		r.stickyWrites = 0
 	}
 }
 
-func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int, errMessage string) {
+func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int, errMessage string, retryAfter time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	now := time.Now().UTC()
-	endpoint := r.endpointState(candidate.endpoint.ID)
+	endpoint := r.endpointState(endpointRuntimeKey(candidate))
 	endpoint.ConsecutiveFailures++
 	endpoint.LastStatusCode = statusCode
 	endpoint.LastError = errMessage
@@ -135,12 +152,24 @@ func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int
 		endpoint.OpenUntil = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second)
 	}
 
-	credential := r.credentialState(candidate.credential.ID)
+	credential := r.credentialState(credentialRuntimeKey(candidate))
 	credential.ConsecutiveFailures++
 	credential.LastStatusCode = statusCode
 	credential.LastError = errMessage
-	if statusCode == 429 || statusCode == 401 || statusCode == 403 {
-		credential.CooldownUntil = now.Add(2 * time.Minute)
+	switch statusCode {
+	case httpStatusUnauthorized, httpStatusForbidden:
+		credential.PermanentlyDisabled = true
+		credential.DisabledUntil = time.Time{}
+	case httpStatusTooManyRequests:
+		credential.PermanentlyDisabled = false
+		if retryAfter <= 0 {
+			retryAfter = defaultRetryAfterCooldown
+		}
+		credential.DisabledUntil = now.Add(retryAfter)
+	default:
+		if retryAfter > 0 {
+			credential.DisabledUntil = now.Add(retryAfter)
+		}
 	}
 }
 
@@ -168,6 +197,14 @@ func (r *runtimeState) stickyBindingFor(gatewayKeyID, alias, sessionID string, n
 		return stickyBinding{}, false
 	}
 	return binding, true
+}
+
+func (r *runtimeState) sweepExpiredStickyLocked(now time.Time) {
+	for key, binding := range r.sticky {
+		if !binding.ExpiresAt.After(now) {
+			delete(r.sticky, key)
+		}
+	}
 }
 
 func (r *runtimeState) acquireGatewayKey(key model.GatewayKey, now time.Time) error {
@@ -221,3 +258,17 @@ func (r *runtimeState) releaseGatewayKey(keyID string, costUSD float64) {
 		window.DailyCostUSD += costUSD
 	}
 }
+
+func endpointRuntimeKey(candidate resolvedCandidate) string {
+	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.endpoint.ID))
+}
+
+func credentialRuntimeKey(candidate resolvedCandidate) string {
+	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.credential.ID)) + "\x00" + model.LegacyGatewaySecretLookupHash(candidate.credential.APIKey)
+}
+
+const (
+	httpStatusUnauthorized    = 401
+	httpStatusForbidden       = 403
+	httpStatusTooManyRequests = 429
+)

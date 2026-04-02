@@ -41,11 +41,11 @@ func extractGatewaySecret(headers http.Header) string {
 }
 
 func bearerToken(value string) string {
-	const prefix = "Bearer "
-	if len(value) >= len(prefix) && value[:len(prefix)] == prefix {
-		return value[len(prefix):]
+	scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
 	}
-	return value
+	return strings.TrimSpace(token)
 }
 
 func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers http.Header, protocol model.Protocol, alias string) (model.GatewayKey, error) {

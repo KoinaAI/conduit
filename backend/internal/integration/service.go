@@ -21,8 +21,16 @@ import (
 
 type Service struct {
 	client               *http.Client
+	transport            *http.Transport
 	allowPrivateBaseURLs bool
 	lookupIPs            func(context.Context, string, string) ([]net.IP, error)
+	pinnedClientsMu      sync.Mutex
+	pinnedClients        map[string]*http.Client
+}
+
+type resolvedBaseURL struct {
+	BaseURL     string
+	DialAddress string
 }
 
 type Option func(*Service)
@@ -46,9 +54,12 @@ type DailyCheckinResult struct {
 }
 
 func NewService(options ...Option) *Service {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
 	service := &Service{
-		client:    &http.Client{Timeout: 20 * time.Second},
-		lookupIPs: net.DefaultResolver.LookupIP,
+		client:        &http.Client{Timeout: 20 * time.Second, Transport: transport},
+		transport:     transport,
+		lookupIPs:     net.DefaultResolver.LookupIP,
+		pinnedClients: map[string]*http.Client{},
 	}
 	for _, option := range options {
 		option(service)
@@ -83,7 +94,8 @@ func (s *Service) CheckinState(ctx context.Context, state *model.State, integrat
 
 // ValidateBaseURL rejects unsafe integration management endpoints.
 func (s *Service) ValidateBaseURL(baseURL string) error {
-	return s.validateBaseURL(baseURL)
+	_, err := s.resolveBaseURL(baseURL)
+	return err
 }
 
 func (s *Service) PrepareSync(ctx context.Context, integration model.Integration) SyncResult {
@@ -109,7 +121,11 @@ func (s *Service) ApplySyncResult(state *model.State, integrationID string, resu
 		return model.IntegrationSnapshot{}, result.Err
 	}
 
+	lastCheckinAt := integration.Snapshot.LastCheckinAt
+	lastCheckinResult := integration.Snapshot.LastCheckinResult
 	integration.Snapshot = result.Snapshot
+	integration.Snapshot.LastCheckinAt = lastCheckinAt
+	integration.Snapshot.LastCheckinResult = lastCheckinResult
 	integration.Snapshot.LastSyncAt = &result.FinishedAt
 	integration.UpdatedAt = result.FinishedAt
 
@@ -481,66 +497,41 @@ func (s *Service) getEnvelope(ctx context.Context, baseURL, rawPath string, head
 }
 
 func (s *Service) postEnvelope(ctx context.Context, baseURL, rawPath string, headers map[string]string, body any) (map[string]any, error) {
-	if err := s.validateBaseURL(baseURL); err != nil {
-		return nil, err
-	}
-	reqURL, err := joinURL(baseURL, rawPath)
-	if err != nil {
-		return nil, err
-	}
-
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	applyHeaders(req.Header, headers)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= http.StatusBadRequest {
-		return nil, fmt.Errorf("integration request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil, err
-	}
-	if success, exists := payload["success"]; exists && success == false {
-		return nil, errors.New(readString(payload, "message"))
-	}
-	return unwrapData(payload), nil
+	return s.doJSONRequest(ctx, http.MethodPost, baseURL, rawPath, headers, bodyBytes)
 }
 
 func (s *Service) getRawJSON(ctx context.Context, baseURL, rawPath string, headers map[string]string) (map[string]any, error) {
-	if err := s.validateBaseURL(baseURL); err != nil {
+	return s.doJSONRequest(ctx, http.MethodGet, baseURL, rawPath, headers, nil)
+}
+
+func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath string, headers map[string]string, body []byte) (map[string]any, error) {
+	resolved, err := s.resolveBaseURL(baseURL)
+	if err != nil {
 		return nil, err
 	}
-	reqURL, err := joinURL(baseURL, rawPath)
+	reqURL, err := joinURL(resolved.BaseURL, rawPath)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	applyHeaders(req.Header, headers)
 
-	resp, err := s.client.Do(req)
+	resp, err := s.clientForResolved(resolved).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -562,6 +553,42 @@ func (s *Service) getRawJSON(ctx context.Context, baseURL, rawPath string, heade
 		return nil, errors.New(readString(payload, "message"))
 	}
 	return payload, nil
+}
+
+func (s *Service) clientForResolved(resolved resolvedBaseURL) *http.Client {
+	dialAddress := strings.TrimSpace(resolved.DialAddress)
+	if dialAddress == "" {
+		return s.client
+	}
+
+	s.pinnedClientsMu.Lock()
+	defer s.pinnedClientsMu.Unlock()
+
+	if client := s.pinnedClients[dialAddress]; client != nil {
+		return client
+	}
+
+	baseTransport := s.transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
+	} else {
+		baseTransport = baseTransport.Clone()
+	}
+	baseTransport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, dialAddress)
+	}
+
+	timeout := 20 * time.Second
+	if s.client != nil && s.client.Timeout > 0 {
+		timeout = s.client.Timeout
+	}
+	client := &http.Client{
+		Timeout:   timeout,
+		Transport: baseTransport,
+	}
+	s.pinnedClients[dialAddress] = client
+	return client
 }
 
 func applyHeaders(dst http.Header, values map[string]string) {
@@ -710,33 +737,45 @@ func pointerBool(value bool) *bool {
 	return &v
 }
 
-func (s *Service) validateBaseURL(baseURL string) error {
-	if s.allowPrivateBaseURLs {
-		return nil
-	}
-
-	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+func (s *Service) resolveBaseURL(baseURL string) (resolvedBaseURL, error) {
+	trimmedBaseURL := strings.TrimSpace(baseURL)
+	parsed, err := url.Parse(trimmedBaseURL)
 	if err != nil {
-		return fmt.Errorf("invalid integration base_url: %w", err)
+		return resolvedBaseURL{}, fmt.Errorf("invalid integration base_url: %w", err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("integration base_url must use http or https")
+		return resolvedBaseURL{}, errors.New("integration base_url must use http or https")
 	}
 
 	host := strings.TrimSpace(parsed.Hostname())
 	if host == "" {
-		return errors.New("integration base_url host is required")
+		return resolvedBaseURL{}, errors.New("integration base_url host is required")
 	}
 	lowerHost := strings.ToLower(host)
 	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") {
-		return errors.New("integration base_url must not target localhost")
+		return resolvedBaseURL{}, errors.New("integration base_url must not target localhost")
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		if blockedBaseURLIP(ip) {
-			return errors.New("integration base_url must not target private or local addresses")
+
+	port := parsed.Port()
+	if port == "" {
+		switch parsed.Scheme {
+		case "https":
+			port = "443"
+		default:
+			port = "80"
 		}
-		return nil
 	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		if !s.allowPrivateBaseURLs && blockedBaseURLIP(ip) {
+			return resolvedBaseURL{}, errors.New("integration base_url must not target private or local addresses")
+		}
+		return resolvedBaseURL{
+			BaseURL:     trimmedBaseURL,
+			DialAddress: net.JoinHostPort(ip.String(), port),
+		}, nil
+	}
+
 	lookupIPs := s.lookupIPs
 	if lookupIPs == nil {
 		lookupIPs = net.DefaultResolver.LookupIP
@@ -745,17 +784,22 @@ func (s *Service) validateBaseURL(baseURL string) error {
 	defer cancel()
 	ips, err := lookupIPs(ctx, "ip", host)
 	if err != nil {
-		return fmt.Errorf("invalid integration base_url: cannot resolve host %q: %w", host, err)
+		return resolvedBaseURL{}, fmt.Errorf("invalid integration base_url: cannot resolve host %q: %w", host, err)
 	}
 	if len(ips) == 0 {
-		return fmt.Errorf("invalid integration base_url: host %q resolved to no addresses", host)
+		return resolvedBaseURL{}, fmt.Errorf("invalid integration base_url: host %q resolved to no addresses", host)
 	}
-	for _, ip := range ips {
-		if blockedBaseURLIP(ip) {
-			return errors.New("integration base_url must not target private or local addresses")
+	if !s.allowPrivateBaseURLs {
+		for _, ip := range ips {
+			if blockedBaseURLIP(ip) {
+				return resolvedBaseURL{}, errors.New("integration base_url must not target private or local addresses")
+			}
 		}
 	}
-	return nil
+	return resolvedBaseURL{
+		BaseURL:     trimmedBaseURL,
+		DialAddress: net.JoinHostPort(ips[0].String(), port),
+	}, nil
 }
 
 func blockedBaseURLIP(ip net.IP) bool {

@@ -239,7 +239,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 					DurationMS:    time.Since(attemptStarted).Milliseconds(),
 					Error:         err.Error(),
 				})
-				s.runtime.reportFailure(candidate, 0, err.Error())
+				s.runtime.reportFailure(candidate, 0, err.Error(), 0)
 				if index < len(candidates)-1 {
 					sleepBackoff(0, index+1)
 					continue
@@ -253,6 +253,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 				lastStatusCode = resp.StatusCode
 				lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 				retryable := isRetryableStatus(resp.StatusCode)
+				retryAfter := parseRetryAfter(resp.Header)
 				attempts = append(attempts, model.RequestAttemptRecord{
 					RequestID:     record.ID,
 					Sequence:      index + 1,
@@ -269,7 +270,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 					DurationMS:    time.Since(attemptStarted).Milliseconds(),
 					Error:         strings.TrimSpace(string(body)),
 				})
-				s.runtime.reportFailure(candidate, resp.StatusCode, strings.TrimSpace(string(body)))
+				s.runtime.reportFailure(candidate, resp.StatusCode, strings.TrimSpace(string(body)), retryAfter)
 				if retryable && index < len(candidates)-1 {
 					sleepBackoff(resp.StatusCode, index+1)
 					continue
@@ -289,6 +290,8 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			_ = resp.Body.Close()
 			if writeErr != nil {
 				lastErr = writeErr
+				retryable := !responseWriteStarted(writeErr)
+				hasNext := index < len(candidates)-1
 				lastStatusCode = http.StatusBadGateway
 				attempts = append(attempts, model.RequestAttemptRecord{
 					RequestID:     record.ID,
@@ -299,14 +302,18 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 					EndpointURL:   candidate.endpoint.BaseURL,
 					CredentialID:  candidate.credential.ID,
 					UpstreamModel: exchange.UpstreamModel,
-					StatusCode:    resp.StatusCode,
-					Retryable:     false,
-					Decision:      "abort",
+					StatusCode:    http.StatusBadGateway,
+					Retryable:     retryable,
+					Decision:      nextDecision(retryable, hasNext),
 					StartedAt:     attemptStarted,
 					DurationMS:    time.Since(attemptStarted).Milliseconds(),
 					Error:         writeErr.Error(),
 				})
-				s.runtime.reportFailure(candidate, resp.StatusCode, writeErr.Error())
+				s.runtime.reportFailure(candidate, 0, writeErr.Error(), 0)
+				if retryable && hasNext {
+					sleepBackoff(0, index+1)
+					continue
+				}
 				break
 			}
 
@@ -348,7 +355,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 		if responseWriteStarted(lastErr) {
 			return
 		}
-		writeError(w, http.StatusBadGateway, record.Error)
+		writeError(w, record.StatusCode, record.Error)
 	}
 }
 
@@ -568,11 +575,6 @@ func (s *Service) RunProbes(ctx context.Context) map[string]any {
 			if err != nil {
 				result["status"] = "down"
 				result["error"] = err.Error()
-				s.runtime.reportFailure(resolvedCandidate{
-					provider:   provider,
-					endpoint:   endpoint,
-					credential: credential,
-				}, 0, err.Error())
 				results = append(results, result)
 				continue
 			}
@@ -581,18 +583,8 @@ func (s *Service) RunProbes(ctx context.Context) map[string]any {
 			_ = resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				result["status"] = "ok"
-				s.runtime.reportSuccess(resolvedCandidate{
-					provider:   provider,
-					endpoint:   endpoint,
-					credential: credential,
-				}, time.Since(started))
 			} else {
 				result["status"] = "degraded"
-				s.runtime.reportFailure(resolvedCandidate{
-					provider:   provider,
-					endpoint:   endpoint,
-					credential: credential,
-				}, resp.StatusCode, "probe returned non-success status")
 			}
 			results = append(results, result)
 		}
@@ -652,7 +644,7 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 					gatewayKeyID: gatewayKeyID,
 					sessionID:    sessionID,
 				}
-				if s.runtime.endpointOpen(endpoint.ID, now) || s.runtime.credentialCoolingDown(credential.ID, now) {
+				if s.runtime.endpointOpen(candidate, now) || s.runtime.credentialCoolingDown(candidate, now) {
 					degraded = append(degraded, candidate)
 					continue
 				}
@@ -674,8 +666,8 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 		if leftPriority != rightPriority {
 			return leftPriority < rightPriority
 		}
-		leftLatency := candidateLatency(s.runtime.endpointLatency(candidates[i].endpoint.ID))
-		rightLatency := candidateLatency(s.runtime.endpointLatency(candidates[j].endpoint.ID))
+		leftLatency := candidateLatency(s.runtime.endpointLatency(candidates[i]))
+		rightLatency := candidateLatency(s.runtime.endpointLatency(candidates[j]))
 		if leftLatency != rightLatency {
 			return leftLatency < rightLatency
 		}
@@ -698,16 +690,20 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 		}
 	}
 
-	maxAttempts := 0
+	filteredCandidates := make([]resolvedCandidate, 0, len(candidates))
+	providerAttempts := make(map[string]int, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.provider.MaxAttempts > maxAttempts {
-			maxAttempts = candidate.provider.MaxAttempts
+		limit := candidate.provider.MaxAttempts
+		if limit > 0 && providerAttempts[candidate.provider.ID] >= limit {
+			continue
 		}
+		filteredCandidates = append(filteredCandidates, candidate)
+		providerAttempts[candidate.provider.ID]++
 	}
-	if maxAttempts <= 0 || maxAttempts > len(candidates) {
-		maxAttempts = len(candidates)
+	if len(filteredCandidates) == 0 {
+		return nil, model.ModelRoute{}, model.PricingProfile{}, fmt.Errorf("route %q has no candidate within provider retry budgets", alias)
 	}
-	return candidates[:maxAttempts], route, profile, nil
+	return filteredCandidates, route, profile, nil
 }
 
 func effectiveUpstreamModel(candidate resolvedCandidate) string {
@@ -819,6 +815,28 @@ func isRetryableStatus(statusCode int) bool {
 		return true
 	}
 	return statusCode >= 500 && statusCode < 600
+}
+
+func parseRetryAfter(headers http.Header) time.Duration {
+	value := strings.TrimSpace(headers.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	at, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+	delay := time.Until(at)
+	if delay <= 0 {
+		return 0
+	}
+	return delay
 }
 
 func writeGatewayAuthError(w http.ResponseWriter, err error) {

@@ -18,10 +18,10 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/example/universal-ai-gateway/internal/billing"
-	"github.com/example/universal-ai-gateway/internal/config"
-	"github.com/example/universal-ai-gateway/internal/model"
-	"github.com/example/universal-ai-gateway/internal/store"
+	"github.com/KoinaAI/conduit/backend/internal/billing"
+	"github.com/KoinaAI/conduit/backend/internal/config"
+	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 type Service struct {

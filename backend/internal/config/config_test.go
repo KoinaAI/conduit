@@ -49,3 +49,17 @@ func TestOriginChecks(t *testing.T) {
 		t.Fatal("expected realtime origin to be allowed")
 	}
 }
+
+func TestSecretLookupPepperFallsBackToAdminToken(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{AdminToken: "admin-token"}
+	if got := cfg.SecretLookupPepper(); got != "admin-token" {
+		t.Fatalf("expected admin token fallback, got %q", got)
+	}
+
+	cfg.GatewaySecretLookupPepper = "lookup-pepper"
+	if got := cfg.SecretLookupPepper(); got != "lookup-pepper" {
+		t.Fatalf("expected explicit lookup pepper, got %q", got)
+	}
+}

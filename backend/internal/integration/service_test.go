@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/universal-ai-gateway/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
 func TestServiceSyncStateNewAPI(t *testing.T) {
@@ -453,9 +454,20 @@ func TestValidateBaseURLRejectsLocalAddresses(t *testing.T) {
 	t.Parallel()
 
 	service := NewService()
+	service.lookupIPs = func(_ context.Context, _, host string) ([]net.IP, error) {
+		switch host {
+		case "relay.example":
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		case "internal.example":
+			return []net.IP{net.ParseIP("10.0.0.5")}, nil
+		default:
+			return nil, nil
+		}
+	}
 	cases := []string{
 		"http://127.0.0.1:8080",
 		"http://localhost:8080",
+		"https://internal.example",
 		"ftp://relay.example",
 	}
 

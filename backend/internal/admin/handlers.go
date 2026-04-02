@@ -10,11 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/universal-ai-gateway/internal/config"
-	"github.com/example/universal-ai-gateway/internal/gateway"
-	"github.com/example/universal-ai-gateway/internal/integration"
-	"github.com/example/universal-ai-gateway/internal/model"
-	"github.com/example/universal-ai-gateway/internal/store"
+	"github.com/KoinaAI/conduit/backend/internal/config"
+	"github.com/KoinaAI/conduit/backend/internal/gateway"
+	"github.com/KoinaAI/conduit/backend/internal/integration"
+	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 // Handlers serves the administrative API surface.
@@ -587,7 +587,7 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		ID:               model.NewID("gk"),
 		Name:             strings.TrimSpace(payload.Name),
 		SecretHash:       hash,
-		SecretLookupHash: model.GatewaySecretLookupHash(secret),
+		SecretLookupHash: model.GatewaySecretLookupHash(secret, h.cfg.SecretLookupPepper()),
 		SecretPreview:    model.SecretPreview(secret),
 		Enabled:          enabled,
 		ExpiresAt:        payload.ExpiresAt,
@@ -709,9 +709,7 @@ func mergeCompatibilityState(current, next *model.State) {
 	if len(next.GatewayKeys) == 0 {
 		next.GatewayKeys = current.GatewayKeys
 	}
-	if len(next.RequestHistory) == 0 {
-		next.RequestHistory = current.RequestHistory
-	}
+	next.RequestHistory = current.RequestHistory
 	for nextProviderIndex := range next.Providers {
 		nextProvider := &next.Providers[nextProviderIndex]
 		currentProvider, ok := current.FindProvider(nextProvider.ID)

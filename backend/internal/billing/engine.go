@@ -3,7 +3,7 @@ package billing
 import (
 	"math"
 
-	"github.com/example/universal-ai-gateway/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
 func Calculate(profile model.PricingProfile, usage model.UsageSummary, multiplier float64, source string) model.BillingSummary {

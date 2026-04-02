@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/example/universal-ai-gateway/internal/app"
-	"github.com/example/universal-ai-gateway/internal/config"
-	"github.com/example/universal-ai-gateway/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/app"
+	"github.com/KoinaAI/conduit/backend/internal/config"
+	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
 func TestAdminCORSRejectsCrossOriginByDefault(t *testing.T) {
@@ -72,6 +72,52 @@ func TestGatewayCORSAllowsWildcardOrigins(t *testing.T) {
 	}
 	if got := res.Header.Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Fatalf("expected wildcard gateway CORS header, got %q", got)
+	}
+}
+
+func TestRealtimeCORSUsesRealtimeOrigins(t *testing.T) {
+	t.Parallel()
+
+	server := newTestServer(t, config.Config{
+		BindAddress:            ":0",
+		StatePath:              filepath.Join(t.TempDir(), "gateway.db"),
+		AdminToken:             "admin-token",
+		GatewayAllowedOrigins:  []string{"https://gateway.example"},
+		RealtimeAllowedOrigins: []string{"https://console.example"},
+		EnableRealtime:         true,
+	})
+	defer server.Close()
+
+	disallowedReq, err := http.NewRequest(http.MethodOptions, server.URL+"/v1/realtime", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	disallowedReq.Header.Set("Origin", "https://gateway.example")
+
+	disallowedRes, err := http.DefaultClient.Do(disallowedReq)
+	if err != nil {
+		t.Fatalf("do disallowed request: %v", err)
+	}
+	defer disallowedRes.Body.Close()
+
+	if got := disallowedRes.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("did not expect gateway origin to be allowed on realtime endpoint, got %q", got)
+	}
+
+	allowedReq, err := http.NewRequest(http.MethodOptions, server.URL+"/v1/realtime", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	allowedReq.Header.Set("Origin", "https://console.example")
+
+	allowedRes, err := http.DefaultClient.Do(allowedReq)
+	if err != nil {
+		t.Fatalf("do allowed request: %v", err)
+	}
+	defer allowedRes.Body.Close()
+
+	if got := allowedRes.Header.Get("Access-Control-Allow-Origin"); got != "https://console.example" {
+		t.Fatalf("expected realtime origin to be echoed, got %q", got)
 	}
 }
 

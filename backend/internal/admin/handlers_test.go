@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/universal-ai-gateway/internal/config"
-	"github.com/example/universal-ai-gateway/internal/integration"
-	"github.com/example/universal-ai-gateway/internal/model"
-	"github.com/example/universal-ai-gateway/internal/store"
+	"github.com/KoinaAI/conduit/backend/internal/config"
+	"github.com/KoinaAI/conduit/backend/internal/integration"
+	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 func TestRunCheckinsSkipsAlreadyCheckedInIntegrations(t *testing.T) {
@@ -179,6 +179,45 @@ func TestCreateGatewayKeyRejectsWeakCustomSecret(t *testing.T) {
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected bad request for weak secret, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPutStatePreservesExistingRequestHistory(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		RequestHistory: []model.RequestRecord{{
+			ID:         "req-original",
+			RouteAlias: "gpt-5.4",
+			StartedAt:  time.Date(2026, time.April, 2, 0, 0, 0, 0, time.UTC),
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{
+		"version":"2026-04-01",
+		"providers":[],
+		"model_routes":[],
+		"pricing_profiles":[],
+		"integrations":[],
+		"gateway_keys":[],
+		"request_history":[{"id":"req-overwrite","route_alias":"malicious"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.PutState(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	if len(saved.RequestHistory) != 1 {
+		t.Fatalf("expected request history to stay unchanged, got %+v", saved.RequestHistory)
+	}
+	if saved.RequestHistory[0].ID != "req-original" {
+		t.Fatalf("expected existing request history to be preserved, got %+v", saved.RequestHistory)
 	}
 }
 

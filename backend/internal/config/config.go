@@ -8,30 +8,32 @@ import (
 )
 
 type Config struct {
-	BindAddress            string
-	StatePath              string
-	AdminToken             string
-	GatewayAllowedOrigins  []string
-	AdminAllowedOrigins    []string
-	RealtimeAllowedOrigins []string
-	EnableRealtime         bool
-	RequestHistory         int
-	BootstrapGatewayKey    string
-	ProbeIntervalSeconds   int
+	BindAddress               string
+	StatePath                 string
+	AdminToken                string
+	GatewaySecretLookupPepper string
+	GatewayAllowedOrigins     []string
+	AdminAllowedOrigins       []string
+	RealtimeAllowedOrigins    []string
+	EnableRealtime            bool
+	RequestHistory            int
+	BootstrapGatewayKey       string
+	ProbeIntervalSeconds      int
 }
 
 func Load() Config {
 	return Config{
-		BindAddress:            getenv("GATEWAY_BIND", ":8080"),
-		StatePath:              getenv("GATEWAY_STATE_PATH", "./data/gateway.db"),
-		AdminToken:             strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_TOKEN")),
-		GatewayAllowedOrigins:  getenvCSV("GATEWAY_ALLOWED_ORIGINS", "*"),
-		AdminAllowedOrigins:    getenvCSV("GATEWAY_ADMIN_ALLOWED_ORIGINS", ""),
-		RealtimeAllowedOrigins: getenvCSV("GATEWAY_REALTIME_ALLOWED_ORIGINS", ""),
-		EnableRealtime:         getenvBool("GATEWAY_ENABLE_REALTIME", true),
-		RequestHistory:         getenvInt("GATEWAY_REQUEST_HISTORY", 200),
-		BootstrapGatewayKey:    getenv("GATEWAY_BOOTSTRAP_GATEWAY_KEY", ""),
-		ProbeIntervalSeconds:   getenvInt("GATEWAY_PROBE_INTERVAL_SECONDS", 180),
+		BindAddress:               getenv("GATEWAY_BIND", ":8080"),
+		StatePath:                 getenv("GATEWAY_STATE_PATH", "./data/gateway.db"),
+		AdminToken:                strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_TOKEN")),
+		GatewaySecretLookupPepper: strings.TrimSpace(os.Getenv("GATEWAY_SECRET_LOOKUP_PEPPER")),
+		GatewayAllowedOrigins:     getenvCSV("GATEWAY_ALLOWED_ORIGINS", "*"),
+		AdminAllowedOrigins:       getenvCSV("GATEWAY_ADMIN_ALLOWED_ORIGINS", ""),
+		RealtimeAllowedOrigins:    getenvCSV("GATEWAY_REALTIME_ALLOWED_ORIGINS", ""),
+		EnableRealtime:            getenvBool("GATEWAY_ENABLE_REALTIME", true),
+		RequestHistory:            getenvInt("GATEWAY_REQUEST_HISTORY", 200),
+		BootstrapGatewayKey:       getenv("GATEWAY_BOOTSTRAP_GATEWAY_KEY", ""),
+		ProbeIntervalSeconds:      getenvInt("GATEWAY_PROBE_INTERVAL_SECONDS", 180),
 	}
 }
 
@@ -55,6 +57,13 @@ func (c Config) AllowsAdminOrigin(origin string) bool {
 
 func (c Config) AllowsRealtimeOrigin(origin string) bool {
 	return originAllowed(c.RealtimeAllowedOrigins, origin)
+}
+
+func (c Config) SecretLookupPepper() string {
+	if pepper := strings.TrimSpace(c.GatewaySecretLookupPepper); pepper != "" {
+		return pepper
+	}
+	return strings.TrimSpace(c.AdminToken)
 }
 
 func getenv(key, fallback string) string {

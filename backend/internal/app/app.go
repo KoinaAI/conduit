@@ -7,13 +7,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/universal-ai-gateway/internal/admin"
-	"github.com/example/universal-ai-gateway/internal/config"
-	"github.com/example/universal-ai-gateway/internal/gateway"
-	"github.com/example/universal-ai-gateway/internal/integration"
-	"github.com/example/universal-ai-gateway/internal/model"
-	"github.com/example/universal-ai-gateway/internal/scheduler"
-	"github.com/example/universal-ai-gateway/internal/store"
+	"github.com/KoinaAI/conduit/backend/internal/admin"
+	"github.com/KoinaAI/conduit/backend/internal/config"
+	"github.com/KoinaAI/conduit/backend/internal/gateway"
+	"github.com/KoinaAI/conduit/backend/internal/integration"
+	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/scheduler"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 type App struct {
@@ -155,7 +155,7 @@ func (a *App) Handler() http.Handler {
 		mux.Handle("/v1/realtime", withCORS(
 			methodHandler(http.MethodGet, http.HandlerFunc(a.gateway.ProxyRealtime)),
 			a.cfg,
-			a.cfg.GatewayAllowedOrigins,
+			a.cfg.RealtimeAllowedOrigins,
 			"Authorization, Content-Type, X-API-Key",
 			"GET, OPTIONS",
 			false,
@@ -301,15 +301,16 @@ func ensureBootstrapGatewayKey(cfg config.Config, stateStore *store.FileStore) e
 	if secret == "" {
 		return nil
 	}
+	lookupHash := model.GatewaySecretLookupHash(secret, cfg.SecretLookupPepper())
 
 	snapshot := stateStore.Snapshot()
 	for _, key := range snapshot.GatewayKeys {
 		if model.VerifyGatewaySecret(key.SecretHash, secret) {
-			if key.SecretLookupHash == "" {
+			if key.SecretLookupHash != lookupHash {
 				_, err := stateStore.Update(func(state *model.State) error {
 					for index := range state.GatewayKeys {
 						if state.GatewayKeys[index].ID == key.ID {
-							state.GatewayKeys[index].SecretLookupHash = model.GatewaySecretLookupHash(secret)
+							state.GatewayKeys[index].SecretLookupHash = lookupHash
 							state.GatewayKeys[index].UpdatedAt = time.Now().UTC()
 							return nil
 						}
@@ -339,7 +340,7 @@ func ensureBootstrapGatewayKey(cfg config.Config, stateStore *store.FileStore) e
 			ID:               model.NewID("gk"),
 			Name:             "bootstrap",
 			SecretHash:       hash,
-			SecretLookupHash: model.GatewaySecretLookupHash(secret),
+			SecretLookupHash: lookupHash,
 			SecretPreview:    model.SecretPreview(secret),
 			Enabled:          true,
 			CreatedAt:        now,

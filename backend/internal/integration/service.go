@@ -16,12 +16,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/universal-ai-gateway/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
 type Service struct {
 	client               *http.Client
 	allowPrivateBaseURLs bool
+	lookupIPs            func(context.Context, string, string) ([]net.IP, error)
 }
 
 type Option func(*Service)
@@ -46,7 +47,8 @@ type DailyCheckinResult struct {
 
 func NewService(options ...Option) *Service {
 	service := &Service{
-		client: &http.Client{Timeout: 20 * time.Second},
+		client:    &http.Client{Timeout: 20 * time.Second},
+		lookupIPs: net.DefaultResolver.LookupIP,
 	}
 	for _, option := range options {
 		option(service)
@@ -729,8 +731,29 @@ func (s *Service) validateBaseURL(baseURL string) error {
 	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") {
 		return errors.New("integration base_url must not target localhost")
 	}
-	if ip := net.ParseIP(host); ip != nil && blockedBaseURLIP(ip) {
-		return errors.New("integration base_url must not target private or local addresses")
+	if ip := net.ParseIP(host); ip != nil {
+		if blockedBaseURLIP(ip) {
+			return errors.New("integration base_url must not target private or local addresses")
+		}
+		return nil
+	}
+	lookupIPs := s.lookupIPs
+	if lookupIPs == nil {
+		lookupIPs = net.DefaultResolver.LookupIP
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := lookupIPs(ctx, "ip", host)
+	if err != nil {
+		return fmt.Errorf("invalid integration base_url: cannot resolve host %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("invalid integration base_url: host %q resolved to no addresses", host)
+	}
+	for _, ip := range ips {
+		if blockedBaseURLIP(ip) {
+			return errors.New("integration base_url must not target private or local addresses")
+		}
 	}
 	return nil
 }

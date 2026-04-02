@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/universal-ai-gateway/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
 type endpointRuntimeState struct {

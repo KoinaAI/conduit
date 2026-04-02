@@ -1,6 +1,9 @@
 package model
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestGatewaySecretLookupHashUsesPepper(t *testing.T) {
 	t.Parallel()
@@ -21,5 +24,25 @@ func TestGatewaySecretLookupHashUsesPepper(t *testing.T) {
 	}
 	if GatewaySecretLookupHash(secret, "") != legacy {
 		t.Fatal("expected empty pepper to preserve legacy lookup hash for compatibility")
+	}
+}
+
+func TestHashGatewaySecretRejectsTooLongSecrets(t *testing.T) {
+	t.Parallel()
+
+	if _, err := HashGatewaySecret(strings.Repeat("a", 73)); err == nil {
+		t.Fatal("expected secret longer than 72 bytes to be rejected")
+	}
+}
+
+func TestSecretPreviewMasksShortSecrets(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{"abc", "shortkey"}
+	for _, secret := range cases {
+		preview := SecretPreview(secret)
+		if preview == secret {
+			t.Fatalf("expected preview to mask short secret %q", secret)
+		}
 	}
 }

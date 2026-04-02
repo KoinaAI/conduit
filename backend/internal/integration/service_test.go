@@ -137,6 +137,45 @@ func TestServiceSyncStateNewAPI(t *testing.T) {
 	}
 }
 
+func TestApplySyncResultPreservesCheckinMetadata(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(WithAllowPrivateBaseURLForTests())
+	checkinAt := time.Date(2026, time.April, 2, 10, 0, 0, 0, time.UTC)
+	state := model.DefaultState()
+	state.Integrations = []model.Integration{{
+		ID:        "integration-1",
+		Name:      "NewAPI",
+		Kind:      model.IntegrationKindNewAPI,
+		BaseURL:   "https://relay.example",
+		AccessKey: "token",
+		Enabled:   true,
+		Snapshot: model.IntegrationSnapshot{
+			LastCheckinAt:     &checkinAt,
+			LastCheckinResult: "checkin ok",
+		},
+	}}
+
+	result := SyncResult{
+		Snapshot: model.IntegrationSnapshot{
+			ModelNames: []string{"gpt-5.4"},
+		},
+		FinishedAt: time.Date(2026, time.April, 2, 11, 0, 0, 0, time.UTC),
+	}
+	_, err := service.ApplySyncResult(&state, "integration-1", result)
+	if err != nil {
+		t.Fatalf("apply sync result: %v", err)
+	}
+
+	snapshot := state.Integrations[0].Snapshot
+	if snapshot.LastCheckinAt == nil || !snapshot.LastCheckinAt.Equal(checkinAt) {
+		t.Fatalf("expected checkin timestamp to be preserved, got %+v", snapshot)
+	}
+	if snapshot.LastCheckinResult != "checkin ok" {
+		t.Fatalf("expected checkin result to be preserved, got %+v", snapshot)
+	}
+}
+
 func TestServiceSyncStateOneHub(t *testing.T) {
 	t.Parallel()
 
@@ -479,5 +518,28 @@ func TestValidateBaseURLRejectsLocalAddresses(t *testing.T) {
 
 	if err := service.ValidateBaseURL("https://relay.example"); err != nil {
 		t.Fatalf("expected public https base URL to be allowed: %v", err)
+	}
+}
+
+func TestResolveBaseURLPinsResolvedAddress(t *testing.T) {
+	t.Parallel()
+
+	service := NewService()
+	service.lookupIPs = func(_ context.Context, _, host string) ([]net.IP, error) {
+		if host != "relay.example" {
+			t.Fatalf("unexpected host lookup: %s", host)
+		}
+		return []net.IP{net.ParseIP("203.0.113.10")}, nil
+	}
+
+	resolved, err := service.resolveBaseURL("https://relay.example/api")
+	if err != nil {
+		t.Fatalf("resolve base url: %v", err)
+	}
+	if resolved.BaseURL != "https://relay.example/api" {
+		t.Fatalf("unexpected resolved base url: %+v", resolved)
+	}
+	if resolved.DialAddress != "203.0.113.10:443" {
+		t.Fatalf("expected dial address to pin resolved IP, got %+v", resolved)
 	}
 }

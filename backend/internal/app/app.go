@@ -2,9 +2,12 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/admin"
@@ -35,6 +38,7 @@ func New(cfg config.Config) (*App, error) {
 	integrationService := integration.NewService()
 	gatewayService := gateway.NewService(cfg, store)
 	if err := ensureBootstrapGatewayKey(cfg, store); err != nil {
+		_ = store.Close()
 		return nil, err
 	}
 	adminHandlers := admin.New(cfg, store, integrationService, gatewayService)
@@ -82,6 +86,7 @@ func (a *App) Handler() http.Handler {
 	adminMux.HandleFunc("POST /api/admin/integrations/{id}/checkin", a.admin.CheckinIntegration)
 	adminMux.HandleFunc("GET /api/admin/gateway-keys", a.admin.ListGatewayKeys)
 	adminMux.HandleFunc("POST /api/admin/gateway-keys", a.admin.CreateGatewayKey)
+	adminMux.HandleFunc("PUT /api/admin/gateway-keys/{id}", a.admin.UpdateGatewayKey)
 	adminMux.HandleFunc("DELETE /api/admin/gateway-keys/{id}", a.admin.DeleteGatewayKey)
 	adminMux.HandleFunc("GET /api/admin/request-history", a.admin.ListRequestHistory)
 	adminMux.HandleFunc("GET /api/admin/request-history/{id}/attempts", a.admin.GetRequestAttempts)
@@ -169,28 +174,60 @@ func (a *App) StartBackground(ctx context.Context) {
 	go a.scheduler.Start(ctx)
 }
 
+func (a *App) Close() error {
+	if a == nil {
+		return nil
+	}
+	return a.store.Close()
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 func Run(cfg config.Config) error {
 	app, err := New(cfg)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeErr := app.Close(); closeErr != nil {
+			log.Printf("gateway store close failed: %v", closeErr)
+		}
+	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	app.StartBackground(ctx)
 
-	server := &http.Server{
-		Addr:              cfg.BindAddress,
-		Handler:           app.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
+	server := newHTTPServer(cfg.BindAddress, app.Handler())
+	log.Printf("gateway listening on %s", cfg.BindAddress)
+	errCh := make(chan error, 1)
+	go func() {
+		if serveErr := server.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- serveErr
+		}
+		close(errCh)
+	}()
+
+	select {
+	case serveErr := <-errCh:
+		return serveErr
+	case <-ctx.Done():
 	}
 
-	log.Printf("gateway listening on %s", cfg.BindAddress)
-	return server.ListenAndServe()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	shutdownErr := server.Shutdown(shutdownCtx)
+	serveErr := <-errCh
+	return errors.Join(shutdownErr, serveErr)
 }
 
 func withCORS(next http.Handler, cfg config.Config, allowedOrigins []string, allowedHeaders, allowedMethods string, rejectDisallowedOrigin bool) http.Handler {

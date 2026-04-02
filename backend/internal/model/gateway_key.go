@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+const maxGatewaySecretBytes = 72
 
 // NewGatewaySecret returns a high-entropy secret suitable for public gateway use.
 func NewGatewaySecret() (string, error) {
@@ -23,7 +26,14 @@ func NewGatewaySecret() (string, error) {
 
 // HashGatewaySecret hashes a gateway secret for storage.
 func HashGatewaySecret(secret string) (string, error) {
-	hashed, err := bcrypt.GenerateFromPassword([]byte(strings.TrimSpace(secret)), bcrypt.DefaultCost)
+	trimmed := strings.TrimSpace(secret)
+	if trimmed == "" {
+		return "", errors.New("gateway secret is required")
+	}
+	if len([]byte(trimmed)) > maxGatewaySecretBytes {
+		return "", fmt.Errorf("gateway secret must be %d bytes or fewer", maxGatewaySecretBytes)
+	}
+	hashed, err := bcrypt.GenerateFromPassword([]byte(trimmed), bcrypt.DefaultCost)
 	if err != nil {
 		return "", err
 	}
@@ -68,8 +78,13 @@ func LegacyGatewaySecretLookupHash(secret string) string {
 // SecretPreview formats a short non-sensitive preview for the admin console.
 func SecretPreview(secret string) string {
 	trimmed := strings.TrimSpace(secret)
-	if len(trimmed) <= 8 {
-		return trimmed
+	switch {
+	case len(trimmed) == 0:
+		return ""
+	case len(trimmed) <= 4:
+		return strings.Repeat("*", len(trimmed))
+	case len(trimmed) <= 8:
+		return fmt.Sprintf("%s...%s", trimmed[:1], trimmed[len(trimmed)-1:])
 	}
 	return fmt.Sprintf("%s...%s", trimmed[:6], trimmed[len(trimmed)-4:])
 }

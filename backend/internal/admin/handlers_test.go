@@ -182,6 +182,220 @@ func TestCreateGatewayKeyRejectsWeakCustomSecret(t *testing.T) {
 	}
 }
 
+func TestAdminMiddlewareRejectsEmptyConfiguredToken(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/meta", nil)
+	recorder := httptest.NewRecorder()
+	handlers.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected service unavailable for empty admin token, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCreateRouteRejectsDuplicateAliasCaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		ModelRoutes: []model.ModelRoute{{
+			Alias: "gpt-5.4",
+			Targets: []model.RouteTarget{{
+				ID:               "target-1",
+				AccountID:        "provider-1",
+				Weight:           1,
+				Enabled:          true,
+				MarkupMultiplier: 1,
+			}},
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/routes", strings.NewReader(`{"alias":"GPT-5.4","targets":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.CreateRoute(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for duplicate route alias, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDeleteProviderPrunesEmptyRoutesAndGatewayKeyReferences(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		Providers: []model.Provider{{
+			ID:      "provider-1",
+			Name:    "provider",
+			Kind:    model.ProviderKindOpenAICompatible,
+			BaseURL: "https://provider.example",
+			APIKey:  "provider-key",
+			Enabled: true,
+		}},
+		ModelRoutes: []model.ModelRoute{
+			{
+				Alias: "gpt-5.4",
+				Targets: []model.RouteTarget{{
+					ID:               "target-1",
+					AccountID:        "provider-1",
+					Weight:           1,
+					Enabled:          true,
+					MarkupMultiplier: 1,
+				}},
+			},
+			{
+				Alias: "claude-3.7",
+				Targets: []model.RouteTarget{{
+					ID:               "target-2",
+					AccountID:        "provider-2",
+					Weight:           1,
+					Enabled:          true,
+					MarkupMultiplier: 1,
+				}},
+			},
+		},
+		GatewayKeys: []model.GatewayKey{{
+			ID:            "gk-1",
+			Name:          "gateway",
+			Enabled:       true,
+			AllowedModels: []string{"gpt-5.4", "claude-3.7"},
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/providers/provider-1", nil)
+	req.SetPathValue("id", "provider-1")
+	recorder := httptest.NewRecorder()
+	handlers.DeleteProvider(recorder, req)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("expected no content, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	if _, ok := saved.FindRoute("gpt-5.4"); ok {
+		t.Fatalf("expected empty route to be pruned after provider deletion")
+	}
+	key, ok := saved.FindGatewayKey("gk-1")
+	if !ok {
+		t.Fatal("expected gateway key to remain")
+	}
+	if len(key.AllowedModels) != 1 || key.AllowedModels[0] != "claude-3.7" {
+		t.Fatalf("expected deleted route alias to be removed from gateway key references, got %+v", key.AllowedModels)
+	}
+}
+
+func TestUpdateGatewayKeyRotatesSecretAndEditableFields(t *testing.T) {
+	t.Parallel()
+
+	hash, err := model.HashGatewaySecret("original-secret-123")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:            "gk-1",
+			Name:          "original",
+			SecretHash:    hash,
+			SecretPreview: model.SecretPreview("original-secret-123"),
+			Enabled:       true,
+		}},
+	})
+	handlers := New(config.Config{GatewaySecretLookupPepper: "pepper"}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/gateway-keys/gk-1", strings.NewReader(`{
+		"name":"rotated",
+		"secret":"replacement-secret-456",
+		"enabled":false,
+		"max_concurrency":4,
+		"rate_limit_rpm":18,
+		"daily_budget_usd":2.5,
+		"allowed_models":["gpt-5.4"],
+		"allowed_protocols":["openai.chat"],
+		"notes":"updated"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("id", "gk-1")
+	recorder := httptest.NewRecorder()
+	handlers.UpdateGatewayKey(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected ok, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["secret"] != "replacement-secret-456" {
+		t.Fatalf("expected rotated secret in response, got %+v", response)
+	}
+
+	saved := fileStore.Snapshot()
+	key, ok := saved.FindGatewayKey("gk-1")
+	if !ok {
+		t.Fatal("expected updated gateway key")
+	}
+	if key.Name != "rotated" || key.Enabled || key.MaxConcurrency != 4 || key.RateLimitRPM != 18 {
+		t.Fatalf("expected gateway key fields to be updated, got %+v", key)
+	}
+	if !model.VerifyGatewaySecret(key.SecretHash, "replacement-secret-456") {
+		t.Fatalf("expected gateway secret hash to be rotated")
+	}
+	if key.SecretLookupHash == "" {
+		t.Fatalf("expected lookup hash to be populated")
+	}
+}
+
+func TestSyncIntegrationFailureDoesNotPersistSnapshotError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"upstream failed"}`, http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		Integrations: []model.Integration{{
+			ID:        "integration-1",
+			Name:      "NewAPI",
+			Kind:      model.IntegrationKindNewAPI,
+			BaseURL:   server.URL,
+			UserID:    "132",
+			AccessKey: "token",
+			Enabled:   true,
+			Snapshot: model.IntegrationSnapshot{
+				LastError: "keep-me",
+			},
+		}},
+	})
+
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/integrations/integration-1/sync", nil)
+	req.SetPathValue("id", "integration-1")
+	recorder := httptest.NewRecorder()
+	handlers.SyncIntegration(recorder, req)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("expected bad gateway, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	if saved.Integrations[0].Snapshot.LastError != "keep-me" {
+		t.Fatalf("expected sync failure not to overwrite persisted snapshot error, got %+v", saved.Integrations[0].Snapshot)
+	}
+}
+
 func TestPutStatePreservesExistingRequestHistory(t *testing.T) {
 	t.Parallel()
 

@@ -385,6 +385,96 @@ func TestGatewayFallsBackToRouteAliasWhenUpstreamModelIsBlank(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsNonBearerAuthorizationHeader(t *testing.T) {
+	t.Parallel()
+
+	gatewayServer := startGatewayServer(t, model.DefaultState())
+	defer gatewayServer.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, gatewayServer.URL+"/v1/models", nil)
+	if err != nil {
+		t.Fatalf("new request failed: %v", err)
+	}
+	req.Header.Set("Authorization", "Basic abc123")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthorized for non-bearer authorization header, got %d", res.StatusCode)
+	}
+}
+
+func TestGatewayRetriesTransformFailuresBeforeWritingResponse(t *testing.T) {
+	t.Parallel()
+
+	var firstCalls int
+	firstServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":`))
+	}))
+	defer firstServer.Close()
+
+	secondServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_2","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+	}))
+	defer secondServer.Close()
+
+	state := model.DefaultState()
+	state.Providers = []model.Provider{
+		{
+			ID:             "provider-1",
+			Name:           "First",
+			Kind:           model.ProviderKindOpenAICompatible,
+			BaseURL:        firstServer.URL + "/v1",
+			APIKey:         "first-key",
+			Enabled:        true,
+			MaxAttempts:    1,
+			Capabilities:   []model.Protocol{model.ProtocolAnthropic},
+			TimeoutSeconds: 30,
+		},
+		{
+			ID:             "provider-2",
+			Name:           "Second",
+			Kind:           model.ProviderKindOpenAICompatible,
+			BaseURL:        secondServer.URL + "/v1",
+			APIKey:         "second-key",
+			Enabled:        true,
+			MaxAttempts:    1,
+			Capabilities:   []model.Protocol{model.ProtocolAnthropic},
+			TimeoutSeconds: 30,
+		},
+	}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "claude-3.7",
+		Targets: []model.RouteTarget{
+			{ID: "target-1", AccountID: "provider-1", UpstreamModel: "claude-up", Weight: 1, Enabled: true, MarkupMultiplier: 1},
+			{ID: "target-2", AccountID: "provider-2", UpstreamModel: "claude-up", Weight: 1, Enabled: true, MarkupMultiplier: 1},
+		},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	res, body := postJSON(t, gatewayServer.URL+"/v1/messages", `{"model":"claude-3.7","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`)
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected fallback candidate to succeed, got %d body=%s", res.StatusCode, body)
+	}
+	if !strings.Contains(body, `"type":"message"`) {
+		t.Fatalf("expected anthropic-compatible response body, got %s", body)
+	}
+	if firstCalls != 1 {
+		t.Fatalf("expected first candidate to be attempted exactly once, got %d", firstCalls)
+	}
+}
+
 func startGatewayServer(t *testing.T, state model.State) *httptest.Server {
 	t.Helper()
 

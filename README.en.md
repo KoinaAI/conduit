@@ -64,8 +64,8 @@ Conduit currently supports:
 
 - `backend/`
   Go backend source code and unit tests.
-- `deploy/docker/`
-  Backend container build assets.
+- `Dockerfile`
+  Backend container image entrypoint.
 - `.github/workflows/`
   GitHub Actions workflows. The repository runs backend unit tests and builds or publishes the backend GHCR image.
 
@@ -174,6 +174,7 @@ Default behavior:
 The repository includes a dedicated backend image workflow that publishes to GHCR:
 
 - workflow file: `.github/workflows/backend-image.yml`
+- Dockerfile: `./Dockerfile`
 - image name: `ghcr.io/koinaai/conduit-backend`
 - default tag: `latest`
 - extra tags: `sha-<commit>`, branch tags, and `vX.Y.Z` on release tags

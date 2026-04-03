@@ -64,8 +64,8 @@ Conduit 当前支持以下常见请求面：
 
 - `backend/`
   Go 后端源码与单元测试。
-- `deploy/docker/`
-  后端镜像构建文件。
+- `Dockerfile`
+  后端容器镜像构建入口。
 - `.github/workflows/`
   GitHub Actions 工作流。当前仓库会执行后端单元测试，并构建或发布后端 GHCR 镜像。
 
@@ -174,6 +174,7 @@ go run ./cmd/gateway
 仓库内置的后端镜像工作流会将镜像发布到 GHCR：
 
 - 工作流文件：`.github/workflows/backend-image.yml`
+- Dockerfile：`./Dockerfile`
 - 镜像名称：`ghcr.io/koinaai/conduit-backend`
 - 默认标签：`latest`
 - 额外标签：`sha-<commit>`、分支标签，以及版本发布时的 `vX.Y.Z`

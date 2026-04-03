@@ -189,10 +189,7 @@ func anthropicToOpenAIChat(payload map[string]any, upstreamModel string) ([]byte
 			if role == "" {
 				role = "user"
 			}
-			messages = append(messages, map[string]any{
-				"role":    role,
-				"content": flattenAnthropicContent(current["content"]),
-			})
+			messages = append(messages, anthropicContentToOpenAIMessages(role, current["content"])...)
 		}
 	}
 	out["messages"] = messages
@@ -241,30 +238,6 @@ func flattenAnthropicSystem(value any) string {
 	}
 }
 
-func flattenAnthropicContent(value any) string {
-	switch current := value.(type) {
-	case string:
-		return current
-	case []any:
-		parts := make([]string, 0, len(current))
-		for _, item := range current {
-			block, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if blockType, _ := block["type"].(string); blockType != "" && blockType != "text" {
-				continue
-			}
-			if text, ok := block["text"].(string); ok && text != "" {
-				parts = append(parts, text)
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
-		return ""
-	}
-}
-
 func geminiToOpenAIChat(rawBody []byte, upstreamModel string, stream bool) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(rawBody, &payload); err != nil {
@@ -277,6 +250,7 @@ func geminiToOpenAIChat(rawBody []byte, upstreamModel string, stream bool) ([]by
 	}
 
 	messages := make([]map[string]any, 0, 8)
+	tracker := newGeminiToolCallTracker()
 	if systemInstruction, ok := payload["systemInstruction"].(map[string]any); ok {
 		if text := flattenGeminiParts(systemInstruction["parts"]); text != "" {
 			messages = append(messages, map[string]any{
@@ -299,16 +273,7 @@ func geminiToOpenAIChat(rawBody []byte, upstreamModel string, stream bool) ([]by
 				continue
 			}
 			role, _ := content["role"].(string)
-			switch role {
-			case "model":
-				role = "assistant"
-			default:
-				role = "user"
-			}
-			messages = append(messages, map[string]any{
-				"role":    role,
-				"content": flattenGeminiParts(content["parts"]),
-			})
+			messages = append(messages, geminiContentToOpenAIMessages(role, content["parts"], tracker)...)
 		}
 	}
 	out["messages"] = messages
@@ -344,6 +309,353 @@ func flattenGeminiParts(value any) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+func anthropicContentToOpenAIMessages(role string, value any) []map[string]any {
+	role = strings.TrimSpace(role)
+	if role == "" {
+		role = "user"
+	}
+
+	switch current := value.(type) {
+	case string:
+		if current == "" {
+			return nil
+		}
+		return []map[string]any{{
+			"role":    role,
+			"content": current,
+		}}
+	case []any:
+		var (
+			messages  []map[string]any
+			parts     []map[string]any
+			toolCalls []map[string]any
+		)
+		flush := func(messageRole string) {
+			if len(parts) == 0 && len(toolCalls) == 0 {
+				return
+			}
+			if len(toolCalls) > 0 {
+				messageRole = "assistant"
+			}
+			message := map[string]any{
+				"role": messageRole,
+			}
+			if len(toolCalls) > 0 {
+				message["tool_calls"] = toolCalls
+				message["content"] = compactOpenAIContent(parts)
+			} else {
+				message["content"] = compactOpenAIContent(parts)
+			}
+			messages = append(messages, message)
+			parts = nil
+			toolCalls = nil
+		}
+
+		for _, item := range current {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch strings.TrimSpace(stringValue(block["type"])) {
+			case "", "text":
+				if text := stringValue(block["text"]); text != "" {
+					parts = append(parts, map[string]any{"type": "text", "text": text})
+				}
+			case "image":
+				if part, ok := anthropicImageToOpenAIContentPart(block); ok {
+					parts = append(parts, part)
+				}
+			case "tool_use":
+				if call, ok := anthropicToolUseToOpenAICall(block); ok {
+					toolCalls = append(toolCalls, call)
+				}
+			case "tool_result":
+				flush(role)
+				if message, ok := anthropicToolResultToOpenAIMessage(block); ok {
+					messages = append(messages, message)
+				}
+			}
+		}
+		flush(role)
+		return messages
+	default:
+		return nil
+	}
+}
+
+func anthropicImageToOpenAIContentPart(block map[string]any) (map[string]any, bool) {
+	source, ok := block["source"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	switch strings.TrimSpace(stringValue(source["type"])) {
+	case "base64":
+		mediaType := strings.TrimSpace(stringValue(source["media_type"]))
+		data := strings.TrimSpace(stringValue(source["data"]))
+		if mediaType == "" || data == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": "data:" + mediaType + ";base64," + data,
+			},
+		}, true
+	case "url":
+		imageURL := strings.TrimSpace(stringValue(source["url"]))
+		if imageURL == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": imageURL,
+			},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func anthropicToolUseToOpenAICall(block map[string]any) (map[string]any, bool) {
+	name := strings.TrimSpace(stringValue(block["name"]))
+	if name == "" {
+		return nil, false
+	}
+	id := strings.TrimSpace(stringValue(block["id"]))
+	if id == "" {
+		id = model.NewID("toolcall")
+	}
+	return map[string]any{
+		"id":   id,
+		"type": "function",
+		"function": map[string]any{
+			"name":      name,
+			"arguments": marshalJSONObject(block["input"]),
+		},
+	}, true
+}
+
+func anthropicToolResultToOpenAIMessage(block map[string]any) (map[string]any, bool) {
+	content := anthropicToolResultContent(block["content"])
+	toolCallID := strings.TrimSpace(stringValue(block["tool_use_id"]))
+	if toolCallID == "" {
+		if content == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"role":    "user",
+			"content": content,
+		}, true
+	}
+	return map[string]any{
+		"role":         "tool",
+		"tool_call_id": toolCallID,
+		"content":      content,
+	}, true
+}
+
+func anthropicToolResultContent(value any) string {
+	if text := flattenAnthropicTextBlocks(value); text != "" {
+		return text
+	}
+	return marshalJSONObject(value)
+}
+
+func flattenAnthropicTextBlocks(value any) string {
+	switch current := value.(type) {
+	case string:
+		return current
+	case []any:
+		parts := make([]string, 0, len(current))
+		for _, item := range current {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(stringValue(block["type"])) != "text" {
+				continue
+			}
+			if text := stringValue(block["text"]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+type geminiToolCallTracker struct {
+	next          int
+	pendingByName map[string][]string
+}
+
+func newGeminiToolCallTracker() *geminiToolCallTracker {
+	return &geminiToolCallTracker{pendingByName: map[string][]string{}}
+}
+
+func (t *geminiToolCallTracker) newCallID(name string) string {
+	t.next++
+	return fmt.Sprintf("gemini-call-%d", t.next)
+}
+
+func (t *geminiToolCallTracker) remember(name, id string) {
+	name = strings.TrimSpace(name)
+	if name == "" || id == "" {
+		return
+	}
+	t.pendingByName[name] = append(t.pendingByName[name], id)
+}
+
+func (t *geminiToolCallTracker) take(name string) string {
+	name = strings.TrimSpace(name)
+	if pending := t.pendingByName[name]; len(pending) > 0 {
+		id := pending[0]
+		if len(pending) == 1 {
+			delete(t.pendingByName, name)
+		} else {
+			t.pendingByName[name] = pending[1:]
+		}
+		return id
+	}
+	return t.newCallID(name)
+}
+
+func geminiContentToOpenAIMessages(role string, value any, tracker *geminiToolCallTracker) []map[string]any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+
+	normalizedRole := "user"
+	if strings.EqualFold(strings.TrimSpace(role), "model") {
+		normalizedRole = "assistant"
+	}
+
+	var (
+		messages  []map[string]any
+		parts     []map[string]any
+		toolCalls []map[string]any
+	)
+	flush := func(messageRole string) {
+		if len(parts) == 0 && len(toolCalls) == 0 {
+			return
+		}
+		message := map[string]any{
+			"role": messageRole,
+		}
+		if len(toolCalls) > 0 {
+			message["tool_calls"] = toolCalls
+			message["content"] = compactOpenAIContent(parts)
+		} else {
+			message["content"] = compactOpenAIContent(parts)
+		}
+		messages = append(messages, message)
+		parts = nil
+		toolCalls = nil
+	}
+
+	for _, item := range items {
+		part, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text := strings.TrimSpace(stringValue(part["text"])); text != "" {
+			parts = append(parts, map[string]any{"type": "text", "text": text})
+		}
+		if call, ok := geminiFunctionCallToOpenAICall(part, tracker); ok {
+			toolCalls = append(toolCalls, call)
+		}
+		if message, ok := geminiFunctionResponseToOpenAIMessage(part, tracker); ok {
+			flush(normalizedRole)
+			messages = append(messages, message)
+		}
+	}
+
+	if len(toolCalls) > 0 {
+		flush("assistant")
+	} else {
+		flush(normalizedRole)
+	}
+	return messages
+}
+
+func geminiFunctionCallToOpenAICall(part map[string]any, tracker *geminiToolCallTracker) (map[string]any, bool) {
+	call, ok := part["functionCall"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	name := strings.TrimSpace(stringValue(call["name"]))
+	if name == "" {
+		return nil, false
+	}
+	id := tracker.newCallID(name)
+	tracker.remember(name, id)
+	return map[string]any{
+		"id":   id,
+		"type": "function",
+		"function": map[string]any{
+			"name":      name,
+			"arguments": marshalJSONObject(call["args"]),
+		},
+	}, true
+}
+
+func geminiFunctionResponseToOpenAIMessage(part map[string]any, tracker *geminiToolCallTracker) (map[string]any, bool) {
+	response, ok := part["functionResponse"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	name := strings.TrimSpace(stringValue(response["name"]))
+	return map[string]any{
+		"role":         "tool",
+		"tool_call_id": tracker.take(name),
+		"content":      marshalJSONObject(response["response"]),
+	}, true
+}
+
+func compactOpenAIContent(parts []map[string]any) any {
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 && stringValue(parts[0]["type"]) == "text" {
+		return stringValue(parts[0]["text"])
+	}
+	return parts
+}
+
+func marshalJSONObject(value any) string {
+	switch current := value.(type) {
+	case nil:
+		return "{}"
+	case string:
+		trimmed := strings.TrimSpace(current)
+		if trimmed == "" {
+			return "{}"
+		}
+		if json.Valid([]byte(trimmed)) {
+			return trimmed
+		}
+		payload, err := json.Marshal(current)
+		if err != nil {
+			return "{}"
+		}
+		return string(payload)
+	default:
+		payload, err := json.Marshal(value)
+		if err != nil || len(payload) == 0 {
+			return "{}"
+		}
+		return string(payload)
+	}
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string) error {
@@ -455,53 +767,54 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 				}
 			} else {
 				var upstream openAIChatResponse
-				if json.Unmarshal([]byte(payload), &upstream) == nil {
-					if upstream.ID != "" {
-						messageID = upstream.ID
+				if err := json.Unmarshal([]byte(payload), &upstream); err != nil {
+					return proxyResponseWriteError{err: err}
+				}
+				if upstream.ID != "" {
+					messageID = upstream.ID
+				}
+				if !messageStarted {
+					if err := writeSSEEvent(w, "message_start", map[string]any{
+						"type": "message_start",
+						"message": map[string]any{
+							"id":            messageID,
+							"type":          "message",
+							"role":          "assistant",
+							"model":         publicAlias,
+							"content":       []any{},
+							"stop_reason":   nil,
+							"stop_sequence": nil,
+							"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
+						},
+					}); err != nil {
+						return proxyResponseWriteError{err: err}
 					}
-					if !messageStarted {
-						if err := writeSSEEvent(w, "message_start", map[string]any{
-							"type": "message_start",
-							"message": map[string]any{
-								"id":            messageID,
-								"type":          "message",
-								"role":          "assistant",
-								"model":         publicAlias,
-								"content":       []any{},
-								"stop_reason":   nil,
-								"stop_sequence": nil,
-								"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
-							},
+					messageStarted = true
+					flush()
+				}
+				deltaText := firstChoiceDeltaText(upstream)
+				if deltaText != "" {
+					if !contentStarted {
+						if err := writeSSEEvent(w, "content_block_start", map[string]any{
+							"type":          "content_block_start",
+							"index":         0,
+							"content_block": map[string]any{"type": "text", "text": ""},
 						}); err != nil {
 							return proxyResponseWriteError{err: err}
 						}
-						messageStarted = true
-						flush()
+						contentStarted = true
 					}
-					deltaText := firstChoiceDeltaText(upstream)
-					if deltaText != "" {
-						if !contentStarted {
-							if err := writeSSEEvent(w, "content_block_start", map[string]any{
-								"type":          "content_block_start",
-								"index":         0,
-								"content_block": map[string]any{"type": "text", "text": ""},
-							}); err != nil {
-								return proxyResponseWriteError{err: err}
-							}
-							contentStarted = true
-						}
-						if err := writeSSEEvent(w, "content_block_delta", map[string]any{
-							"type":  "content_block_delta",
-							"index": 0,
-							"delta": map[string]any{"type": "text_delta", "text": deltaText},
-						}); err != nil {
-							return proxyResponseWriteError{err: err}
-						}
-						flush()
+					if err := writeSSEEvent(w, "content_block_delta", map[string]any{
+						"type":  "content_block_delta",
+						"index": 0,
+						"delta": map[string]any{"type": "text_delta", "text": deltaText},
+					}); err != nil {
+						return proxyResponseWriteError{err: err}
 					}
-					if finish := firstChoiceFinishReason(upstream); finish != "" {
-						finishReason = mapAnthropicStopReason(finish)
-					}
+					flush()
+				}
+				if finish := firstChoiceFinishReason(upstream); finish != "" {
+					finishReason = mapAnthropicStopReason(finish)
 				}
 			}
 		}
@@ -628,27 +941,28 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 				break
 			} else {
 				var upstream openAIChatResponse
-				if json.Unmarshal([]byte(payload), &upstream) == nil {
-					if finish := firstChoiceFinishReason(upstream); finish != "" {
-						finishReason = mapGeminiFinishReason(finish)
-					}
-					deltaText := firstChoiceDeltaText(upstream)
-					if deltaText != "" {
-						if err := writeSSEData(w, map[string]any{
-							"candidates": []map[string]any{
-								{
-									"index": 0,
-									"content": map[string]any{
-										"role":  "model",
-										"parts": []map[string]any{{"text": deltaText}},
-									},
+				if err := json.Unmarshal([]byte(payload), &upstream); err != nil {
+					return proxyResponseWriteError{err: err}
+				}
+				if finish := firstChoiceFinishReason(upstream); finish != "" {
+					finishReason = mapGeminiFinishReason(finish)
+				}
+				deltaText := firstChoiceDeltaText(upstream)
+				if deltaText != "" {
+					if err := writeSSEData(w, map[string]any{
+						"candidates": []map[string]any{
+							{
+								"index": 0,
+								"content": map[string]any{
+									"role":  "model",
+									"parts": []map[string]any{{"text": deltaText}},
 								},
 							},
-						}); err != nil {
-							return proxyResponseWriteError{err: err}
-						}
-						flush()
+						},
+					}); err != nil {
+						return proxyResponseWriteError{err: err}
 					}
+					flush()
 				}
 			}
 		}
@@ -766,7 +1080,7 @@ func mapAnthropicStopReason(value string) string {
 	case "length":
 		return "max_tokens"
 	case "content_filter":
-		return "stop_sequence"
+		return "refusal"
 	default:
 		return "end_turn"
 	}

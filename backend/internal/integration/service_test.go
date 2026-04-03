@@ -262,6 +262,53 @@ func TestResolvedBaseURLClientKeyNormalizesDefaultPorts(t *testing.T) {
 	}
 }
 
+func TestExtractModelNamesIgnoresGenericStrings(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"data": []any{
+			map[string]any{"id": "gpt-5.4"},
+			map[string]any{"model_name": "claude-3-7-sonnet"},
+		},
+		"models": []string{"deepseek/deepseek-r1"},
+		"meta": map[string]any{
+			"last_sync": "2024-01-15",
+			"url":       "https://relay.example/v1/models",
+			"trace_id":  "550e8400-e29b-41d4-a716-446655440000",
+			"message":   "provider responded with model-not-found",
+		},
+	}
+
+	got := extractModelNames(payload)
+	want := []string{"claude-3-7-sonnet", "deepseek/deepseek-r1", "gpt-5.4"}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected model extraction: got=%v want=%v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("unexpected model extraction: got=%v want=%v", got, want)
+		}
+	}
+}
+
+func TestIsLikelyModelNameFiltersCommonGarbage(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]bool{
+		"gpt-5.4":                                 true,
+		"deepseek/deepseek-r1":                    true,
+		"2024-01-15":                              false,
+		"https://relay.example/v1/models":         false,
+		"550e8400-e29b-41d4-a716-446655440000":    false,
+		"provider responded with model-not-found": false,
+	}
+	for input, want := range cases {
+		if got := isLikelyModelName(input); got != want {
+			t.Fatalf("unexpected model-name classification for %q: got=%v want=%v", input, got, want)
+		}
+	}
+}
+
 func TestServiceSyncStateOneHub(t *testing.T) {
 	t.Parallel()
 

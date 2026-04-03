@@ -97,23 +97,32 @@ func collectUsageMaps(current any, out *[]map[string]any) {
 }
 
 func readTokenInt(values map[string]any, keys ...string) int64 {
+	var maximum int64
 	for _, key := range keys {
 		if values == nil {
 			continue
 		}
 		switch value := values[key].(type) {
 		case float64:
-			return int64(value)
+			if int64(value) > maximum {
+				maximum = int64(value)
+			}
 		case int:
-			return int64(value)
+			if int64(value) > maximum {
+				maximum = int64(value)
+			}
 		case int64:
-			return value
+			if value > maximum {
+				maximum = value
+			}
 		case json.Number:
 			n, _ := value.Int64()
-			return n
+			if n > maximum {
+				maximum = n
+			}
 		}
 	}
-	return 0
+	return maximum
 }
 
 func maxInt64(base int64, values ...int64) int64 {

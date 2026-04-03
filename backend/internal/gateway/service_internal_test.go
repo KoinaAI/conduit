@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -68,6 +69,137 @@ func TestRewriteProxyRequestGeminiPreservesBody(t *testing.T) {
 	}
 }
 
+func TestAnthropicToOpenAIChatPreservesToolAndImageContext(t *testing.T) {
+	t.Parallel()
+
+	body, stream, err := anthropicToOpenAIChat(map[string]any{
+		"stream": true,
+		"system": "You are a router.",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "image",
+						"source": map[string]any{
+							"type":       "base64",
+							"media_type": "image/png",
+							"data":       "ZmFrZQ==",
+						},
+					},
+					map[string]any{"type": "text", "text": "look at this"},
+				},
+			},
+			map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "text", "text": "calling tool"},
+					map[string]any{"type": "tool_use", "id": "toolu_1", "name": "search", "input": map[string]any{"q": "weather"}},
+				},
+			},
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": []any{map[string]any{"type": "text", "text": "sunny"}}},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"name": "search", "description": "search the web", "input_schema": map[string]any{"type": "object"}},
+		},
+	}, "provider-model")
+	if err != nil {
+		t.Fatalf("anthropic to openai chat: %v", err)
+	}
+	if !stream {
+		t.Fatal("expected stream flag to be preserved")
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 4 {
+		t.Fatalf("expected system + user + assistant + tool messages, got %d", len(messages))
+	}
+	user := messages[1].(map[string]any)
+	content := user["content"].([]any)
+	if content[0].(map[string]any)["type"] != "image_url" {
+		t.Fatalf("expected anthropic image block to become image_url content, got %+v", content[0])
+	}
+	assistant := messages[2].(map[string]any)
+	toolCalls := assistant["tool_calls"].([]any)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %+v", assistant)
+	}
+	toolMessage := messages[3].(map[string]any)
+	if toolMessage["role"] != "tool" || toolMessage["tool_call_id"] != "toolu_1" || toolMessage["content"] != "sunny" {
+		t.Fatalf("expected tool result message to be preserved, got %+v", toolMessage)
+	}
+}
+
+func TestGeminiToOpenAIChatPreservesFunctionCallsAndResponses(t *testing.T) {
+	t.Parallel()
+
+	body, err := geminiToOpenAIChat([]byte(`{
+		"contents":[
+			{"role":"user","parts":[{"text":"weather?"}]},
+			{"role":"model","parts":[{"functionCall":{"name":"search","args":{"q":"weather"}}}]},
+			{"role":"function","parts":[{"functionResponse":{"name":"search","response":{"result":"sunny"}}}]}
+		]
+	}`), "provider-model", false)
+	if err != nil {
+		t.Fatalf("gemini to openai chat: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("expected user + assistant + tool messages, got %d", len(messages))
+	}
+	assistant := messages[1].(map[string]any)
+	if assistant["role"] != "assistant" {
+		t.Fatalf("expected function call to map to assistant message, got %+v", assistant)
+	}
+	toolCalls := assistant["tool_calls"].([]any)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %+v", assistant)
+	}
+	callID := toolCalls[0].(map[string]any)["id"]
+	toolMessage := messages[2].(map[string]any)
+	if toolMessage["role"] != "tool" || toolMessage["tool_call_id"] != callID {
+		t.Fatalf("expected function response to map to tool message, got %+v", toolMessage)
+	}
+	if !strings.Contains(toolMessage["content"].(string), `"result":"sunny"`) {
+		t.Fatalf("expected function response payload to be preserved, got %+v", toolMessage)
+	}
+}
+
+func TestWriteAnthropicSSEReturnsErrorOnMalformedJSONEvent(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	resp := &http.Response{
+		Body: io.NopCloser(strings.NewReader("data: {bad json}\n\n")),
+	}
+	err := writeAnthropicSSE(recorder, resp, NewUsageObserver(model.ProtocolOpenAIChat), "gpt-5.4")
+	if err == nil || !responseWriteStarted(err) {
+		t.Fatalf("expected malformed SSE payload to fail after write start, got %v", err)
+	}
+}
+
+func TestMapAnthropicStopReasonContentFilterBecomesRefusal(t *testing.T) {
+	t.Parallel()
+
+	if got := mapAnthropicStopReason("content_filter"); got != "refusal" {
+		t.Fatalf("expected content_filter to map to refusal, got %q", got)
+	}
+}
+
 func TestBearerTokenRejectsNonBearerSchemes(t *testing.T) {
 	t.Parallel()
 
@@ -76,6 +208,41 @@ func TestBearerTokenRejectsNonBearerSchemes(t *testing.T) {
 	}
 	if got := bearerToken("bearer secret-token"); got != "secret-token" {
 		t.Fatalf("expected bearer token to be parsed case-insensitively, got %q", got)
+	}
+}
+
+func TestReadTokenIntFallsBackPastZeroValue(t *testing.T) {
+	t.Parallel()
+
+	if got := readTokenInt(map[string]any{
+		"prompt_tokens": float64(0),
+		"input_tokens":  float64(500),
+	}, "prompt_tokens", "input_tokens", "promptTokenCount"); got != 500 {
+		t.Fatalf("expected later token keys to be considered when earlier alias is zero, got %d", got)
+	}
+}
+
+func TestCopyForwardHeadersDropsHopByHopAndProxyCredentials(t *testing.T) {
+	t.Parallel()
+
+	src := http.Header{}
+	src.Set("Connection", "Keep-Alive, X-Connection-Token")
+	src.Set("Keep-Alive", "timeout=5")
+	src.Set("Proxy-Authorization", "Basic abc123")
+	src.Set("Transfer-Encoding", "chunked")
+	src.Set("TE", "trailers")
+	src.Set("Trailer", "X-Test")
+	src.Set("X-Connection-Token", "secret")
+	src.Set("X-Trace-ID", "trace-1")
+
+	dst := http.Header{}
+	copyForwardHeaders(dst, src)
+
+	if dst.Get("Proxy-Authorization") != "" || dst.Get("Transfer-Encoding") != "" || dst.Get("Keep-Alive") != "" || dst.Get("X-Connection-Token") != "" {
+		t.Fatalf("expected hop-by-hop and proxy headers to be stripped, got %+v", dst)
+	}
+	if dst.Get("X-Trace-ID") != "trace-1" {
+		t.Fatalf("expected end-to-end headers to be forwarded, got %+v", dst)
 	}
 }
 

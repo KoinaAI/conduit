@@ -1129,10 +1129,6 @@ func preserveProviderSecrets(current, next model.Provider) model.Provider {
 	for index := range next.Credentials {
 		credential := &next.Credentials[index]
 		currentCredential, ok := byID[credential.ID]
-		if !ok && index < len(current.Credentials) {
-			currentCredential = current.Credentials[index]
-			ok = true
-		}
 		if ok && strings.TrimSpace(credential.APIKey) == "" {
 			credential.APIKey = currentCredential.APIKey
 		}
@@ -1159,10 +1155,6 @@ func preserveGatewayKeys(current, next []model.GatewayKey) []model.GatewayKey {
 	for index := range next {
 		key := next[index]
 		currentKey, ok := byID[key.ID]
-		if !ok && index < len(current) {
-			currentKey = current[index]
-			ok = true
-		}
 		if ok {
 			key = preserveGatewayKeySecrets(currentKey, key)
 		}

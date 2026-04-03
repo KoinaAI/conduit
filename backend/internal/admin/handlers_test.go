@@ -587,6 +587,115 @@ func TestPutStatePreservesGatewayKeySecrets(t *testing.T) {
 	}
 }
 
+func TestPutStateDoesNotBorrowGatewayKeySecretsAcrossDifferentIDs(t *testing.T) {
+	t.Parallel()
+
+	hash, err := model.HashGatewaySecret("original-secret-123")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:               "gk-1",
+			Name:             "gateway",
+			SecretHash:       hash,
+			SecretLookupHash: "lookup-hash",
+			SecretPreview:    model.SecretPreview("original-secret-123"),
+			Enabled:          true,
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{
+		"version":"2026-04-01",
+		"providers":[],
+		"model_routes":[],
+		"pricing_profiles":[],
+		"integrations":[],
+		"gateway_keys":[{"id":"gk-2","name":"new-key","enabled":true}],
+		"request_history":[]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.PutState(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	key, ok := saved.FindGatewayKey("gk-2")
+	if !ok {
+		t.Fatal("expected replacement gateway key to be present")
+	}
+	if key.SecretHash != "" || key.SecretLookupHash != "" || key.SecretPreview != "" {
+		t.Fatalf("expected unmatched gateway key IDs not to inherit existing secrets, got %+v", key)
+	}
+}
+
+func TestPutStateDoesNotBorrowCredentialSecretsAcrossDifferentIDs(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		Providers: []model.Provider{{
+			ID:      "provider-1",
+			Name:    "provider",
+			Kind:    model.ProviderKindOpenAICompatible,
+			BaseURL: "https://provider.example",
+			APIKey:  "provider-key",
+			Enabled: true,
+			Credentials: []model.ProviderCredential{{
+				ID:      "cred-1",
+				Label:   "primary",
+				APIKey:  "credential-secret",
+				Enabled: true,
+			}},
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{
+		"version":"2026-04-01",
+		"providers":[{
+			"id":"provider-1",
+			"name":"provider",
+			"kind":"openai-compatible",
+			"base_url":"https://provider.example",
+			"enabled":true,
+			"credentials":[{"id":"cred-2","label":"replacement","enabled":true}]
+		}],
+		"model_routes":[],
+		"pricing_profiles":[],
+		"integrations":[],
+		"gateway_keys":[],
+		"request_history":[]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.PutState(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	provider, ok := saved.FindProvider("provider-1")
+	if !ok {
+		t.Fatal("expected provider to remain")
+	}
+	if len(provider.Credentials) != 1 {
+		t.Fatalf("expected one credential, got %+v", provider.Credentials)
+	}
+	if provider.Credentials[0].ID != "cred-2" {
+		t.Fatalf("expected replacement credential to be kept, got %+v", provider.Credentials[0])
+	}
+	if provider.Credentials[0].APIKey != "" {
+		t.Fatalf("expected unmatched credential IDs not to inherit API keys, got %+v", provider.Credentials[0])
+	}
+}
+
 func TestSyncAllIntegrationsAppliesSuccessfulResultsEvenWhenSomeFail(t *testing.T) {
 	t.Parallel()
 

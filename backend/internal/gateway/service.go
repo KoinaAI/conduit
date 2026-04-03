@@ -971,9 +971,36 @@ func extractGeminiModelFromPath(path string) (string, error) {
 }
 
 func copyForwardHeaders(dst, src http.Header) {
+	skipped := map[string]struct{}{
+		"authorization":            {},
+		"connection":               {},
+		"content-length":           {},
+		"host":                     {},
+		"keep-alive":               {},
+		"proxy-authenticate":       {},
+		"proxy-authorization":      {},
+		"proxy-connection":         {},
+		"sec-websocket-accept":     {},
+		"sec-websocket-extensions": {},
+		"sec-websocket-key":        {},
+		"sec-websocket-version":    {},
+		"te":                       {},
+		"trailer":                  {},
+		"transfer-encoding":        {},
+		"upgrade":                  {},
+		"x-api-key":                {},
+	}
+	for _, value := range src.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			name := strings.ToLower(strings.TrimSpace(token))
+			if name == "" {
+				continue
+			}
+			skipped[name] = struct{}{}
+		}
+	}
 	for key, values := range src {
-		switch strings.ToLower(key) {
-		case "host", "content-length", "authorization", "x-api-key", "connection", "upgrade", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-accept":
+		if _, skip := skipped[strings.ToLower(key)]; skip {
 			continue
 		}
 		for _, value := range values {

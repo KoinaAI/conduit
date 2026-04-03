@@ -711,16 +711,16 @@ func extractModelNames(payload map[string]any) []string {
 		switch value := current.(type) {
 		case map[string]any:
 			if id, ok := value["id"].(string); ok && id != "" {
-				if !seen[id] {
-					seen[id] = true
-					models = append(models, id)
-				}
+				appendModelNameCandidate(id, seen, &models)
 			}
 			if name, ok := value["model"].(string); ok && name != "" {
-				if !seen[name] {
-					seen[name] = true
-					models = append(models, name)
-				}
+				appendModelNameCandidate(name, seen, &models)
+			}
+			if name, ok := value["model_name"].(string); ok && name != "" {
+				appendModelNameCandidate(name, seen, &models)
+			}
+			if name, ok := value["name"].(string); ok && name != "" {
+				appendModelNameCandidate(name, seen, &models)
 			}
 			for _, nested := range value {
 				queue = append(queue, queueItem{value: nested})
@@ -731,23 +731,96 @@ func extractModelNames(payload map[string]any) []string {
 			}
 		case []string:
 			for _, item := range value {
-				if item != "" && !seen[item] {
-					seen[item] = true
-					models = append(models, item)
-				}
-			}
-		case string:
-			if strings.Contains(value, "-") || strings.Contains(value, "/") {
-				if !seen[value] {
-					seen[value] = true
-					models = append(models, value)
-				}
+				appendModelNameCandidate(item, seen, &models)
 			}
 		}
 	}
 
 	slices.Sort(models)
 	return models
+}
+
+func appendModelNameCandidate(raw string, seen map[string]bool, models *[]string) {
+	candidate := strings.TrimSpace(raw)
+	if !isLikelyModelName(candidate) || seen[candidate] {
+		return
+	}
+	seen[candidate] = true
+	*models = append(*models, candidate)
+}
+
+func isLikelyModelName(value string) bool {
+	if value == "" {
+		return false
+	}
+	if strings.ContainsAny(value, " \t\r\n") {
+		return false
+	}
+	if strings.HasPrefix(strings.ToLower(value), "http://") || strings.HasPrefix(strings.ToLower(value), "https://") {
+		return false
+	}
+	if looksLikeUUID(value) {
+		return false
+	}
+	if len(value) == len("2024-01-15") {
+		dateLike := true
+		for index, char := range value {
+			switch index {
+			case 4, 7:
+				if char != '-' {
+					dateLike = false
+				}
+			default:
+				if char < '0' || char > '9' {
+					dateLike = false
+				}
+			}
+		}
+		if dateLike {
+			return false
+		}
+	}
+	validRune := false
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z':
+			validRune = true
+		case char >= 'A' && char <= 'Z':
+			validRune = true
+		case char >= '0' && char <= '9':
+		case char == '-', char == '_', char == '.', char == '/', char == ':':
+		default:
+			return false
+		}
+	}
+	return validRune
+}
+
+func looksLikeUUID(value string) bool {
+	if len(value) != len("00000000-0000-0000-0000-000000000000") {
+		return false
+	}
+	hexRunes := 0
+	for index, char := range value {
+		switch index {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			switch {
+			case char >= '0' && char <= '9':
+				hexRunes++
+			case char >= 'a' && char <= 'f':
+				hexRunes++
+			case char >= 'A' && char <= 'F':
+				hexRunes++
+			default:
+				return false
+			}
+		}
+	}
+	return hexRunes == 32
 }
 
 func pointerBool(value bool) *bool {

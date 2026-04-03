@@ -70,6 +70,19 @@ func Open(path string) (*FileStore, error) {
 	return store, nil
 }
 
+// Close flushes the SQLite WAL before closing the backing database handle.
+func (s *FileStore) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+	err := s.db.Close()
+	s.db = nil
+	return err
+}
+
 func loadLegacyJSON(path string) (*model.State, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

@@ -50,14 +50,25 @@ func TestOriginChecks(t *testing.T) {
 	}
 }
 
-func TestSecretLookupPepperFallsBackToAdminToken(t *testing.T) {
+func TestValidateRejectsNegativeProbeInterval(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:           "super-secret-admin-token",
+		ProbeIntervalSeconds: -1,
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected negative probe interval to be rejected")
+	}
+}
+
+func TestSecretLookupPepperUsesExplicitValueOnly(t *testing.T) {
 	t.Parallel()
 
 	cfg := Config{AdminToken: "admin-token"}
-	if got := cfg.SecretLookupPepper(); got != "admin-token" {
-		t.Fatalf("expected admin token fallback, got %q", got)
+	if got := cfg.SecretLookupPepper(); got != "" {
+		t.Fatalf("expected empty lookup pepper without explicit config, got %q", got)
 	}
-
 	cfg.GatewaySecretLookupPepper = "lookup-pepper"
 	if got := cfg.SecretLookupPepper(); got != "lookup-pepper" {
 		t.Fatalf("expected explicit lookup pepper, got %q", got)

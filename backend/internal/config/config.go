@@ -42,9 +42,11 @@ func (c Config) Validate() error {
 	switch token := strings.TrimSpace(c.AdminToken); token {
 	case "", "dev-admin-token", "change-this-admin-token":
 		return errors.New("GATEWAY_ADMIN_TOKEN must be explicitly configured with a non-default value")
-	default:
-		return nil
 	}
+	if c.ProbeIntervalSeconds < 0 {
+		return errors.New("GATEWAY_PROBE_INTERVAL_SECONDS must be greater than or equal to 0")
+	}
+	return nil
 }
 
 func (c Config) AllowsGatewayOrigin(origin string) bool {
@@ -60,10 +62,7 @@ func (c Config) AllowsRealtimeOrigin(origin string) bool {
 }
 
 func (c Config) SecretLookupPepper() string {
-	if pepper := strings.TrimSpace(c.GatewaySecretLookupPepper); pepper != "" {
-		return pepper
-	}
-	return strings.TrimSpace(c.AdminToken)
+	return strings.TrimSpace(c.GatewaySecretLookupPepper)
 }
 
 func getenv(key, fallback string) string {

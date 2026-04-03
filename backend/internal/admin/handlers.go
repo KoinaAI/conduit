@@ -1,13 +1,16 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/config"
@@ -48,11 +51,16 @@ func (h *Handlers) Middleware(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		adminToken := strings.TrimSpace(h.cfg.AdminToken)
+		if adminToken == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "admin API is not configured"})
+			return
+		}
 		token := r.Header.Get("X-Admin-Token")
 		if token == "" {
 			token = bearerToken(r.Header.Get("Authorization"))
 		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(h.cfg.AdminToken)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
@@ -110,17 +118,16 @@ func (h *Handlers) SyncIntegration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := h.integration.PrepareSync(r.Context(), current)
-	var applyErr error
-	saved, err := h.updateState(func(state *model.State) error {
-		_, applyErr = h.integration.ApplySyncResult(state, id, result)
-		return nil
-	})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	if result.Err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": result.Err.Error()})
 		return
 	}
-	if applyErr != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": applyErr.Error()})
+	saved, err := h.updateState(func(state *model.State) error {
+		_, err := h.integration.ApplySyncResult(state, id, result)
+		return err
+	})
+	if err != nil {
+		writeResourceError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, saved)
@@ -161,32 +168,57 @@ func (h *Handlers) SyncAllIntegrations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	operations := make([]syncOperation, 0, len(snapshot.Integrations))
-	var firstErr error
+	indexByID := map[string]int{}
 	for _, current := range snapshot.Integrations {
 		if !current.Enabled {
 			continue
 		}
-		result := h.integration.PrepareSync(r.Context(), current)
-		if firstErr == nil && result.Err != nil {
-			firstErr = result.Err
+		operations = append(operations, syncOperation{id: current.ID})
+		indexByID[current.ID] = len(operations) - 1
+	}
+	if len(operations) == 0 {
+		writeJSON(w, http.StatusOK, snapshot)
+		return
+	}
+
+	var (
+		mu       sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+	)
+	for _, current := range snapshot.Integrations {
+		if !current.Enabled {
+			continue
 		}
-		operations = append(operations, syncOperation{id: current.ID, result: result})
+		current := current
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := h.integration.PrepareSync(r.Context(), current)
+			mu.Lock()
+			operations[indexByID[current.ID]].result = result
+			if firstErr == nil && result.Err != nil {
+				firstErr = result.Err
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": firstErr.Error()})
+		return
 	}
 
 	saved, err := h.updateState(func(state *model.State) error {
 		for _, operation := range operations {
-			if _, err := h.integration.ApplySyncResult(state, operation.id, operation.result); err != nil && firstErr == nil {
-				firstErr = err
+			if _, err := h.integration.ApplySyncResult(state, operation.id, operation.result); err != nil {
+				return err
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	if firstErr != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": firstErr.Error()})
+		writeResourceError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, saved)
@@ -271,16 +303,24 @@ func (h *Handlers) DeleteProvider(w http.ResponseWriter, r *http.Request) {
 		if len(state.Providers) == before {
 			return errNotFound("provider")
 		}
-		for routeIndex := range state.ModelRoutes {
-			route := &state.ModelRoutes[routeIndex]
-			filtered := route.Targets[:0]
+		removedAliases := map[string]struct{}{}
+		filteredRoutes := state.ModelRoutes[:0]
+		for _, route := range state.ModelRoutes {
+			filteredTargets := route.Targets[:0]
 			for _, target := range route.Targets {
 				if target.AccountID != id {
-					filtered = append(filtered, target)
+					filteredTargets = append(filteredTargets, target)
 				}
 			}
-			route.Targets = filtered
+			route.Targets = filteredTargets
+			if len(route.Targets) == 0 {
+				removedAliases[strings.ToLower(strings.TrimSpace(route.Alias))] = struct{}{}
+				continue
+			}
+			filteredRoutes = append(filteredRoutes, route)
 		}
+		state.ModelRoutes = filteredRoutes
+		removeGatewayKeyModelReferences(state.GatewayKeys, removedAliases)
 		return nil
 	})
 	if err != nil {
@@ -303,11 +343,15 @@ func (h *Handlers) CreateRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	saved, err := h.updateState(func(state *model.State) error {
+		payload.Alias = strings.TrimSpace(payload.Alias)
+		if err := validateRouteAlias(state.ModelRoutes, payload.Alias, ""); err != nil {
+			return err
+		}
 		state.ModelRoutes = append([]model.ModelRoute{payload}, state.ModelRoutes...)
 		return nil
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeMutationError(w, err)
 		return
 	}
 	route, _ := saved.FindRoute(payload.Alias)
@@ -332,7 +376,14 @@ func (h *Handlers) UpdateRoute(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	payload.Alias = strings.TrimSpace(payload.Alias)
+	if payload.Alias == "" {
+		payload.Alias = strings.TrimSpace(alias)
+	}
 	saved, err := h.updateState(func(state *model.State) error {
+		if err := validateRouteAlias(state.ModelRoutes, payload.Alias, alias); err != nil {
+			return err
+		}
 		for index := range state.ModelRoutes {
 			if !strings.EqualFold(state.ModelRoutes[index].Alias, alias) {
 				continue
@@ -343,7 +394,7 @@ func (h *Handlers) UpdateRoute(w http.ResponseWriter, r *http.Request) {
 		return errNotFound("route")
 	})
 	if err != nil {
-		writeResourceError(w, err)
+		writeMutationError(w, err)
 		return
 	}
 	route, _ := saved.FindRoute(payload.Alias)
@@ -365,6 +416,9 @@ func (h *Handlers) DeleteRoute(w http.ResponseWriter, r *http.Request) {
 		if len(state.ModelRoutes) == before {
 			return errNotFound("route")
 		}
+		removeGatewayKeyModelReferences(state.GatewayKeys, map[string]struct{}{
+			strings.ToLower(strings.TrimSpace(alias)): {},
+		})
 		return nil
 	})
 	if err != nil {
@@ -618,6 +672,103 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// UpdateGatewayKey serves PUT /api/admin/gateway-keys/{id}.
+func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var payload struct {
+		Name             *string          `json:"name"`
+		Secret           *string          `json:"secret"`
+		Enabled          *bool            `json:"enabled"`
+		ExpiresAt        json.RawMessage  `json:"expires_at"`
+		AllowedModels    []string         `json:"allowed_models"`
+		AllowedProtocols []model.Protocol `json:"allowed_protocols"`
+		MaxConcurrency   *int             `json:"max_concurrency"`
+		RateLimitRPM     *int             `json:"rate_limit_rpm"`
+		DailyBudgetUSD   *float64         `json:"daily_budget_usd"`
+		Notes            *string          `json:"notes"`
+	}
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	var rotatedSecret string
+	saved, err := h.updateState(func(state *model.State) error {
+		for index := range state.GatewayKeys {
+			if state.GatewayKeys[index].ID != id {
+				continue
+			}
+			current := state.GatewayKeys[index]
+			if payload.Name != nil {
+				current.Name = strings.TrimSpace(*payload.Name)
+			}
+			if payload.Enabled != nil {
+				current.Enabled = *payload.Enabled
+			}
+			if payload.ExpiresAt != nil {
+				if bytes.Equal(bytes.TrimSpace(payload.ExpiresAt), []byte("null")) {
+					current.ExpiresAt = nil
+				} else {
+					var expiresAt time.Time
+					if err := json.Unmarshal(payload.ExpiresAt, &expiresAt); err != nil {
+						return errValidation("expires_at must be a valid RFC3339 timestamp or null")
+					}
+					current.ExpiresAt = &expiresAt
+				}
+			}
+			if payload.AllowedModels != nil {
+				current.AllowedModels = payload.AllowedModels
+			}
+			if payload.AllowedProtocols != nil {
+				current.AllowedProtocols = payload.AllowedProtocols
+			}
+			if payload.MaxConcurrency != nil {
+				current.MaxConcurrency = *payload.MaxConcurrency
+			}
+			if payload.RateLimitRPM != nil {
+				current.RateLimitRPM = *payload.RateLimitRPM
+			}
+			if payload.DailyBudgetUSD != nil {
+				current.DailyBudgetUSD = *payload.DailyBudgetUSD
+			}
+			if payload.Notes != nil {
+				current.Notes = *payload.Notes
+			}
+			if payload.Secret != nil {
+				secret := strings.TrimSpace(*payload.Secret)
+				if err := validateGatewaySecretStrength(secret); err != nil {
+					return errValidation(err.Error())
+				}
+				hash, err := model.HashGatewaySecret(secret)
+				if err != nil {
+					return errValidation(err.Error())
+				}
+				current.SecretHash = hash
+				current.SecretLookupHash = model.GatewaySecretLookupHash(secret, h.cfg.SecretLookupPepper())
+				current.SecretPreview = model.SecretPreview(secret)
+				rotatedSecret = secret
+			}
+			if strings.TrimSpace(current.Name) == "" {
+				current.Name = current.ID
+			}
+			current.UpdatedAt = time.Now().UTC()
+			state.GatewayKeys[index] = current
+			return nil
+		}
+		return errNotFound("gateway key")
+	})
+	if err != nil {
+		writeMutationError(w, err)
+		return
+	}
+	key, _ := saved.FindGatewayKey(id)
+	response := map[string]any{"gateway_key": key}
+	if rotatedSecret != "" {
+		response["secret"] = rotatedSecret
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 // DeleteGatewayKey serves DELETE /api/admin/gateway-keys/{id}.
 func (h *Handlers) DeleteGatewayKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -776,6 +927,10 @@ func buildOpenAPISpec() map[string]any {
 				"get":  map[string]any{"summary": "List gateway keys"},
 				"post": map[string]any{"summary": "Create gateway key"},
 			},
+			"/api/admin/gateway-keys/{id}": map[string]any{
+				"put":    map[string]any{"summary": "Update gateway key"},
+				"delete": map[string]any{"summary": "Delete gateway key"},
+			},
 			"/api/admin/request-history": map[string]any{
 				"get": map[string]any{"summary": "List request history"},
 			},
@@ -916,8 +1071,15 @@ func preserveIntegrationSecrets(current, next model.Integration) model.Integrati
 }
 
 func validateGatewaySecretStrength(secret string) error {
-	if len(strings.TrimSpace(secret)) < 16 {
+	trimmed := strings.TrimSpace(secret)
+	if trimmed == "" {
+		return errors.New("custom gateway secret is required")
+	}
+	if len(trimmed) < 16 {
 		return errors.New("custom gateway secrets must be at least 16 characters long")
+	}
+	if len([]byte(trimmed)) > 72 {
+		return errors.New("custom gateway secrets must be 72 bytes or fewer")
 	}
 	return nil
 }
@@ -951,15 +1113,19 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 }
 
 func bearerToken(value string) string {
-	const prefix = "Bearer "
-	if len(value) >= len(prefix) && value[:len(prefix)] == prefix {
-		return value[len(prefix):]
+	scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
 	}
-	return value
+	return strings.TrimSpace(token)
 }
 
 type resourceError struct {
 	name string
+}
+
+type validationError struct {
+	message string
 }
 
 func (e resourceError) Error() string {
@@ -968,6 +1134,10 @@ func (e resourceError) Error() string {
 
 func errNotFound(name string) error {
 	return resourceError{name: name}
+}
+
+func errValidation(message string) error {
+	return validationError{message: message}
 }
 
 func writeResourceError(w http.ResponseWriter, err error) {
@@ -979,6 +1149,19 @@ func writeResourceError(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 }
 
+func (e validationError) Error() string {
+	return e.message
+}
+
+func writeMutationError(w http.ResponseWriter, err error) {
+	var validation validationError
+	if errors.As(err, &validation) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": validation.Error()})
+		return
+	}
+	writeResourceError(w, err)
+}
+
 func slicesDeleteProvider(providers []model.Provider, id string) []model.Provider {
 	filtered := providers[:0]
 	for _, provider := range providers {
@@ -987,4 +1170,47 @@ func slicesDeleteProvider(providers []model.Provider, id string) []model.Provide
 		}
 	}
 	return filtered
+}
+
+func validateRouteAlias(routes []model.ModelRoute, alias, currentAlias string) error {
+	trimmedAlias := strings.TrimSpace(alias)
+	if trimmedAlias == "" {
+		return errValidation("route alias is required")
+	}
+	for _, route := range routes {
+		if !strings.EqualFold(route.Alias, trimmedAlias) {
+			continue
+		}
+		if currentAlias != "" && strings.EqualFold(route.Alias, currentAlias) {
+			continue
+		}
+		return errValidation("route alias already exists")
+	}
+	return nil
+}
+
+func removeGatewayKeyModelReferences(keys []model.GatewayKey, aliases map[string]struct{}) {
+	if len(aliases) == 0 {
+		return
+	}
+	updatedAt := time.Now().UTC()
+	for keyIndex := range keys {
+		if len(keys[keyIndex].AllowedModels) == 0 {
+			continue
+		}
+		original := keys[keyIndex].AllowedModels
+		filtered := original[:0]
+		removedAny := false
+		for _, alias := range original {
+			if _, removed := aliases[strings.ToLower(strings.TrimSpace(alias))]; removed {
+				removedAny = true
+				continue
+			}
+			filtered = append(filtered, alias)
+		}
+		if removedAny {
+			keys[keyIndex].AllowedModels = slices.Clone(filtered)
+			keys[keyIndex].UpdatedAt = updatedAt
+		}
+	}
 }

@@ -12,6 +12,7 @@ import (
 const (
 	defaultStickySweepInterval = 64
 	defaultRetryAfterCooldown  = 2 * time.Minute
+	maxRetryAfterCooldown      = 15 * time.Minute
 )
 
 type endpointRuntimeState struct {
@@ -47,20 +48,22 @@ type gatewayKeyWindow struct {
 }
 
 type runtimeState struct {
-	mu           sync.Mutex
-	endpoints    map[string]*endpointRuntimeState
-	credentials  map[string]*credentialRuntimeState
-	sticky       map[string]stickyBinding
-	stickyWrites int
-	keyWindows   map[string]*gatewayKeyWindow
+	mu                  sync.Mutex
+	endpoints           map[string]*endpointRuntimeState
+	credentials         map[string]*credentialRuntimeState
+	credentialHashCache map[string]string
+	sticky              map[string]stickyBinding
+	stickyWrites        int
+	keyWindows          map[string]*gatewayKeyWindow
 }
 
 func newRuntimeState() *runtimeState {
 	return &runtimeState{
-		endpoints:   map[string]*endpointRuntimeState{},
-		credentials: map[string]*credentialRuntimeState{},
-		sticky:      map[string]stickyBinding{},
-		keyWindows:  map[string]*gatewayKeyWindow{},
+		endpoints:           map[string]*endpointRuntimeState{},
+		credentials:         map[string]*credentialRuntimeState{},
+		credentialHashCache: map[string]string{},
+		sticky:              map[string]stickyBinding{},
+		keyWindows:          map[string]*gatewayKeyWindow{},
 	}
 }
 
@@ -97,7 +100,7 @@ func (r *runtimeState) endpointOpen(candidate resolvedCandidate, now time.Time) 
 func (r *runtimeState) credentialCoolingDown(candidate resolvedCandidate, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.credentialState(credentialRuntimeKey(candidate))
+	state := r.credentialState(r.credentialRuntimeKeyLocked(candidate))
 	return state.PermanentlyDisabled || state.DisabledUntil.After(now)
 }
 
@@ -114,7 +117,7 @@ func (r *runtimeState) reportSuccess(candidate resolvedCandidate, latency time.D
 	endpoint.LastError = ""
 	endpoint.LastCheckedAt = now
 
-	credential := r.credentialState(credentialRuntimeKey(candidate))
+	credential := r.credentialState(r.credentialRuntimeKeyLocked(candidate))
 	credential.ConsecutiveFailures = 0
 	credential.DisabledUntil = time.Time{}
 	credential.PermanentlyDisabled = false
@@ -152,7 +155,7 @@ func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int
 		endpoint.OpenUntil = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second)
 	}
 
-	credential := r.credentialState(credentialRuntimeKey(candidate))
+	credential := r.credentialState(r.credentialRuntimeKeyLocked(candidate))
 	credential.ConsecutiveFailures++
 	credential.LastStatusCode = statusCode
 	credential.LastError = errMessage
@@ -165,10 +168,10 @@ func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int
 		if retryAfter <= 0 {
 			retryAfter = defaultRetryAfterCooldown
 		}
-		credential.DisabledUntil = now.Add(retryAfter)
+		credential.DisabledUntil = now.Add(clampRetryAfterCooldown(retryAfter))
 	default:
 		if retryAfter > 0 {
-			credential.DisabledUntil = now.Add(retryAfter)
+			credential.DisabledUntil = now.Add(clampRetryAfterCooldown(retryAfter))
 		}
 	}
 }
@@ -263,8 +266,24 @@ func endpointRuntimeKey(candidate resolvedCandidate) string {
 	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.endpoint.ID))
 }
 
-func credentialRuntimeKey(candidate resolvedCandidate) string {
-	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.credential.ID)) + "\x00" + model.LegacyGatewaySecretLookupHash(candidate.credential.APIKey)
+func (r *runtimeState) credentialRuntimeKeyLocked(candidate resolvedCandidate) string {
+	cacheKey := strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.credential.ID)) + "\x00" + candidate.credential.APIKey
+	lookupHash, ok := r.credentialHashCache[cacheKey]
+	if !ok {
+		lookupHash = model.LegacyGatewaySecretLookupHash(candidate.credential.APIKey)
+		r.credentialHashCache[cacheKey] = lookupHash
+	}
+	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.credential.ID)) + "\x00" + lookupHash
+}
+
+func clampRetryAfterCooldown(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	if delay > maxRetryAfterCooldown {
+		return maxRetryAfterCooldown
+	}
+	return delay
 }
 
 const (

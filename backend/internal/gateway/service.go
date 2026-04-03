@@ -70,6 +70,7 @@ const (
 	responseModeAnthropicSSE  responseMode = "anthropic-sse"
 	responseModeGeminiJSON    responseMode = "gemini-json"
 	responseModeGeminiSSE     responseMode = "gemini-sse"
+	maxRealtimeFrameBytes     int64        = 8 << 20
 )
 
 type cancelReadCloser struct {
@@ -409,6 +410,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer clientConn.Close()
+	clientConn.SetReadLimit(maxRealtimeFrameBytes)
 
 	headers := http.Header{}
 	copyForwardHeaders(headers, r.Header)
@@ -429,6 +431,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer serverConn.Close()
+	serverConn.SetReadLimit(maxRealtimeFrameBytes)
 
 	started := time.Now().UTC()
 	observer := NewUsageObserver(model.ProtocolOpenAIRealtime)
@@ -449,7 +452,14 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	go proxyWSFrames(serverConn, clientConn, observer, errCh)
 	go proxyWSFrames(clientConn, serverConn, nil, errCh)
 
-	err = <-errCh
+	firstErr := <-errCh
+	_ = serverConn.Close()
+	_ = clientConn.Close()
+	secondErr := <-errCh
+	err = firstErr
+	if isNormalClose(err) && !isNormalClose(secondErr) {
+		err = secondErr
+	}
 	record.DurationMS = time.Since(started).Milliseconds()
 	record.Usage = observer.Summary()
 	record.Billing = billing.Calculate(pricing, record.Usage, candidate.multiplier, pricing.Name)
@@ -763,11 +773,19 @@ func (s *Service) newProbeRequest(ctx context.Context, provider model.Provider, 
 }
 
 func totalCandidateWeight(candidate resolvedCandidate) int {
-	weight := candidate.provider.Weight * candidate.target.Weight * candidate.endpoint.Weight * candidate.credential.Weight
-	if weight <= 0 {
-		return 1
+	const maxWeight = int(^uint(0) >> 1)
+	weights := []int{candidate.provider.Weight, candidate.target.Weight, candidate.endpoint.Weight, candidate.credential.Weight}
+	product := 1
+	for _, weight := range weights {
+		if weight <= 0 {
+			return 1
+		}
+		if product > maxWeight/weight {
+			return maxWeight
+		}
+		product *= weight
 	}
-	return weight
+	return product
 }
 
 func candidateLatency(latency int64) int64 {
@@ -826,7 +844,7 @@ func parseRetryAfter(headers http.Header) time.Duration {
 		if seconds <= 0 {
 			return 0
 		}
-		return time.Duration(seconds) * time.Second
+		return clampRetryAfterCooldown(time.Duration(seconds) * time.Second)
 	}
 	at, err := http.ParseTime(value)
 	if err != nil {
@@ -836,7 +854,7 @@ func parseRetryAfter(headers http.Header) time.Duration {
 	if delay <= 0 {
 		return 0
 	}
-	return delay
+	return clampRetryAfterCooldown(delay)
 }
 
 func writeGatewayAuthError(w http.ResponseWriter, err error) {

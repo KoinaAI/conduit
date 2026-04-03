@@ -17,6 +17,8 @@ type proxyResponseWriteError struct {
 	err error
 }
 
+const maxTransformedResponseBodyBytes = 8 << 20
+
 func (e proxyResponseWriteError) Error() string {
 	return e.err.Error()
 }
@@ -282,8 +284,7 @@ func geminiToOpenAIChat(rawBody []byte, upstreamModel string, stream bool) ([]by
 				"content": text,
 			})
 		}
-	}
-	if systemInstruction, ok := payload["system_instruction"].(map[string]any); ok {
+	} else if systemInstruction, ok := payload["system_instruction"].(map[string]any); ok {
 		if text := flattenGeminiParts(systemInstruction["parts"]); text != "" {
 			messages = append(messages, map[string]any{
 				"role":    "system",
@@ -357,7 +358,7 @@ func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response,
 			}
 			return nil
 		}
-		payload, err := io.ReadAll(resp.Body)
+		payload, err := readLimitedResponseBody(resp.Body, maxTransformedResponseBodyBytes)
 		if err != nil {
 			return err
 		}
@@ -382,7 +383,7 @@ func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response,
 }
 
 func writeAnthropicJSON(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string) error {
-	payload, err := io.ReadAll(resp.Body)
+	payload, err := readLimitedResponseBody(resp.Body, maxTransformedResponseBodyBytes)
 	if err != nil {
 		return err
 	}
@@ -442,6 +443,10 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 				if err == nil {
 					continue
 				}
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return proxyResponseWriteError{err: err}
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 			if payload == "" || payload == "[DONE]" {
@@ -554,7 +559,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 }
 
 func writeGeminiJSON(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string) error {
-	payload, err := io.ReadAll(resp.Body)
+	payload, err := readLimitedResponseBody(resp.Body, maxTransformedResponseBodyBytes)
 	if err != nil {
 		return err
 	}
@@ -611,6 +616,10 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 				if err == nil {
 					continue
 				}
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return proxyResponseWriteError{err: err}
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 			if payload == "" {
@@ -772,4 +781,15 @@ func mapGeminiFinishReason(value string) string {
 	default:
 		return "STOP"
 	}
+}
+
+func readLimitedResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	payload, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > maxBytes {
+		return nil, fmt.Errorf("upstream response exceeded %d bytes", maxBytes)
+	}
+	return payload, nil
 }

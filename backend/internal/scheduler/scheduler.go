@@ -41,9 +41,13 @@ func (s *Service) Start(ctx context.Context) {
 		case <-s.stop:
 			return
 		case <-checkinTicker.C:
-			s.admin.RunCheckins(ctx)
+			runSafely("checkins", func() {
+				s.admin.RunCheckins(ctx)
+			})
 		case <-probeCh:
-			s.admin.RunProbes(ctx)
+			runSafely("probes", func() {
+				s.admin.RunProbes(ctx)
+			})
 		}
 	}
 }
@@ -55,4 +59,13 @@ func (s *Service) Stop() {
 		close(s.stop)
 		log.Print("scheduler stopped")
 	}
+}
+
+func runSafely(name string, fn func()) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("scheduler %s task panicked: %v", name, recovered)
+		}
+	}()
+	fn()
 }

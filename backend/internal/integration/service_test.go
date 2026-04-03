@@ -182,6 +182,7 @@ func TestClientForResolvedReusesPinnedClient(t *testing.T) {
 	service := NewService(WithAllowPrivateBaseURLForTests())
 	resolved := resolvedBaseURL{
 		BaseURL:     "https://relay.example",
+		ClientKey:   "https://relay.example",
 		DialAddress: "203.0.113.10:443",
 	}
 
@@ -199,6 +200,36 @@ func TestClientForResolvedReusesPinnedClient(t *testing.T) {
 	}
 	if got := len(service.pinnedClients); got != 1 {
 		t.Fatalf("expected exactly one cached pinned client, got %d", got)
+	}
+}
+
+func TestClientForResolvedReplacesStaleDialAddressWithoutGrowingCache(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(WithAllowPrivateBaseURLForTests())
+	first := service.clientForResolved(resolvedBaseURL{
+		BaseURL:     "https://relay.example/api",
+		ClientKey:   "https://relay.example",
+		DialAddress: "203.0.113.10:443",
+	})
+	second := service.clientForResolved(resolvedBaseURL{
+		BaseURL:     "https://relay.example/api",
+		ClientKey:   "https://relay.example",
+		DialAddress: "203.0.113.11:443",
+	})
+
+	if first == nil || second == nil {
+		t.Fatal("expected pinned clients to be created")
+	}
+	if first == second {
+		t.Fatal("expected dial-address change to replace the pinned client")
+	}
+	if got := len(service.pinnedClients); got != 1 {
+		t.Fatalf("expected pinned client cache to stay bounded per base URL, got %d", got)
+	}
+	entry := service.pinnedClients["https://relay.example"]
+	if entry.DialAddress != "203.0.113.11:443" {
+		t.Fatalf("expected latest dial address to replace stale entry, got %+v", entry)
 	}
 }
 

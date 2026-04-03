@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"sync"
 
 	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
 type UsageObserver struct {
+	mu        sync.Mutex
 	protocol  model.Protocol
 	lastEvent string
 	summary   model.UsageSummary
@@ -23,6 +25,8 @@ func (o *UsageObserver) ObserveJSON(payload []byte) {
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return
 	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.mergeUsageMaps(body)
 }
 
@@ -31,6 +35,8 @@ func (o *UsageObserver) ObserveLine(line []byte) {
 	if len(trimmed) == 0 {
 		return
 	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if bytes.HasPrefix(trimmed, []byte("event:")) {
 		o.lastEvent = strings.TrimSpace(string(trimmed[len("event:"):]))
 		return
@@ -52,6 +58,8 @@ func (o *UsageObserver) ObserveLine(line []byte) {
 }
 
 func (o *UsageObserver) Summary() model.UsageSummary {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.summary.TotalTokens == 0 {
 		o.summary.TotalTokens = o.summary.InputTokens + o.summary.OutputTokens
 	}

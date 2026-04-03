@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -56,7 +57,7 @@ func (h *Handlers) Middleware(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "admin API is not configured"})
 			return
 		}
-		token := r.Header.Get("X-Admin-Token")
+		token := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
 		if token == "" {
 			token = bearerToken(r.Header.Get("Authorization"))
 		}
@@ -182,9 +183,8 @@ func (h *Handlers) SyncAllIntegrations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		mu       sync.Mutex
-		firstErr error
-		wg       sync.WaitGroup
+		mu sync.Mutex
+		wg sync.WaitGroup
 	)
 	for _, current := range snapshot.Integrations {
 		if !current.Enabled {
@@ -197,20 +197,37 @@ func (h *Handlers) SyncAllIntegrations(w http.ResponseWriter, r *http.Request) {
 			result := h.integration.PrepareSync(r.Context(), current)
 			mu.Lock()
 			operations[indexByID[current.ID]].result = result
-			if firstErr == nil && result.Err != nil {
-				firstErr = result.Err
-			}
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
-	if firstErr != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": firstErr.Error()})
+
+	successful := make([]syncOperation, 0, len(operations))
+	failures := make([]map[string]any, 0)
+	for _, operation := range operations {
+		if operation.result.Err != nil {
+			failures = append(failures, map[string]any{
+				"integration_id": operation.id,
+				"error":          operation.result.Err.Error(),
+			})
+			continue
+		}
+		successful = append(successful, operation)
+	}
+	if len(successful) == 0 {
+		message := "all integration sync operations failed"
+		if len(failures) == 1 {
+			message = failures[0]["error"].(string)
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":    message,
+			"failures": failures,
+		})
 		return
 	}
 
 	saved, err := h.updateState(func(state *model.State) error {
-		for _, operation := range operations {
+		for _, operation := range successful {
 			if _, err := h.integration.ApplySyncResult(state, operation.id, operation.result); err != nil {
 				return err
 			}
@@ -221,7 +238,14 @@ func (h *Handlers) SyncAllIntegrations(w http.ResponseWriter, r *http.Request) {
 		writeResourceError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	if len(failures) == 0 {
+		writeJSON(w, http.StatusOK, saved)
+		return
+	}
+	writeJSON(w, http.StatusMultiStatus, map[string]any{
+		"state":    saved,
+		"failures": failures,
+	})
 }
 
 // ListProviders serves GET /api/admin/providers.
@@ -676,16 +700,16 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var payload struct {
-		Name             *string          `json:"name"`
-		Secret           *string          `json:"secret"`
-		Enabled          *bool            `json:"enabled"`
-		ExpiresAt        json.RawMessage  `json:"expires_at"`
-		AllowedModels    []string         `json:"allowed_models"`
-		AllowedProtocols []model.Protocol `json:"allowed_protocols"`
-		MaxConcurrency   *int             `json:"max_concurrency"`
-		RateLimitRPM     *int             `json:"rate_limit_rpm"`
-		DailyBudgetUSD   *float64         `json:"daily_budget_usd"`
-		Notes            *string          `json:"notes"`
+		Name             *string         `json:"name"`
+		Secret           *string         `json:"secret"`
+		Enabled          *bool           `json:"enabled"`
+		ExpiresAt        json.RawMessage `json:"expires_at"`
+		AllowedModels    json.RawMessage `json:"allowed_models"`
+		AllowedProtocols json.RawMessage `json:"allowed_protocols"`
+		MaxConcurrency   *int            `json:"max_concurrency"`
+		RateLimitRPM     *int            `json:"rate_limit_rpm"`
+		DailyBudgetUSD   *float64        `json:"daily_budget_usd"`
+		Notes            *string         `json:"notes"`
 	}
 	if err := decodeJSONBody(w, r, &payload); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -717,10 +741,18 @@ func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if payload.AllowedModels != nil {
-				current.AllowedModels = payload.AllowedModels
+				allowedModels, err := decodeOptionalStrings(payload.AllowedModels, "allowed_models")
+				if err != nil {
+					return errValidation(err.Error())
+				}
+				current.AllowedModels = allowedModels
 			}
 			if payload.AllowedProtocols != nil {
-				current.AllowedProtocols = payload.AllowedProtocols
+				allowedProtocols, err := decodeOptionalProtocols(payload.AllowedProtocols, "allowed_protocols")
+				if err != nil {
+					return errValidation(err.Error())
+				}
+				current.AllowedProtocols = allowedProtocols
 			}
 			if payload.MaxConcurrency != nil {
 				current.MaxConcurrency = *payload.MaxConcurrency
@@ -859,6 +891,8 @@ func mergeCompatibilityState(current, next *model.State) {
 
 	if len(next.GatewayKeys) == 0 {
 		next.GatewayKeys = current.GatewayKeys
+	} else {
+		next.GatewayKeys = preserveGatewayKeys(current.GatewayKeys, next.GatewayKeys)
 	}
 	next.RequestHistory = current.RequestHistory
 	for nextProviderIndex := range next.Providers {
@@ -907,21 +941,55 @@ func buildOpenAPISpec() map[string]any {
 			"description": "RESTful administrative surface for providers, routes, pricing, integrations, gateway keys, request history, and maintenance operations.",
 		},
 		"paths": map[string]any{
+			"/api/admin/state": map[string]any{
+				"get": map[string]any{"summary": "Get full admin state snapshot"},
+				"put": map[string]any{"summary": "Replace compatibility state snapshot"},
+			},
+			"/api/admin/meta": map[string]any{
+				"get": map[string]any{"summary": "Get admin metadata"},
+			},
+			"/api/admin/integrations/sync": map[string]any{
+				"post": map[string]any{"summary": "Sync all enabled integrations"},
+			},
 			"/api/admin/providers": map[string]any{
 				"get":  map[string]any{"summary": "List providers"},
 				"post": map[string]any{"summary": "Create provider"},
+			},
+			"/api/admin/providers/{id}": map[string]any{
+				"get":    map[string]any{"summary": "Get one provider"},
+				"put":    map[string]any{"summary": "Update one provider"},
+				"delete": map[string]any{"summary": "Delete one provider"},
 			},
 			"/api/admin/routes": map[string]any{
 				"get":  map[string]any{"summary": "List routes"},
 				"post": map[string]any{"summary": "Create route"},
 			},
+			"/api/admin/routes/{alias}": map[string]any{
+				"get":    map[string]any{"summary": "Get one route"},
+				"put":    map[string]any{"summary": "Update one route"},
+				"delete": map[string]any{"summary": "Delete one route"},
+			},
 			"/api/admin/pricing-profiles": map[string]any{
 				"get":  map[string]any{"summary": "List pricing profiles"},
 				"post": map[string]any{"summary": "Create pricing profile"},
 			},
+			"/api/admin/pricing-profiles/{id}": map[string]any{
+				"put":    map[string]any{"summary": "Update one pricing profile"},
+				"delete": map[string]any{"summary": "Delete one pricing profile"},
+			},
 			"/api/admin/integrations": map[string]any{
 				"get":  map[string]any{"summary": "List integrations"},
 				"post": map[string]any{"summary": "Create integration"},
+			},
+			"/api/admin/integrations/{id}": map[string]any{
+				"put":    map[string]any{"summary": "Update one integration"},
+				"delete": map[string]any{"summary": "Delete one integration"},
+			},
+			"/api/admin/integrations/{id}/sync": map[string]any{
+				"post": map[string]any{"summary": "Sync one integration"},
+			},
+			"/api/admin/integrations/{id}/checkin": map[string]any{
+				"post": map[string]any{"summary": "Run one integration daily checkin"},
 			},
 			"/api/admin/gateway-keys": map[string]any{
 				"get":  map[string]any{"summary": "List gateway keys"},
@@ -933,6 +1001,9 @@ func buildOpenAPISpec() map[string]any {
 			},
 			"/api/admin/request-history": map[string]any{
 				"get": map[string]any{"summary": "List request history"},
+			},
+			"/api/admin/request-history/{id}/attempts": map[string]any{
+				"get": map[string]any{"summary": "Get recorded upstream attempts for one request"},
 			},
 			"/api/admin/maintenance/probes": map[string]any{
 				"post": map[string]any{"summary": "Probe all provider endpoints"},
@@ -979,6 +1050,14 @@ func sanitizeAdminPayload(payload any) any {
 	case model.GatewayKey:
 		return sanitizeGatewayKey(current)
 	case map[string]any:
+		if state, ok := current["state"].(model.State); ok {
+			next := cloneMap(current)
+			next["state"] = sanitizeState(state)
+			if gatewayKey, ok := next["gateway_key"].(model.GatewayKey); ok {
+				next["gateway_key"] = sanitizeGatewayKey(gatewayKey)
+			}
+			return next
+		}
 		if gatewayKey, ok := current["gateway_key"].(model.GatewayKey); ok {
 			next := cloneMap(current)
 			next["gateway_key"] = sanitizeGatewayKey(gatewayKey)
@@ -1026,6 +1105,7 @@ func sanitizeIntegration(integration model.Integration) model.Integration {
 }
 
 func sanitizeGatewayKey(key model.GatewayKey) model.GatewayKey {
+	key.SecretHash = ""
 	key.SecretLookupHash = ""
 	return key
 }
@@ -1068,6 +1148,82 @@ func preserveIntegrationSecrets(current, next model.Integration) model.Integrati
 		next.RelayAPIKey = current.RelayAPIKey
 	}
 	return next
+}
+
+func preserveGatewayKeys(current, next []model.GatewayKey) []model.GatewayKey {
+	byID := make(map[string]model.GatewayKey, len(current))
+	for _, key := range current {
+		byID[key.ID] = key
+	}
+	preserved := make([]model.GatewayKey, len(next))
+	for index := range next {
+		key := next[index]
+		currentKey, ok := byID[key.ID]
+		if !ok && index < len(current) {
+			currentKey = current[index]
+			ok = true
+		}
+		if ok {
+			key = preserveGatewayKeySecrets(currentKey, key)
+		}
+		preserved[index] = key
+	}
+	return preserved
+}
+
+func preserveGatewayKeySecrets(current, next model.GatewayKey) model.GatewayKey {
+	if strings.TrimSpace(next.SecretHash) == "" {
+		next.SecretHash = current.SecretHash
+	}
+	if strings.TrimSpace(next.SecretLookupHash) == "" {
+		next.SecretLookupHash = current.SecretLookupHash
+	}
+	if strings.TrimSpace(next.SecretPreview) == "" {
+		next.SecretPreview = current.SecretPreview
+	}
+	if next.ExpiresAt == nil {
+		next.ExpiresAt = cloneTimeValue(current.ExpiresAt)
+	}
+	if next.LastUsedAt == nil {
+		next.LastUsedAt = cloneTimeValue(current.LastUsedAt)
+	}
+	if next.CreatedAt.IsZero() {
+		next.CreatedAt = current.CreatedAt
+	}
+	if next.UpdatedAt.IsZero() {
+		next.UpdatedAt = current.UpdatedAt
+	}
+	return next
+}
+
+func cloneTimeValue(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := value.UTC()
+	return &cloned
+}
+
+func decodeOptionalStrings(raw json.RawMessage, field string) ([]string, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, nil
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("%s must be an array of strings or null", field)
+	}
+	return values, nil
+}
+
+func decodeOptionalProtocols(raw json.RawMessage, field string) ([]model.Protocol, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, nil
+	}
+	var values []model.Protocol
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("%s must be an array of protocol identifiers or null", field)
+	}
+	return values, nil
 }
 
 func validateGatewaySecretStrength(secret string) error {
@@ -1199,7 +1355,7 @@ func removeGatewayKeyModelReferences(keys []model.GatewayKey, aliases map[string
 			continue
 		}
 		original := keys[keyIndex].AllowedModels
-		filtered := original[:0]
+		filtered := make([]string, 0, len(original))
 		removedAny := false
 		for _, alias := range original {
 			if _, removed := aliases[strings.ToLower(strings.TrimSpace(alias))]; removed {

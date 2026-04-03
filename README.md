@@ -3,6 +3,7 @@
 [English README](./README.en.md)
 
 ![Backend Tests](https://github.com/KoinaAI/conduit/actions/workflows/backend-tests.yml/badge.svg)
+![Backend Image](https://github.com/KoinaAI/conduit/actions/workflows/backend-image.yml/badge.svg)
 
 `Conduit`，中文名 `汇流`，是一个偏个人使用场景的自托管 AI 网关。它的主要目标不是给团队搭建统一平台，而是让你在多个来源、多个协议、多个账号之间做统一接入与切换，并把这套能力稳定地部署在自己的服务器上，供多设备共享使用。
 
@@ -63,10 +64,10 @@ Conduit 当前支持以下常见请求面：
 
 - `backend/`
   Go 后端源码与单元测试。
-- `deploy/`
-  Docker 构建文件与单服务 `compose` 部署文件。
+- `deploy/docker/`
+  后端镜像构建文件。
 - `.github/workflows/`
-  GitHub Actions 工作流。当前仓库会在每次 `push` 与 `pull_request` 时执行后端单元测试。
+  GitHub Actions 工作流。当前仓库会执行后端单元测试，并构建或发布后端 GHCR 镜像。
 
 ## 当前公开仓库包含什么
 
@@ -74,7 +75,8 @@ Conduit 当前支持以下常见请求面：
 
 - 核心后端实现
 - 单元测试
-- Docker 部署文件
+- 后端镜像构建文件
+- GHCR 发布工作流
 - 基础项目文档
 
 当前公开仓库不包含：
@@ -112,7 +114,6 @@ Conduit 可以理解成三层：
 
 - Go `1.24.x`
 - Docker
-- Docker Compose
 
 ### 部署建议
 
@@ -123,18 +124,29 @@ Conduit 可以理解成三层：
 
 ## 快速部署
 
-### 使用 Docker Compose
+### 直接使用 GHCR 镜像
+
+默认镜像地址：
+
+- `ghcr.io/koinaai/conduit-backend:latest`
+
+典型部署命令：
 
 ```bash
-cd deploy
-GATEWAY_ADMIN_TOKEN='replace-with-a-strong-admin-token' \
-GATEWAY_BOOTSTRAP_GATEWAY_KEY='optional-bootstrap-gateway-key' \
-docker compose up --build -d
+mkdir -p /srv/conduit
+
+docker pull ghcr.io/koinaai/conduit-backend:latest
+
+docker run -d \
+  --name conduit-backend \
+  --restart unless-stopped \
+  -p 18092:8080 \
+  -v /srv/conduit:/data \
+  -e GATEWAY_ADMIN_TOKEN='replace-with-a-strong-admin-token' \
+  -e GATEWAY_BOOTSTRAP_GATEWAY_KEY='optional-bootstrap-gateway-key' \
+  -e GATEWAY_STATE_PATH='/data/gateway.db' \
+  ghcr.io/koinaai/conduit-backend:latest
 ```
-
-默认监听端口：
-
-- `http://127.0.0.1:18092`
 
 健康检查：
 
@@ -142,7 +154,7 @@ docker compose up --build -d
 curl http://127.0.0.1:18092/healthz
 ```
 
-### 本地直接运行
+### 本地直接运行 Go
 
 ```bash
 cd backend
@@ -157,9 +169,31 @@ go run ./cmd/gateway
 
 ## 详细部署说明
 
+### GHCR 发布方式
+
+仓库内置的后端镜像工作流会将镜像发布到 GHCR：
+
+- 工作流文件：`.github/workflows/backend-image.yml`
+- 镜像名称：`ghcr.io/koinaai/conduit-backend`
+- 默认标签：`latest`
+- 额外标签：`sha-<commit>`、分支标签，以及版本发布时的 `vX.Y.Z`
+
+触发方式：
+
+- 提交到 `main` 时自动构建并推送
+- 创建版本 tag `v*` 时自动构建并推送
+- `pull_request` 时执行构建校验但不推送
+- `workflow_dispatch` 时允许手动触发
+
+如果 GHCR 包仍处于私有状态，拉取前请先执行：
+
+```bash
+docker login ghcr.io
+```
+
 ### 环境变量
 
-`deploy/compose.yaml` 当前暴露的关键变量如下：
+容器部署时常用的关键变量如下：
 
 - `GATEWAY_ADMIN_TOKEN`
   管理接口认证令牌。
@@ -175,6 +209,15 @@ go run ./cmd/gateway
   请求历史保留条数。
 - `GATEWAY_PROBE_INTERVAL_SECONDS`
   Provider 主动探测间隔秒数。
+
+### 服务器直接运行建议
+
+如果你不想使用更复杂的编排系统，个人部署场景下推荐直接用单容器运行：
+
+- 使用固定挂载目录持久化 `/data`
+- 明确指定 `GATEWAY_STATE_PATH=/data/gateway.db`
+- 由 Nginx、Caddy 或 Traefik 对外暴露 `18092`
+- 升级时先 `docker pull`，再 `docker rm -f` 旧容器并按同样参数重新拉起
 
 ### 反向代理建议
 
@@ -249,6 +292,9 @@ go test ./...
 - 文件位置：`.github/workflows/backend-tests.yml`
 - 触发条件：`push`、`pull_request`
 - 执行内容：在 `backend/` 目录运行全部后端单元测试
+- 文件位置：`.github/workflows/backend-image.yml`
+- 触发条件：`push main`、`push tag v*`、`pull_request`、`workflow_dispatch`
+- 执行内容：构建后端镜像，并在非 PR 事件下发布到 GHCR
 
 ## 安全与运维建议
 

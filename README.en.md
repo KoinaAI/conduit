@@ -3,6 +3,7 @@
 [中文说明](./README.md)
 
 ![Backend Tests](https://github.com/KoinaAI/conduit/actions/workflows/backend-tests.yml/badge.svg)
+![Backend Image](https://github.com/KoinaAI/conduit/actions/workflows/backend-image.yml/badge.svg)
 
 `Conduit`, Chinese brand name `汇流`, is a self-hosted AI gateway focused primarily on personal use. Its main purpose is not to act as a shared team platform, but to let you choose between multiple upstream sources, protocols, and accounts from a single stable entrypoint, typically deployed on your own server for use across your own devices.
 
@@ -63,10 +64,10 @@ Conduit currently supports:
 
 - `backend/`
   Go backend source code and unit tests.
-- `deploy/`
-  Docker build assets and single-service compose deployment.
+- `deploy/docker/`
+  Backend container build assets.
 - `.github/workflows/`
-  GitHub Actions workflows. The repository runs backend unit tests on every `push` and `pull_request`.
+  GitHub Actions workflows. The repository runs backend unit tests and builds or publishes the backend GHCR image.
 
 ## What the public repository contains
 
@@ -74,7 +75,8 @@ The current public repository includes:
 
 - core backend implementation
 - unit tests
-- Docker deployment assets
+- backend container build assets
+- GHCR publication workflow
 - baseline project documentation
 
 The current public repository does not include:
@@ -112,7 +114,6 @@ Key entry points:
 
 - Go `1.24.x`
 - Docker
-- Docker Compose
 
 ### Deployment recommendations
 
@@ -123,18 +124,29 @@ Key entry points:
 
 ## Quick deployment
 
-### Docker Compose
+### Deploy directly from GHCR
+
+Default image:
+
+- `ghcr.io/koinaai/conduit-backend:latest`
+
+Typical deployment:
 
 ```bash
-cd deploy
-GATEWAY_ADMIN_TOKEN='replace-with-a-strong-admin-token' \
-GATEWAY_BOOTSTRAP_GATEWAY_KEY='optional-bootstrap-gateway-key' \
-docker compose up --build -d
+mkdir -p /srv/conduit
+
+docker pull ghcr.io/koinaai/conduit-backend:latest
+
+docker run -d \
+  --name conduit-backend \
+  --restart unless-stopped \
+  -p 18092:8080 \
+  -v /srv/conduit:/data \
+  -e GATEWAY_ADMIN_TOKEN='replace-with-a-strong-admin-token' \
+  -e GATEWAY_BOOTSTRAP_GATEWAY_KEY='optional-bootstrap-gateway-key' \
+  -e GATEWAY_STATE_PATH='/data/gateway.db' \
+  ghcr.io/koinaai/conduit-backend:latest
 ```
-
-Default port:
-
-- `http://127.0.0.1:18092`
 
 Health check:
 
@@ -142,7 +154,7 @@ Health check:
 curl http://127.0.0.1:18092/healthz
 ```
 
-### Run locally
+### Run locally from source
 
 ```bash
 cd backend
@@ -157,9 +169,31 @@ Default behavior:
 
 ## Detailed deployment notes
 
+### GHCR publication
+
+The repository includes a dedicated backend image workflow that publishes to GHCR:
+
+- workflow file: `.github/workflows/backend-image.yml`
+- image name: `ghcr.io/koinaai/conduit-backend`
+- default tag: `latest`
+- extra tags: `sha-<commit>`, branch tags, and `vX.Y.Z` on release tags
+
+Trigger behavior:
+
+- pushes to `main` build and publish
+- version tags `v*` build and publish
+- `pull_request` builds for validation only
+- `workflow_dispatch` allows manual publication
+
+If the package is still private in GHCR, log in before pulling:
+
+```bash
+docker login ghcr.io
+```
+
 ### Environment variables
 
-Primary variables exposed through `deploy/compose.yaml`:
+Primary variables for direct container deployment:
 
 - `GATEWAY_ADMIN_TOKEN`
   Authentication token for admin routes.
@@ -175,6 +209,15 @@ Primary variables exposed through `deploy/compose.yaml`:
   Maximum retained request-history entries.
 - `GATEWAY_PROBE_INTERVAL_SECONDS`
   Provider probe interval in seconds.
+
+### Direct server runtime guidance
+
+For personal deployment, the simplest supported shape is a single long-running container:
+
+- persist `/data` on a host directory or volume
+- explicitly set `GATEWAY_STATE_PATH=/data/gateway.db`
+- put Nginx, Caddy, or Traefik in front if you need public HTTPS
+- upgrade by pulling a newer image and recreating the container with the same bind mount and environment
 
 ### Reverse proxy guidance
 
@@ -249,6 +292,9 @@ The repository includes a backend unit test workflow:
 - file: `.github/workflows/backend-tests.yml`
 - triggers: `push`, `pull_request`
 - behavior: runs the full backend unit-test suite inside `backend/`
+- file: `.github/workflows/backend-image.yml`
+- triggers: `push main`, `push tag v*`, `pull_request`, `workflow_dispatch`
+- behavior: builds the backend image and publishes it to GHCR on non-PR events
 
 ## Security and operational notes
 

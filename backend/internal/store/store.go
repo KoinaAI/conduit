@@ -72,11 +72,14 @@ func Open(path string) (*FileStore, error) {
 
 // Close flushes the SQLite WAL before closing the backing database handle.
 func (s *FileStore) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db == nil {
+		return nil
+	}
 	_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
 	err := s.db.Close()
 	s.db = nil
@@ -379,7 +382,13 @@ func (s *FileStore) AppendRequestRecord(record model.RequestRecord, attempts []m
 
 // RequestAttempts returns the recorded upstream attempts for one request.
 func (s *FileStore) RequestAttempts(requestID string) ([]model.RequestAttemptRecord, error) {
-	rows, err := s.db.Query(`SELECT payload FROM request_attempts WHERE request_id = ? ORDER BY sequence ASC`, requestID)
+	s.mu.RLock()
+	db := s.db
+	s.mu.RUnlock()
+	if db == nil {
+		return nil, errors.New("store is closed")
+	}
+	rows, err := db.Query(`SELECT payload FROM request_attempts WHERE request_id = ? ORDER BY sequence ASC`, requestID)
 	if err != nil {
 		return nil, err
 	}

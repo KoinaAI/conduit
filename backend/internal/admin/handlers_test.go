@@ -161,6 +161,9 @@ func TestGetStateRedactsSensitiveFields(t *testing.T) {
 
 	gatewayKeys := payload["gateway_keys"].([]any)
 	key := gatewayKeys[0].(map[string]any)
+	if _, ok := key["secret_hash"]; ok {
+		t.Fatalf("did not expect secret_hash in admin response: %+v", key)
+	}
 	if _, ok := key["secret_lookup_hash"]; ok {
 		t.Fatalf("did not expect secret_lookup_hash in admin response: %+v", key)
 	}
@@ -401,6 +404,50 @@ func TestUpdateGatewayKeyClearsExpiresAtWhenNull(t *testing.T) {
 	}
 }
 
+func TestUpdateGatewayKeyClearsAllowedRestrictionsWhenNull(t *testing.T) {
+	t.Parallel()
+
+	hash, err := model.HashGatewaySecret("original-secret-123")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:               "gk-1",
+			Name:             "restricted",
+			SecretHash:       hash,
+			SecretLookupHash: "lookup",
+			Enabled:          true,
+			AllowedModels:    []string{"gpt-5.4"},
+			AllowedProtocols: []model.Protocol{model.ProtocolOpenAIChat},
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/gateway-keys/gk-1", strings.NewReader(`{"allowed_models":null,"allowed_protocols":null}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("id", "gk-1")
+	recorder := httptest.NewRecorder()
+	handlers.UpdateGatewayKey(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected ok, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	key, ok := saved.FindGatewayKey("gk-1")
+	if !ok {
+		t.Fatal("expected updated gateway key")
+	}
+	if len(key.AllowedModels) != 0 {
+		t.Fatalf("expected allowed_models to be cleared, got %+v", key.AllowedModels)
+	}
+	if len(key.AllowedProtocols) != 0 {
+		t.Fatalf("expected allowed_protocols to be cleared, got %+v", key.AllowedProtocols)
+	}
+}
+
 func TestSyncIntegrationFailureDoesNotPersistSnapshotError(t *testing.T) {
 	t.Parallel()
 
@@ -477,6 +524,172 @@ func TestPutStatePreservesExistingRequestHistory(t *testing.T) {
 	}
 	if saved.RequestHistory[0].ID != "req-original" {
 		t.Fatalf("expected existing request history to be preserved, got %+v", saved.RequestHistory)
+	}
+}
+
+func TestPutStatePreservesGatewayKeySecrets(t *testing.T) {
+	t.Parallel()
+
+	hash, err := model.HashGatewaySecret("original-secret-123")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:               "gk-1",
+			Name:             "gateway",
+			SecretHash:       hash,
+			SecretLookupHash: "lookup-hash",
+			SecretPreview:    model.SecretPreview("original-secret-123"),
+			Enabled:          true,
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{
+		"version":"2026-04-01",
+		"providers":[],
+		"model_routes":[],
+		"pricing_profiles":[],
+		"integrations":[],
+		"gateway_keys":[{
+			"id":"gk-1",
+			"name":"gateway",
+			"secret_hash":"forged-hash",
+			"secret_lookup_hash":"forged-lookup",
+			"secret_preview":"forged-preview",
+			"enabled":true
+		}],
+		"request_history":[]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.PutState(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	key, ok := saved.FindGatewayKey("gk-1")
+	if !ok {
+		t.Fatal("expected gateway key to remain")
+	}
+	if key.SecretHash == "" || key.SecretLookupHash == "" {
+		t.Fatalf("expected gateway key secrets to be preserved, got %+v", key)
+	}
+	if key.SecretHash == "forged-hash" || key.SecretLookupHash == "forged-lookup" || key.SecretPreview == "forged-preview" {
+		t.Fatalf("expected compatibility state update to ignore incoming secret-derived fields, got %+v", key)
+	}
+	if !model.VerifyGatewaySecret(key.SecretHash, "original-secret-123") {
+		t.Fatalf("expected preserved secret hash to remain valid")
+	}
+}
+
+func TestSyncAllIntegrationsAppliesSuccessfulResultsEvenWhenSomeFail(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		switch r.URL.Path {
+		case "/api/user/self":
+			switch token {
+			case "ok-token":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"success": true,
+					"data": map[string]any{
+						"quota":      64,
+						"used_quota": 8,
+					},
+				})
+			case "fail-token":
+				http.Error(w, `{"message":"upstream failed"}`, http.StatusBadGateway)
+			default:
+				t.Fatalf("unexpected token for self endpoint: %s", token)
+			}
+		case "/api/user/models":
+			switch token {
+			case "ok-token":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"success": true,
+					"data":    []map[string]any{{"id": "gpt-5.4"}},
+				})
+			default:
+				http.Error(w, `{"message":"upstream failed"}`, http.StatusBadGateway)
+			}
+		case "/api/pricing":
+			if token != "" {
+				t.Fatalf("expected pricing endpoint to be unauthenticated, got token %q", token)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data":    []map[string]any{{"model_name": "gpt-5.4", "input_per_million": 2.5, "output_per_million": 10}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		Integrations: []model.Integration{
+			{
+				ID:               "integration-ok",
+				Name:             "OK",
+				Kind:             model.IntegrationKindNewAPI,
+				BaseURL:          server.URL,
+				AccessKey:        "ok-token",
+				Enabled:          true,
+				AutoCreateRoutes: true,
+			},
+			{
+				ID:        "integration-fail",
+				Name:      "FAIL",
+				Kind:      model.IntegrationKindNewAPI,
+				BaseURL:   server.URL,
+				AccessKey: "fail-token",
+				Enabled:   true,
+				Snapshot: model.IntegrationSnapshot{
+					LastError: "keep-me",
+				},
+			},
+		},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/integrations/sync", nil)
+	recorder := httptest.NewRecorder()
+	handlers.SyncAllIntegrations(recorder, req)
+
+	if recorder.Code != http.StatusMultiStatus {
+		t.Fatalf("expected multistatus for partial sync, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	failures, ok := response["failures"].([]any)
+	if !ok || len(failures) != 1 {
+		t.Fatalf("expected one failure entry, got %+v", response)
+	}
+
+	saved := fileStore.Snapshot()
+	okIntegration, found := saved.FindIntegration("integration-ok")
+	if !found || len(okIntegration.Snapshot.ModelNames) != 1 || okIntegration.Snapshot.ModelNames[0] != "gpt-5.4" {
+		t.Fatalf("expected successful integration sync to be applied, got %+v", okIntegration.Snapshot)
+	}
+	failIntegration, found := saved.FindIntegration("integration-fail")
+	if !found {
+		t.Fatal("expected failing integration to remain")
+	}
+	if failIntegration.Snapshot.LastError != "keep-me" {
+		t.Fatalf("expected failed integration snapshot to stay untouched, got %+v", failIntegration.Snapshot)
+	}
+	if _, ok := saved.FindRoute("gpt-5.4"); !ok {
+		t.Fatalf("expected successful sync to create route")
 	}
 }
 
@@ -619,6 +832,38 @@ func TestRunCheckinsDoesNotBlockSnapshotsWhileWaitingOnUpstream(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("run checkins did not complete after upstream release")
+	}
+}
+
+func TestBuildOpenAPISpecCoversAdminRoutes(t *testing.T) {
+	t.Parallel()
+
+	paths := buildOpenAPISpec()["paths"].(map[string]any)
+	required := []string{
+		"/api/admin/state",
+		"/api/admin/meta",
+		"/api/admin/integrations/sync",
+		"/api/admin/providers",
+		"/api/admin/providers/{id}",
+		"/api/admin/routes",
+		"/api/admin/routes/{alias}",
+		"/api/admin/pricing-profiles",
+		"/api/admin/pricing-profiles/{id}",
+		"/api/admin/integrations",
+		"/api/admin/integrations/{id}",
+		"/api/admin/integrations/{id}/sync",
+		"/api/admin/integrations/{id}/checkin",
+		"/api/admin/gateway-keys",
+		"/api/admin/gateway-keys/{id}",
+		"/api/admin/request-history",
+		"/api/admin/request-history/{id}/attempts",
+		"/api/admin/openapi.json",
+		"/api/admin/maintenance/probes",
+	}
+	for _, path := range required {
+		if _, ok := paths[path]; !ok {
+			t.Fatalf("expected openapi spec to contain %s", path)
+		}
 	}
 }
 

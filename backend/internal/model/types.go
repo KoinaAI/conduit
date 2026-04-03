@@ -210,7 +210,7 @@ type IntegrationPricing struct {
 type GatewayKey struct {
 	ID               string     `json:"id"`
 	Name             string     `json:"name"`
-	SecretHash       string     `json:"-"`
+	SecretHash       string     `json:"secret_hash,omitempty"`
 	SecretLookupHash string     `json:"secret_lookup_hash,omitempty"`
 	SecretPreview    string     `json:"secret_preview"`
 	Enabled          bool       `json:"enabled"`
@@ -595,7 +595,9 @@ func (s State) RoutingSnapshot() RoutingState {
 	for i, route := range s.ModelRoutes {
 		snapshot.ModelRoutes[i] = route.clone()
 	}
-	copy(snapshot.GatewayKeys, s.GatewayKeys)
+	for i, key := range s.GatewayKeys {
+		snapshot.GatewayKeys[i] = key.clone()
+	}
 	return snapshot
 }
 
@@ -646,7 +648,10 @@ func (s State) Clone() State {
 	cloned.Providers = routing.Providers
 	cloned.ModelRoutes = routing.ModelRoutes
 	cloned.PricingProfiles = routing.PricingProfiles
-	cloned.GatewayKeys = slices.Clone(s.GatewayKeys)
+	cloned.GatewayKeys = make([]GatewayKey, len(s.GatewayKeys))
+	for i, key := range s.GatewayKeys {
+		cloned.GatewayKeys[i] = key.clone()
+	}
 	cloned.Integrations = make([]Integration, len(s.Integrations))
 	for i, integration := range s.Integrations {
 		cloned.Integrations[i] = integration.clone()
@@ -697,6 +702,14 @@ func (t RouteTarget) clone() RouteTarget {
 	return t
 }
 
+func (k GatewayKey) clone() GatewayKey {
+	k.ExpiresAt = cloneTimePointer(k.ExpiresAt)
+	k.LastUsedAt = cloneTimePointer(k.LastUsedAt)
+	k.AllowedModels = slices.Clone(k.AllowedModels)
+	k.AllowedProtocols = slices.Clone(k.AllowedProtocols)
+	return k
+}
+
 func (i Integration) clone() Integration {
 	i.DefaultProtocols = slices.Clone(i.DefaultProtocols)
 	i.ModelMarkupOverrides = maps.Clone(i.ModelMarkupOverrides)
@@ -725,4 +738,12 @@ func cloneBoolPointer(value *bool) *bool {
 		return nil
 	}
 	return boolPointer(*value)
+}
+
+func cloneTimePointer(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	next := value.UTC()
+	return &next
 }

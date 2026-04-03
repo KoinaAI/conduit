@@ -12,6 +12,7 @@ import (
 const (
 	defaultStickySweepInterval = 64
 	defaultRetryAfterCooldown  = 2 * time.Minute
+	maxRetryAfterCooldown      = 15 * time.Minute
 )
 
 type endpointRuntimeState struct {
@@ -165,10 +166,10 @@ func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int
 		if retryAfter <= 0 {
 			retryAfter = defaultRetryAfterCooldown
 		}
-		credential.DisabledUntil = now.Add(retryAfter)
+		credential.DisabledUntil = now.Add(clampRetryAfterCooldown(retryAfter))
 	default:
 		if retryAfter > 0 {
-			credential.DisabledUntil = now.Add(retryAfter)
+			credential.DisabledUntil = now.Add(clampRetryAfterCooldown(retryAfter))
 		}
 	}
 }
@@ -265,6 +266,16 @@ func endpointRuntimeKey(candidate resolvedCandidate) string {
 
 func credentialRuntimeKey(candidate resolvedCandidate) string {
 	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.credential.ID)) + "\x00" + model.LegacyGatewaySecretLookupHash(candidate.credential.APIKey)
+}
+
+func clampRetryAfterCooldown(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	if delay > maxRetryAfterCooldown {
+		return maxRetryAfterCooldown
+	}
+	return delay
 }
 
 const (

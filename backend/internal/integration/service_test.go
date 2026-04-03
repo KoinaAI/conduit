@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -182,6 +183,7 @@ func TestClientForResolvedReusesPinnedClient(t *testing.T) {
 	service := NewService(WithAllowPrivateBaseURLForTests())
 	resolved := resolvedBaseURL{
 		BaseURL:     "https://relay.example",
+		ClientKey:   "https://[relay.example]:443",
 		DialAddress: "203.0.113.10:443",
 	}
 
@@ -199,6 +201,64 @@ func TestClientForResolvedReusesPinnedClient(t *testing.T) {
 	}
 	if got := len(service.pinnedClients); got != 1 {
 		t.Fatalf("expected exactly one cached pinned client, got %d", got)
+	}
+}
+
+func TestClientForResolvedReplacesStaleDialAddressWithoutGrowingCache(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(WithAllowPrivateBaseURLForTests())
+	first := service.clientForResolved(resolvedBaseURL{
+		BaseURL:     "https://relay.example/api",
+		ClientKey:   "https://[relay.example]:443",
+		DialAddress: "203.0.113.10:443",
+	})
+	second := service.clientForResolved(resolvedBaseURL{
+		BaseURL:     "https://relay.example/api",
+		ClientKey:   "https://[relay.example]:443",
+		DialAddress: "203.0.113.11:443",
+	})
+
+	if first == nil || second == nil {
+		t.Fatal("expected pinned clients to be created")
+	}
+	if first == second {
+		t.Fatal("expected dial-address change to replace the pinned client")
+	}
+	if got := len(service.pinnedClients); got != 1 {
+		t.Fatalf("expected pinned client cache to stay bounded per base URL, got %d", got)
+	}
+	entry := service.pinnedClients["https://[relay.example]:443"]
+	if entry.DialAddress != "203.0.113.11:443" {
+		t.Fatalf("expected latest dial address to replace stale entry, got %+v", entry)
+	}
+}
+
+func TestResolvedBaseURLClientKeyNormalizesDefaultPorts(t *testing.T) {
+	t.Parallel()
+
+	implicitHTTPS, err := url.Parse("https://relay.example/api")
+	if err != nil {
+		t.Fatalf("parse implicit https url: %v", err)
+	}
+	explicitHTTPS, err := url.Parse("https://relay.example:443/api")
+	if err != nil {
+		t.Fatalf("parse explicit https url: %v", err)
+	}
+	implicitHTTP, err := url.Parse("http://relay.example/api")
+	if err != nil {
+		t.Fatalf("parse implicit http url: %v", err)
+	}
+	explicitHTTP, err := url.Parse("http://relay.example:80/api")
+	if err != nil {
+		t.Fatalf("parse explicit http url: %v", err)
+	}
+
+	if resolvedBaseURLClientKey(implicitHTTPS) != resolvedBaseURLClientKey(explicitHTTPS) {
+		t.Fatalf("expected https client key to normalize default port")
+	}
+	if resolvedBaseURLClientKey(implicitHTTP) != resolvedBaseURLClientKey(explicitHTTP) {
+		t.Fatalf("expected http client key to normalize default port")
 	}
 }
 

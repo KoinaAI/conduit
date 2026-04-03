@@ -67,3 +67,51 @@ func TestAppendRequestRecordTrimsHistoryAndPreservesRoutingState(t *testing.T) {
 		t.Fatalf("pricing profile changed unexpectedly")
 	}
 }
+
+func TestOpenRoundTripPreservesGatewayKeySecretHash(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	fileStore, err := Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	hash, err := model.HashGatewaySecret("gateway-secret-123")
+	if err != nil {
+		t.Fatalf("hash secret: %v", err)
+	}
+	state := model.DefaultState()
+	state.GatewayKeys = []model.GatewayKey{{
+		ID:               "gk-1",
+		Name:             "gateway",
+		SecretHash:       hash,
+		SecretLookupHash: "lookup",
+		SecretPreview:    model.SecretPreview("gateway-secret-123"),
+		Enabled:          true,
+	}}
+	if _, err := fileStore.Replace(state); err != nil {
+		t.Fatalf("replace state: %v", err)
+	}
+	if err := fileStore.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+
+	saved := reopened.Snapshot()
+	key, ok := saved.FindGatewayKey("gk-1")
+	if !ok {
+		t.Fatal("expected gateway key after reopen")
+	}
+	if key.SecretHash == "" {
+		t.Fatalf("expected secret hash to persist across reopen, got %+v", key)
+	}
+	if !model.VerifyGatewaySecret(key.SecretHash, "gateway-secret-123") {
+		t.Fatalf("expected persisted secret hash to stay valid")
+	}
+}

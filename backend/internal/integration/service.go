@@ -25,12 +25,19 @@ type Service struct {
 	allowPrivateBaseURLs bool
 	lookupIPs            func(context.Context, string, string) ([]net.IP, error)
 	pinnedClientsMu      sync.Mutex
-	pinnedClients        map[string]*http.Client
+	pinnedClients        map[string]pinnedClient
 }
 
 type resolvedBaseURL struct {
 	BaseURL     string
+	ClientKey   string
 	DialAddress string
+}
+
+type pinnedClient struct {
+	DialAddress string
+	Client      *http.Client
+	Transport   *http.Transport
 }
 
 type Option func(*Service)
@@ -59,7 +66,7 @@ func NewService(options ...Option) *Service {
 		client:        &http.Client{Timeout: 20 * time.Second, Transport: transport},
 		transport:     transport,
 		lookupIPs:     net.DefaultResolver.LookupIP,
-		pinnedClients: map[string]*http.Client{},
+		pinnedClients: map[string]pinnedClient{},
 	}
 	for _, option := range options {
 		option(service)
@@ -557,15 +564,22 @@ func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath st
 
 func (s *Service) clientForResolved(resolved resolvedBaseURL) *http.Client {
 	dialAddress := strings.TrimSpace(resolved.DialAddress)
-	if dialAddress == "" {
+	clientKey := strings.TrimSpace(resolved.ClientKey)
+	if dialAddress == "" || clientKey == "" {
 		return s.client
 	}
 
 	s.pinnedClientsMu.Lock()
 	defer s.pinnedClientsMu.Unlock()
 
-	if client := s.pinnedClients[dialAddress]; client != nil {
-		return client
+	if client, ok := s.pinnedClients[clientKey]; ok {
+		if client.DialAddress == dialAddress && client.Client != nil {
+			return client.Client
+		}
+		if client.Transport != nil {
+			client.Transport.CloseIdleConnections()
+		}
+		delete(s.pinnedClients, clientKey)
 	}
 
 	baseTransport := s.transport
@@ -587,7 +601,11 @@ func (s *Service) clientForResolved(resolved resolvedBaseURL) *http.Client {
 		Timeout:   timeout,
 		Transport: baseTransport,
 	}
-	s.pinnedClients[dialAddress] = client
+	s.pinnedClients[clientKey] = pinnedClient{
+		DialAddress: dialAddress,
+		Client:      client,
+		Transport:   baseTransport,
+	}
 	return client
 }
 
@@ -772,6 +790,7 @@ func (s *Service) resolveBaseURL(baseURL string) (resolvedBaseURL, error) {
 		}
 		return resolvedBaseURL{
 			BaseURL:     trimmedBaseURL,
+			ClientKey:   resolvedBaseURLClientKey(parsed),
 			DialAddress: net.JoinHostPort(ip.String(), port),
 		}, nil
 	}
@@ -798,8 +817,39 @@ func (s *Service) resolveBaseURL(baseURL string) (resolvedBaseURL, error) {
 	}
 	return resolvedBaseURL{
 		BaseURL:     trimmedBaseURL,
+		ClientKey:   resolvedBaseURLClientKey(parsed),
 		DialAddress: net.JoinHostPort(ips[0].String(), port),
 	}, nil
+}
+
+func resolvedBaseURLClientKey(parsed *url.URL) string {
+	if parsed == nil {
+		return ""
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	port := resolvedBaseURLEffectivePort(parsed)
+	if scheme == "" || host == "" || port == "" {
+		return ""
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+func resolvedBaseURLEffectivePort(parsed *url.URL) string {
+	if parsed == nil {
+		return ""
+	}
+	if port := strings.TrimSpace(parsed.Port()); port != "" {
+		return port
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func blockedBaseURLIP(ip net.IP) bool {

@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -255,4 +257,77 @@ func newProbeTestService(t *testing.T, kind model.ProviderKind, baseURL string) 
 	}
 
 	return NewService(config.Config{}, fileStore)
+}
+
+func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	t.Parallel()
+
+	headers := http.Header{}
+	headers.Set("Retry-After", "999999999")
+
+	if got := parseRetryAfter(headers); got != maxRetryAfterCooldown {
+		t.Fatalf("expected retry-after to clamp to %v, got %v", maxRetryAfterCooldown, got)
+	}
+}
+
+func TestRuntimeReportFailureClampsHugeRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	candidate := resolvedCandidate{
+		provider:   model.Provider{ID: "provider-1"},
+		endpoint:   model.ProviderEndpoint{ID: "endpoint-1"},
+		credential: model.ProviderCredential{ID: "credential-1", APIKey: "credential-key"},
+	}
+
+	before := time.Now().UTC()
+	runtime.reportFailure(candidate, http.StatusTooManyRequests, "ratelimited", 24*365*time.Hour)
+
+	runtime.mu.Lock()
+	credential := runtime.credentials[credentialRuntimeKey(candidate)]
+	runtime.mu.Unlock()
+	if credential == nil {
+		t.Fatal("expected credential runtime state to be created")
+	}
+	if credential.DisabledUntil.Sub(before) > maxRetryAfterCooldown+time.Second {
+		t.Fatalf("expected retry-after clamp within %v, got %v", maxRetryAfterCooldown, credential.DisabledUntil.Sub(before))
+	}
+}
+
+func TestGeminiToOpenAIChatDoesNotDuplicateSystemInstruction(t *testing.T) {
+	t.Parallel()
+
+	body, err := geminiToOpenAIChat([]byte(`{
+		"systemInstruction":{"parts":[{"text":"camel"}]},
+		"system_instruction":{"parts":[{"text":"snake"}]},
+		"contents":[{"role":"user","parts":[{"text":"hello"}]}]
+	}`), "gpt-5.4", false)
+	if err != nil {
+		t.Fatalf("gemini to openai chat: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	systemCount := 0
+	for _, item := range messages {
+		message := item.(map[string]any)
+		if message["role"] == "system" {
+			systemCount++
+		}
+	}
+	if systemCount != 1 {
+		t.Fatalf("expected exactly one system message, got %d body=%s", systemCount, string(body))
+	}
+}
+
+func TestReadLimitedResponseBodyRejectsOversizedPayload(t *testing.T) {
+	t.Parallel()
+
+	body := bytes.NewReader(bytes.Repeat([]byte("a"), maxTransformedResponseBodyBytes+1))
+	if _, err := readLimitedResponseBody(body, maxTransformedResponseBodyBytes); err == nil {
+		t.Fatal("expected oversized upstream response to be rejected")
+	}
 }

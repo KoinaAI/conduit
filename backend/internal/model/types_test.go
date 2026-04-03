@@ -1,6 +1,9 @@
 package model
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestStateCloneDeepCopiesNestedCollections(t *testing.T) {
 	t.Parallel()
@@ -40,6 +43,20 @@ func TestStateCloneDeepCopiesNestedCollections(t *testing.T) {
 		},
 	}
 	state.RequestHistory = []RequestRecord{{ID: "req-1"}}
+	expiresAt := time.Date(2026, time.April, 3, 10, 0, 0, 0, time.UTC)
+	lastUsedAt := time.Date(2026, time.April, 3, 11, 0, 0, 0, time.UTC)
+	state.GatewayKeys = []GatewayKey{{
+		ID:               "gk-1",
+		Name:             "gateway",
+		SecretHash:       "hash",
+		SecretLookupHash: "lookup",
+		SecretPreview:    "preview",
+		Enabled:          true,
+		ExpiresAt:        &expiresAt,
+		LastUsedAt:       &lastUsedAt,
+		AllowedModels:    []string{"gpt-5"},
+		AllowedProtocols: []Protocol{ProtocolOpenAIChat},
+	}}
 
 	cloned := state.Clone()
 
@@ -51,6 +68,10 @@ func TestStateCloneDeepCopiesNestedCollections(t *testing.T) {
 	cloned.Integrations[0].Snapshot.ModelNames[0] = "gpt-5.4"
 	cloned.Integrations[0].Snapshot.Prices["gpt-5"] = IntegrationPricing{InputPerMillion: 99}
 	cloned.RequestHistory[0].ID = "req-2"
+	cloned.GatewayKeys[0].AllowedModels[0] = "gpt-5.4"
+	cloned.GatewayKeys[0].AllowedProtocols[0] = ProtocolAnthropic
+	*cloned.GatewayKeys[0].ExpiresAt = expiresAt.Add(time.Hour)
+	*cloned.GatewayKeys[0].LastUsedAt = lastUsedAt.Add(time.Hour)
 
 	if state.Providers[0].Capabilities[0] != ProtocolOpenAIChat {
 		t.Fatalf("provider capabilities were not cloned")
@@ -75,6 +96,18 @@ func TestStateCloneDeepCopiesNestedCollections(t *testing.T) {
 	}
 	if state.RequestHistory[0].ID != "req-1" {
 		t.Fatalf("request history values were unexpectedly mutated")
+	}
+	if state.GatewayKeys[0].AllowedModels[0] != "gpt-5" {
+		t.Fatalf("gateway key allowed models were not cloned")
+	}
+	if state.GatewayKeys[0].AllowedProtocols[0] != ProtocolOpenAIChat {
+		t.Fatalf("gateway key allowed protocols were not cloned")
+	}
+	if !state.GatewayKeys[0].ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("gateway key expires_at pointer was not cloned")
+	}
+	if !state.GatewayKeys[0].LastUsedAt.Equal(lastUsedAt) {
+		t.Fatalf("gateway key last_used_at pointer was not cloned")
 	}
 }
 
@@ -103,12 +136,22 @@ func TestStateRoutingSnapshotDeepCopiesRoutingCollections(t *testing.T) {
 		},
 	}
 	state.PricingProfiles = []PricingProfile{{ID: "pricing-1", Name: "Pricing 1"}}
+	expiresAt := time.Date(2026, time.April, 3, 10, 0, 0, 0, time.UTC)
+	state.GatewayKeys = []GatewayKey{{
+		ID:               "gk-1",
+		AllowedModels:    []string{"gpt-5"},
+		AllowedProtocols: []Protocol{ProtocolOpenAIChat},
+		ExpiresAt:        &expiresAt,
+	}}
 
 	snapshot := state.RoutingSnapshot()
 	snapshot.Providers[0].Capabilities[0] = ProtocolGeminiGenerate
 	snapshot.Providers[0].Headers["x-test"] = "b"
 	snapshot.ModelRoutes[0].Targets[0].Protocols[0] = ProtocolAnthropic
 	snapshot.PricingProfiles[0].Name = "Pricing 2"
+	snapshot.GatewayKeys[0].AllowedModels[0] = "gpt-5.4"
+	snapshot.GatewayKeys[0].AllowedProtocols[0] = ProtocolAnthropic
+	*snapshot.GatewayKeys[0].ExpiresAt = expiresAt.Add(time.Hour)
 
 	if state.Providers[0].Capabilities[0] != ProtocolOpenAIChat {
 		t.Fatalf("provider capabilities were not cloned")
@@ -121,5 +164,14 @@ func TestStateRoutingSnapshotDeepCopiesRoutingCollections(t *testing.T) {
 	}
 	if state.PricingProfiles[0].Name != "Pricing 1" {
 		t.Fatalf("pricing profiles were not cloned")
+	}
+	if state.GatewayKeys[0].AllowedModels[0] != "gpt-5" {
+		t.Fatalf("gateway key allowed models were not cloned")
+	}
+	if state.GatewayKeys[0].AllowedProtocols[0] != ProtocolOpenAIChat {
+		t.Fatalf("gateway key allowed protocols were not cloned")
+	}
+	if !state.GatewayKeys[0].ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("gateway key expires_at pointer was not cloned")
 	}
 }

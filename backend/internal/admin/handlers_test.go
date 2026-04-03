@@ -553,7 +553,14 @@ func TestPutStatePreservesGatewayKeySecrets(t *testing.T) {
 		"model_routes":[],
 		"pricing_profiles":[],
 		"integrations":[],
-		"gateway_keys":[{"id":"gk-1","name":"gateway","secret_preview":"uag-xx...yy","enabled":true}],
+		"gateway_keys":[{
+			"id":"gk-1",
+			"name":"gateway",
+			"secret_hash":"forged-hash",
+			"secret_lookup_hash":"forged-lookup",
+			"secret_preview":"forged-preview",
+			"enabled":true
+		}],
 		"request_history":[]
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -571,6 +578,9 @@ func TestPutStatePreservesGatewayKeySecrets(t *testing.T) {
 	}
 	if key.SecretHash == "" || key.SecretLookupHash == "" {
 		t.Fatalf("expected gateway key secrets to be preserved, got %+v", key)
+	}
+	if key.SecretHash == "forged-hash" || key.SecretLookupHash == "forged-lookup" || key.SecretPreview == "forged-preview" {
+		t.Fatalf("expected compatibility state update to ignore incoming secret-derived fields, got %+v", key)
 	}
 	if !model.VerifyGatewaySecret(key.SecretHash, "original-secret-123") {
 		t.Fatalf("expected preserved secret hash to remain valid")

@@ -284,7 +284,7 @@ func TestRuntimeReportFailureClampsHugeRetryAfter(t *testing.T) {
 	runtime.reportFailure(candidate, http.StatusTooManyRequests, "ratelimited", 24*365*time.Hour)
 
 	runtime.mu.Lock()
-	credential := runtime.credentials[runtime.credentialRuntimeKeyLocked(candidate)]
+	credential := runtime.credentials[credentialRuntimeKey(candidate)]
 	runtime.mu.Unlock()
 	if credential == nil {
 		t.Fatal("expected credential runtime state to be created")

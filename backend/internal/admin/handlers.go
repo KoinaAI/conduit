@@ -1172,15 +1172,9 @@ func preserveGatewayKeys(current, next []model.GatewayKey) []model.GatewayKey {
 }
 
 func preserveGatewayKeySecrets(current, next model.GatewayKey) model.GatewayKey {
-	if strings.TrimSpace(next.SecretHash) == "" {
-		next.SecretHash = current.SecretHash
-	}
-	if strings.TrimSpace(next.SecretLookupHash) == "" {
-		next.SecretLookupHash = current.SecretLookupHash
-	}
-	if strings.TrimSpace(next.SecretPreview) == "" {
-		next.SecretPreview = current.SecretPreview
-	}
+	next.SecretHash = current.SecretHash
+	next.SecretLookupHash = current.SecretLookupHash
+	next.SecretPreview = current.SecretPreview
 	if next.ExpiresAt == nil {
 		next.ExpiresAt = cloneTimeValue(current.ExpiresAt)
 	}

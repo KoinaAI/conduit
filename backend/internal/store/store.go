@@ -383,11 +383,12 @@ func (s *FileStore) AppendRequestRecord(record model.RequestRecord, attempts []m
 // RequestAttempts returns the recorded upstream attempts for one request.
 func (s *FileStore) RequestAttempts(requestID string) ([]model.RequestAttemptRecord, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.db == nil {
+	db := s.db
+	s.mu.RUnlock()
+	if db == nil {
 		return nil, errors.New("store is closed")
 	}
-	rows, err := s.db.Query(`SELECT payload FROM request_attempts WHERE request_id = ? ORDER BY sequence ASC`, requestID)
+	rows, err := db.Query(`SELECT payload FROM request_attempts WHERE request_id = ? ORDER BY sequence ASC`, requestID)
 	if err != nil {
 		return nil, err
 	}

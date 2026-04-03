@@ -827,11 +827,29 @@ func resolvedBaseURLClientKey(parsed *url.URL) string {
 		return ""
 	}
 	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
-	host := strings.ToLower(strings.TrimSpace(parsed.Host))
-	if scheme == "" || host == "" {
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	port := resolvedBaseURLEffectivePort(parsed)
+	if scheme == "" || host == "" || port == "" {
 		return ""
 	}
-	return scheme + "://" + host
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+func resolvedBaseURLEffectivePort(parsed *url.URL) string {
+	if parsed == nil {
+		return ""
+	}
+	if port := strings.TrimSpace(parsed.Port()); port != "" {
+		return port
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func blockedBaseURLIP(ip net.IP) bool {

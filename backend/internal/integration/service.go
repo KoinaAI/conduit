@@ -759,24 +759,8 @@ func isLikelyModelName(value string) bool {
 	if strings.HasPrefix(strings.ToLower(value), "http://") || strings.HasPrefix(strings.ToLower(value), "https://") {
 		return false
 	}
-	if len(value) == len("00000000-0000-0000-0000-000000000000") {
-		hexRunes := 0
-		for _, char := range value {
-			switch {
-			case char >= '0' && char <= '9':
-				hexRunes++
-			case char >= 'a' && char <= 'f':
-				hexRunes++
-			case char >= 'A' && char <= 'F':
-				hexRunes++
-			case char == '-':
-			default:
-				return false
-			}
-		}
-		if hexRunes == 32 {
-			return false
-		}
+	if looksLikeUUID(value) {
+		return false
 	}
 	if len(value) == len("2024-01-15") {
 		dateLike := true
@@ -810,6 +794,33 @@ func isLikelyModelName(value string) bool {
 		}
 	}
 	return validRune
+}
+
+func looksLikeUUID(value string) bool {
+	if len(value) != len("00000000-0000-0000-0000-000000000000") {
+		return false
+	}
+	hexRunes := 0
+	for index, char := range value {
+		switch index {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			switch {
+			case char >= '0' && char <= '9':
+				hexRunes++
+			case char >= 'a' && char <= 'f':
+				hexRunes++
+			case char >= 'A' && char <= 'F':
+				hexRunes++
+			default:
+				return false
+			}
+		}
+	}
+	return hexRunes == 32
 }
 
 func pointerBool(value bool) *bool {

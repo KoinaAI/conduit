@@ -179,6 +179,33 @@ func TestGeminiToOpenAIChatPreservesFunctionCallsAndResponses(t *testing.T) {
 	}
 }
 
+func TestGeminiToOpenAIChatSkipsFunctionResponseWithoutName(t *testing.T) {
+	t.Parallel()
+
+	body, err := geminiToOpenAIChat([]byte(`{
+		"contents":[
+			{"role":"model","parts":[{"functionCall":{"name":"search","args":{"q":"weather"}}}]},
+			{"role":"function","parts":[{"functionResponse":{"response":{"result":"sunny"}}}]}
+		]
+	}`), "provider-model", false)
+	if err != nil {
+		t.Fatalf("gemini to openai chat: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected nameless function response to be skipped, got %d messages", len(messages))
+	}
+	assistant := messages[0].(map[string]any)
+	if assistant["role"] != "assistant" {
+		t.Fatalf("expected remaining message to be assistant tool call, got %+v", assistant)
+	}
+}
+
 func TestWriteAnthropicSSEReturnsErrorOnMalformedJSONEvent(t *testing.T) {
 	t.Parallel()
 

@@ -610,6 +610,9 @@ func geminiFunctionResponseToOpenAIMessage(part map[string]any, tracker *geminiT
 		return nil, false
 	}
 	name := strings.TrimSpace(stringValue(response["name"]))
+	if name == "" {
+		return nil, false
+	}
 	return map[string]any{
 		"role":         "tool",
 		"tool_call_id": tracker.take(name),

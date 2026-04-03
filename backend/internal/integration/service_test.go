@@ -297,6 +297,7 @@ func TestIsLikelyModelNameFiltersCommonGarbage(t *testing.T) {
 	cases := map[string]bool{
 		"gpt-5.4":                                 true,
 		"deepseek/deepseek-r1":                    true,
+		"gpt-5-super-long-model-name-2026-abcd":   true,
 		"2024-01-15":                              false,
 		"https://relay.example/v1/models":         false,
 		"550e8400-e29b-41d4-a716-446655440000":    false,
@@ -306,6 +307,17 @@ func TestIsLikelyModelNameFiltersCommonGarbage(t *testing.T) {
 		if got := isLikelyModelName(input); got != want {
 			t.Fatalf("unexpected model-name classification for %q: got=%v want=%v", input, got, want)
 		}
+	}
+}
+
+func TestLooksLikeUUIDMatchesOnlyUUIDShape(t *testing.T) {
+	t.Parallel()
+
+	if !looksLikeUUID("550e8400-e29b-41d4-a716-446655440000") {
+		t.Fatal("expected canonical uuid to match")
+	}
+	if looksLikeUUID("gpt-5-super-long-model-name-2026-abcd") {
+		t.Fatal("expected non-uuid 36-char model name not to match uuid heuristic")
 	}
 }
 

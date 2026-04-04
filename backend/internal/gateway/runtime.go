@@ -13,6 +13,12 @@ const (
 	defaultStickySweepInterval = 64
 	defaultRetryAfterCooldown  = 2 * time.Minute
 	maxRetryAfterCooldown      = 15 * time.Minute
+	defaultAuthFailureWindow   = 5 * time.Minute
+	defaultAuthLockDuration    = 10 * time.Minute
+	defaultAuthFailureLimit    = 20
+	defaultInvalidLookupTTL    = 60 * time.Second
+	defaultAuthSweepInterval   = 64
+	maxAuthRuntimeEntries      = 4096
 )
 
 type endpointRuntimeState struct {
@@ -47,21 +53,40 @@ type gatewayKeyWindow struct {
 	InFlight     int
 }
 
+type invalidGatewayLookupState struct {
+	CandidateFingerprint string
+	ExpiresAt            time.Time
+}
+
+type gatewayAuthFailureState struct {
+	WindowStartedAt time.Time
+	LastFailedAt    time.Time
+	FailureCount    int
+	LockedUntil     time.Time
+}
+
 type runtimeState struct {
-	mu           sync.Mutex
-	endpoints    map[string]*endpointRuntimeState
-	credentials  map[string]*credentialRuntimeState
-	sticky       map[string]stickyBinding
-	stickyWrites int
-	keyWindows   map[string]*gatewayKeyWindow
+	mu                    sync.Mutex
+	endpoints             map[string]*endpointRuntimeState
+	credentials           map[string]*credentialRuntimeState
+	sticky                map[string]stickyBinding
+	stickyWrites          int
+	keyWindows            map[string]*gatewayKeyWindow
+	roundRobin            map[string]uint64
+	invalidGatewayLookups map[string]invalidGatewayLookupState
+	authFailures          map[string]*gatewayAuthFailureState
+	authWrites            int
 }
 
 func newRuntimeState() *runtimeState {
 	return &runtimeState{
-		endpoints:   map[string]*endpointRuntimeState{},
-		credentials: map[string]*credentialRuntimeState{},
-		sticky:      map[string]stickyBinding{},
-		keyWindows:  map[string]*gatewayKeyWindow{},
+		endpoints:             map[string]*endpointRuntimeState{},
+		credentials:           map[string]*credentialRuntimeState{},
+		sticky:                map[string]stickyBinding{},
+		keyWindows:            map[string]*gatewayKeyWindow{},
+		roundRobin:            map[string]uint64{},
+		invalidGatewayLookups: map[string]invalidGatewayLookupState{},
+		authFailures:          map[string]*gatewayAuthFailureState{},
 	}
 }
 
@@ -260,12 +285,151 @@ func (r *runtimeState) releaseGatewayKey(keyID string, costUSD float64) {
 	}
 }
 
+func (r *runtimeState) gatewayAuthSourceLocked(source string, now time.Time) bool {
+	source = normalizeGatewayAuthSource(source)
+	if source == "" {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	state := r.authFailures[source]
+	if state == nil {
+		return false
+	}
+	if !state.LockedUntil.After(now) {
+		if !state.LockedUntil.IsZero() {
+			state.FailureCount = 0
+			state.WindowStartedAt = time.Time{}
+			state.LockedUntil = time.Time{}
+		}
+		if state.LastFailedAt.IsZero() || state.LastFailedAt.Add(defaultAuthFailureWindow).Before(now) {
+			delete(r.authFailures, source)
+		}
+		return false
+	}
+	return true
+}
+
+func (r *runtimeState) invalidGatewayLookupCached(lookupHash, candidateFingerprint string, now time.Time) bool {
+	lookupHash = strings.TrimSpace(lookupHash)
+	if lookupHash == "" {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	entry, ok := r.invalidGatewayLookups[lookupHash]
+	if !ok {
+		return false
+	}
+	if !entry.ExpiresAt.After(now) {
+		delete(r.invalidGatewayLookups, lookupHash)
+		return false
+	}
+	if entry.CandidateFingerprint != candidateFingerprint {
+		delete(r.invalidGatewayLookups, lookupHash)
+		return false
+	}
+	return true
+}
+
+func (r *runtimeState) recordGatewayAuthFailure(source, lookupHash, candidateFingerprint string, now time.Time) {
+	source = normalizeGatewayAuthSource(source)
+	lookupHash = strings.TrimSpace(lookupHash)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if source != "" {
+		state := r.authFailures[source]
+		if state == nil {
+			state = &gatewayAuthFailureState{}
+			r.authFailures[source] = state
+		}
+		if state.WindowStartedAt.IsZero() || now.Sub(state.WindowStartedAt) > defaultAuthFailureWindow {
+			state.WindowStartedAt = now
+			state.FailureCount = 0
+		}
+		state.FailureCount++
+		state.LastFailedAt = now
+		if state.LockedUntil.After(now) || state.FailureCount >= defaultAuthFailureLimit {
+			state.LockedUntil = now.Add(defaultAuthLockDuration)
+		}
+	}
+
+	if lookupHash != "" {
+		r.invalidGatewayLookups[lookupHash] = invalidGatewayLookupState{
+			CandidateFingerprint: candidateFingerprint,
+			ExpiresAt:            now.Add(defaultInvalidLookupTTL),
+		}
+	}
+
+	r.authWrites++
+	if r.authWrites >= defaultAuthSweepInterval ||
+		len(r.authFailures) > maxAuthRuntimeEntries ||
+		len(r.invalidGatewayLookups) > maxAuthRuntimeEntries {
+		r.sweepGatewayAuthStateLocked(now)
+		r.authWrites = 0
+	}
+}
+
+func (r *runtimeState) clearGatewayAuthFailures(source, lookupHash string) {
+	source = normalizeGatewayAuthSource(source)
+	lookupHash = strings.TrimSpace(lookupHash)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if source != "" {
+		delete(r.authFailures, source)
+	}
+	if lookupHash != "" {
+		delete(r.invalidGatewayLookups, lookupHash)
+	}
+}
+
+func (r *runtimeState) sweepGatewayAuthStateLocked(now time.Time) {
+	for key, entry := range r.invalidGatewayLookups {
+		if !entry.ExpiresAt.After(now) {
+			delete(r.invalidGatewayLookups, key)
+		}
+	}
+	for source, state := range r.authFailures {
+		if state == nil {
+			delete(r.authFailures, source)
+			continue
+		}
+		if state.LockedUntil.After(now) {
+			continue
+		}
+		if state.LastFailedAt.IsZero() || state.LastFailedAt.Add(defaultAuthFailureWindow).Before(now) {
+			delete(r.authFailures, source)
+		}
+	}
+}
+
+func (r *runtimeState) nextRoundRobinOffset(key string, size int) int {
+	if size <= 1 {
+		return 0
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	offset := int(r.roundRobin[key] % uint64(size))
+	r.roundRobin[key]++
+	return offset
+}
+
 func endpointRuntimeKey(candidate resolvedCandidate) string {
 	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.endpoint.ID))
 }
 
 func credentialRuntimeKey(candidate resolvedCandidate) string {
-	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.credential.ID)) + "\x00" + model.LegacyGatewaySecretLookupHash(candidate.credential.APIKey)
+	return strings.ToLower(strings.TrimSpace(candidate.provider.ID)) + "\x00" + strings.ToLower(strings.TrimSpace(candidate.credential.ID))
 }
 
 func clampRetryAfterCooldown(delay time.Duration) time.Duration {

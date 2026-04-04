@@ -2,8 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os/signal"
 	"strings"
@@ -25,6 +26,7 @@ type App struct {
 	admin     *admin.Handlers
 	gateway   *gateway.Service
 	scheduler *scheduler.Service
+	startedAt time.Time
 }
 
 func New(cfg config.Config) (*App, error) {
@@ -49,16 +51,14 @@ func New(cfg config.Config) (*App, error) {
 		admin:     adminHandlers,
 		gateway:   gatewayService,
 		scheduler: scheduler.New(adminHandlers, time.Duration(cfg.ProbeIntervalSeconds)*time.Second),
+		startedAt: time.Now().UTC(),
 	}, nil
 }
 
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	mux.HandleFunc("GET /healthz", a.Healthz)
 
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("GET /api/admin/state", a.admin.GetState)
@@ -90,6 +90,10 @@ func (a *App) Handler() http.Handler {
 	adminMux.HandleFunc("DELETE /api/admin/gateway-keys/{id}", a.admin.DeleteGatewayKey)
 	adminMux.HandleFunc("GET /api/admin/request-history", a.admin.ListRequestHistory)
 	adminMux.HandleFunc("GET /api/admin/request-history/{id}/attempts", a.admin.GetRequestAttempts)
+	adminMux.HandleFunc("GET /api/admin/stats/summary", a.admin.GetStatsSummary)
+	adminMux.HandleFunc("GET /api/admin/stats/by-key", a.admin.GetStatsByGatewayKey)
+	adminMux.HandleFunc("GET /api/admin/stats/by-provider", a.admin.GetStatsByProvider)
+	adminMux.HandleFunc("GET /api/admin/stats/by-model", a.admin.GetStatsByModel)
 	adminMux.HandleFunc("GET /api/admin/meta", a.admin.GetMeta)
 	adminMux.HandleFunc("GET /api/admin/openapi.json", a.admin.OpenAPI)
 	adminMux.HandleFunc("POST /api/admin/maintenance/probes", a.admin.ProbeAllProviders)
@@ -170,6 +174,39 @@ func (a *App) Handler() http.Handler {
 	return mux
 }
 
+// Healthz reports process uptime plus SQLite connectivity for external probes.
+func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
+	status := http.StatusOK
+	dbStatus := "ok"
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.store.Ping(ctx); err != nil {
+		status = http.StatusServiceUnavailable
+		dbStatus = err.Error()
+	}
+	now := time.Now().UTC()
+	counts := a.store.HealthCounts(now)
+	healthStatus := "ok"
+	if status != http.StatusOK {
+		healthStatus = "degraded"
+	}
+	writeJSON(w, status, map[string]any{
+		"status":         healthStatus,
+		"server_time":    now,
+		"uptime_seconds": int64(now.Sub(a.startedAt).Seconds()),
+		"db_status":      dbStatus,
+		"counts": map[string]any{
+			"providers":             counts.Providers,
+			"routes":                counts.Routes,
+			"gateway_keys_total":    counts.GatewayKeysTotal,
+			"gateway_keys_active":   counts.GatewayKeysActive,
+			"integrations":          counts.Integrations,
+			"pricing_profiles":      counts.PricingProfiles,
+			"request_history_items": counts.RequestHistoryItems,
+		},
+	})
+}
+
 func (a *App) StartBackground(ctx context.Context) {
 	go a.scheduler.Start(ctx)
 }
@@ -198,7 +235,7 @@ func Run(cfg config.Config) error {
 	}
 	defer func() {
 		if closeErr := app.Close(); closeErr != nil {
-			log.Printf("gateway store close failed: %v", closeErr)
+			slog.Error("gateway store close failed", "error", closeErr)
 		}
 	}()
 
@@ -208,7 +245,7 @@ func Run(cfg config.Config) error {
 	app.StartBackground(ctx)
 
 	server := newHTTPServer(cfg.BindAddress, app.Handler())
-	log.Printf("gateway listening on %s", cfg.BindAddress)
+	slog.Info("gateway listening", "bind_address", cfg.BindAddress)
 	errCh := make(chan error, 1)
 	go func() {
 		if serveErr := server.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
@@ -222,6 +259,7 @@ func Run(cfg config.Config) error {
 		return serveErr
 	case <-ctx.Done():
 	}
+	slog.Info("gateway shutdown requested")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -256,6 +294,12 @@ func withCORS(next http.Handler, cfg config.Config, allowedOrigins []string, all
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func originAllowed(cfg config.Config, allowedOrigins []string, origin string) bool {

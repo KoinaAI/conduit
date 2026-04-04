@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,17 @@ type FileStore struct {
 	db    *sql.DB
 	mu    sync.RWMutex
 	state model.State
+}
+
+// HealthCounts summarizes lightweight in-memory counts for health endpoints.
+type HealthCounts struct {
+	Providers           int
+	Routes              int
+	GatewayKeysTotal    int
+	GatewayKeysActive   int
+	Integrations        int
+	PricingProfiles     int
+	RequestHistoryItems int
 }
 
 // Open initializes the SQLite-backed store and imports legacy JSON state when
@@ -84,6 +96,39 @@ func (s *FileStore) Close() error {
 	err := s.db.Close()
 	s.db = nil
 	return err
+}
+
+// Ping verifies that the backing SQLite connection is still healthy.
+func (s *FileStore) Ping(ctx context.Context) error {
+	s.mu.RLock()
+	db := s.db
+	s.mu.RUnlock()
+	if db == nil {
+		return errors.New("store is closed")
+	}
+	return db.PingContext(ctx)
+}
+
+// HealthCounts returns lightweight state counts without cloning the full
+// configuration snapshot or request history.
+func (s *FileStore) HealthCounts(now time.Time) HealthCounts {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	counts := HealthCounts{
+		Providers:           len(s.state.Providers),
+		Routes:              len(s.state.ModelRoutes),
+		GatewayKeysTotal:    len(s.state.GatewayKeys),
+		Integrations:        len(s.state.Integrations),
+		PricingProfiles:     len(s.state.PricingProfiles),
+		RequestHistoryItems: len(s.state.RequestHistory),
+	}
+	for _, key := range s.state.GatewayKeys {
+		if key.Enabled && !key.IsExpired(now) {
+			counts.GatewayKeysActive++
+		}
+	}
+	return counts
 }
 
 func loadLegacyJSON(path string) (*model.State, error) {

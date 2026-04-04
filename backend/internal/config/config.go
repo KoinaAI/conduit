@@ -12,6 +12,8 @@ type Config struct {
 	StatePath                 string
 	AdminToken                string
 	GatewaySecretLookupPepper string
+	LogFormat                 string
+	LogLevel                  string
 	GatewayAllowedOrigins     []string
 	AdminAllowedOrigins       []string
 	RealtimeAllowedOrigins    []string
@@ -27,11 +29,13 @@ func Load() Config {
 		StatePath:                 getenv("GATEWAY_STATE_PATH", "./data/gateway.db"),
 		AdminToken:                strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_TOKEN")),
 		GatewaySecretLookupPepper: strings.TrimSpace(os.Getenv("GATEWAY_SECRET_LOOKUP_PEPPER")),
+		LogFormat:                 strings.TrimSpace(getenv("GATEWAY_LOG_FORMAT", "text")),
+		LogLevel:                  strings.TrimSpace(getenv("GATEWAY_LOG_LEVEL", "info")),
 		GatewayAllowedOrigins:     getenvCSV("GATEWAY_ALLOWED_ORIGINS", "*"),
 		AdminAllowedOrigins:       getenvCSV("GATEWAY_ADMIN_ALLOWED_ORIGINS", ""),
 		RealtimeAllowedOrigins:    getenvCSV("GATEWAY_REALTIME_ALLOWED_ORIGINS", ""),
 		EnableRealtime:            getenvBool("GATEWAY_ENABLE_REALTIME", true),
-		RequestHistory:            getenvInt("GATEWAY_REQUEST_HISTORY", 200),
+		RequestHistory:            getenvInt("GATEWAY_REQUEST_HISTORY", 10000),
 		BootstrapGatewayKey:       getenv("GATEWAY_BOOTSTRAP_GATEWAY_KEY", ""),
 		ProbeIntervalSeconds:      getenvInt("GATEWAY_PROBE_INTERVAL_SECONDS", 180),
 	}
@@ -45,6 +49,16 @@ func (c Config) Validate() error {
 	}
 	if c.ProbeIntervalSeconds < 0 {
 		return errors.New("GATEWAY_PROBE_INTERVAL_SECONDS must be greater than or equal to 0")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.LogFormat)) {
+	case "", "text", "json":
+	default:
+		return errors.New("GATEWAY_LOG_FORMAT must be text or json")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
+	case "", "debug", "info", "warn", "error":
+	default:
+		return errors.New("GATEWAY_LOG_LEVEL must be one of debug, info, warn, error")
 	}
 	return nil
 }

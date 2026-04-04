@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -73,6 +75,13 @@ const (
 	maxRealtimeFrameBytes     int64        = 8 << 20
 )
 
+const (
+	providerRoutingModeRoundRobin model.ProviderRoutingMode = "round-robin"
+	providerRoutingModeRandom     model.ProviderRoutingMode = "random"
+	providerRoutingModeFailover   model.ProviderRoutingMode = "failover"
+	providerRoutingModeOrdered    model.ProviderRoutingMode = "ordered"
+)
+
 type cancelReadCloser struct {
 	io.ReadCloser
 	cancel context.CancelFunc
@@ -136,7 +145,7 @@ func NewService(cfg config.Config, store *store.FileStore) *Service {
 // consumer key.
 func (s *Service) HandleModels(w http.ResponseWriter, r *http.Request) {
 	state := s.store.RoutingSnapshot()
-	gatewayKey, err := s.authenticateGatewayRequest(state, r.Header, "", "")
+	gatewayKey, err := s.authenticateGatewayRequest(state, r.Header, "", "", gatewayRequestSource(r))
 	if err != nil {
 		writeGatewayAuthError(w, err)
 		return
@@ -179,7 +188,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 		}
 
 		state := s.store.RoutingSnapshot()
-		gatewayKey, err := s.authenticateGatewayRequest(state, r.Header, protocol, parsedRequest.routeAlias)
+		gatewayKey, err := s.authenticateGatewayRequest(state, r.Header, protocol, parsedRequest.routeAlias, gatewayRequestSource(r))
 		if err != nil {
 			writeGatewayAuthError(w, err)
 			return
@@ -189,7 +198,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			s.runtime.releaseGatewayKey(gatewayKey.ID, finalCost)
 		}()
 
-		candidates, _, pricing, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, gatewayKey.ID, parsedRequest.sessionID)
+		candidates, route, pricing, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, gatewayKey.ID, parsedRequest.sessionID)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -206,6 +215,13 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			StartedAt:       started,
 			Stream:          parsedRequest.stream,
 		}
+		record.RoutingDecision = newRoutingDecision(route, gatewayKey.ID, parsedRequest.sessionID, candidates, s.runtime, started)
+		logger := slog.With(
+			"request_id", record.ID,
+			"protocol", protocol,
+			"route_alias", parsedRequest.routeAlias,
+			"gateway_key_id", gatewayKey.ID,
+		)
 
 		attempts := make([]model.RequestAttemptRecord, 0, len(candidates))
 		var lastErr error
@@ -242,9 +258,20 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 				})
 				s.runtime.reportFailure(candidate, 0, err.Error(), 0)
 				if index < len(candidates)-1 {
+					backoff := retryBackoffDelay(0, index+1)
+					appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "switch_provider", true, 0, backoff, err)
+					logger.Warn("gateway upstream request failed before response",
+						"provider_id", candidate.provider.ID,
+						"endpoint_id", candidate.endpoint.ID,
+						"credential_id", candidate.credential.ID,
+						"attempt", index+1,
+						"backoff_ms", backoff.Milliseconds(),
+						"error", err,
+					)
 					sleepBackoff(0, index+1)
 					continue
 				}
+				appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "abort", true, 0, 0, err)
 				break
 			}
 
@@ -273,9 +300,21 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 				})
 				s.runtime.reportFailure(candidate, resp.StatusCode, strings.TrimSpace(string(body)), retryAfter)
 				if retryable && index < len(candidates)-1 {
+					backoff := retryBackoffDelay(resp.StatusCode, index+1)
+					appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "switch_provider", retryable, resp.StatusCode, backoff, lastErr)
+					logger.Warn("gateway upstream returned retryable error",
+						"provider_id", candidate.provider.ID,
+						"endpoint_id", candidate.endpoint.ID,
+						"credential_id", candidate.credential.ID,
+						"attempt", index+1,
+						"status_code", resp.StatusCode,
+						"backoff_ms", backoff.Milliseconds(),
+						"error", lastErr,
+					)
 					sleepBackoff(resp.StatusCode, index+1)
 					continue
 				}
+				appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, nextDecision(retryable, false), retryable, resp.StatusCode, 0, lastErr)
 				break
 			}
 
@@ -286,7 +325,9 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			record.AttemptCount = index + 1
 
 			observer := NewUsageObserver(protocol)
+			observer.ObserveRequestBody(exchange.Body)
 			setBillingTrailers(w.Header())
+			writeRoutingMetadata(w.Header(), route, candidate, time.Since(attemptStarted), parsedRequest.sessionID)
 			writeErr := s.writeProxyResponse(w, resp, observer, exchange, parsedRequest.routeAlias)
 			_ = resp.Body.Close()
 			if writeErr != nil {
@@ -312,9 +353,21 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 				})
 				s.runtime.reportFailure(candidate, 0, writeErr.Error(), 0)
 				if retryable && hasNext {
+					backoff := retryBackoffDelay(0, index+1)
+					appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "switch_provider", true, http.StatusBadGateway, backoff, writeErr)
+					logger.Warn("gateway response transformation failed before completion",
+						"provider_id", candidate.provider.ID,
+						"endpoint_id", candidate.endpoint.ID,
+						"credential_id", candidate.credential.ID,
+						"attempt", index+1,
+						"status_code", http.StatusBadGateway,
+						"backoff_ms", backoff.Milliseconds(),
+						"error", writeErr,
+					)
 					sleepBackoff(0, index+1)
 					continue
 				}
+				appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, nextDecision(retryable, false), retryable, http.StatusBadGateway, 0, writeErr)
 				break
 			}
 
@@ -322,6 +375,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			record.Usage = observer.Summary()
 			record.Billing = billing.Calculate(pricing, record.Usage, candidate.multiplier, pricing.Name)
 			finalCost = record.Billing.FinalCost
+			appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "success", false, resp.StatusCode, 0, nil)
 			writeBillingMetadata(w.Header(), record)
 			attempts = append(attempts, model.RequestAttemptRecord{
 				RequestID:     record.ID,
@@ -339,6 +393,18 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 				DurationMS:    time.Since(attemptStarted).Milliseconds(),
 			})
 			s.runtime.reportSuccess(candidate, time.Since(attemptStarted))
+			logger.Info("gateway request completed",
+				"provider_id", candidate.provider.ID,
+				"endpoint_id", candidate.endpoint.ID,
+				"credential_id", candidate.credential.ID,
+				"attempts", index+1,
+				"status_code", resp.StatusCode,
+				"duration_ms", record.DurationMS,
+				"input_tokens", record.Usage.InputTokens,
+				"output_tokens", record.Usage.OutputTokens,
+				"total_tokens", record.Usage.TotalTokens,
+				"final_cost", record.Billing.FinalCost,
+			)
 			s.appendRecord(record, attempts)
 			return
 		}
@@ -352,6 +418,12 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 		if lastErr != nil {
 			record.Error = lastErr.Error()
 		}
+		logger.Warn("gateway request failed",
+			"status_code", record.StatusCode,
+			"attempts", record.AttemptCount,
+			"duration_ms", record.DurationMS,
+			"error", record.Error,
+		)
 		s.appendRecord(record, attempts)
 		if responseWriteStarted(lastErr) {
 			return
@@ -369,7 +441,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	}
 
 	state := s.store.RoutingSnapshot()
-	gatewayKey, err := s.authenticateGatewayRequest(state, r.Header, model.ProtocolOpenAIRealtime, routeAlias)
+	gatewayKey, err := s.authenticateGatewayRequest(state, r.Header, model.ProtocolOpenAIRealtime, routeAlias, gatewayRequestSource(r))
 	if err != nil {
 		writeGatewayAuthError(w, err)
 		return
@@ -379,7 +451,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		s.runtime.releaseGatewayKey(gatewayKey.ID, finalCost)
 	}()
 
-	candidates, _, pricing, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, gatewayKey.ID, "")
+	candidates, route, pricing, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, gatewayKey.ID, "")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -405,7 +477,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	upstreamURL.RawQuery = query.Encode()
 
 	upgrader := websocket.Upgrader{CheckOrigin: s.allowRealtimeOrigin}
-	clientConn, err := upgrader.Upgrade(w, r, nil)
+	clientConn, err := upgrader.Upgrade(w, r, routingMetadataHeader(route, candidate, 0, ""))
 	if err != nil {
 		return
 	}
@@ -447,6 +519,16 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		StartedAt:     started,
 		Stream:        true,
 	}
+	record.RoutingDecision = newRoutingDecision(route, gatewayKey.ID, "", candidates, s.runtime, started)
+	logger := slog.With(
+		"request_id", record.ID,
+		"protocol", model.ProtocolOpenAIRealtime,
+		"route_alias", routeAlias,
+		"gateway_key_id", gatewayKey.ID,
+		"provider_id", candidate.provider.ID,
+		"endpoint_id", candidate.endpoint.ID,
+		"credential_id", candidate.credential.ID,
+	)
 
 	errCh := make(chan error, 2)
 	go proxyWSFrames(serverConn, clientConn, observer, errCh)
@@ -464,8 +546,25 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	record.Usage = observer.Summary()
 	record.Billing = billing.Calculate(pricing, record.Usage, candidate.multiplier, pricing.Name)
 	finalCost = record.Billing.FinalCost
+	appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, 1, "success", false, http.StatusSwitchingProtocols, 0, nil)
 	if err != nil && !isNormalClose(err) {
 		record.Error = err.Error()
+		logger.Warn("gateway realtime session closed with error",
+			"duration_ms", record.DurationMS,
+			"input_tokens", record.Usage.InputTokens,
+			"output_tokens", record.Usage.OutputTokens,
+			"total_tokens", record.Usage.TotalTokens,
+			"final_cost", record.Billing.FinalCost,
+			"error", err,
+		)
+	} else {
+		logger.Info("gateway realtime session completed",
+			"duration_ms", record.DurationMS,
+			"input_tokens", record.Usage.InputTokens,
+			"output_tokens", record.Usage.OutputTokens,
+			"total_tokens", record.Usage.TotalTokens,
+			"final_cost", record.Billing.FinalCost,
+		)
 	}
 	s.appendRecord(record, []model.RequestAttemptRecord{{
 		RequestID:     record.ID,
@@ -670,24 +769,7 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 	if len(candidates) == 0 {
 		candidates = degraded
 	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		leftPriority := candidates[i].target.Priority + candidates[i].endpoint.Priority
-		rightPriority := candidates[j].target.Priority + candidates[j].endpoint.Priority
-		if leftPriority != rightPriority {
-			return leftPriority < rightPriority
-		}
-		leftLatency := candidateLatency(s.runtime.endpointLatency(candidates[i]))
-		rightLatency := candidateLatency(s.runtime.endpointLatency(candidates[j]))
-		if leftLatency != rightLatency {
-			return leftLatency < rightLatency
-		}
-		leftWeight := totalCandidateWeight(candidates[i])
-		rightWeight := totalCandidateWeight(candidates[j])
-		if leftWeight != rightWeight {
-			return leftWeight > rightWeight
-		}
-		return candidates[i].provider.Name < candidates[j].provider.Name
-	})
+	candidates = s.orderCandidatePlan(route, protocol, candidates)
 
 	if binding, ok := s.runtime.stickyBindingFor(gatewayKeyID, alias, sessionID, now); ok {
 		for index, candidate := range candidates {
@@ -714,6 +796,272 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 		return nil, model.ModelRoute{}, model.PricingProfile{}, fmt.Errorf("route %q has no candidate within provider retry budgets", alias)
 	}
 	return filteredCandidates, route, profile, nil
+}
+
+type candidateGroup struct {
+	key          string
+	targetID     string
+	targetWeight int
+	providerName string
+	priority     int
+	candidates   []resolvedCandidate
+}
+
+func (s *Service) orderCandidatePlan(route model.ModelRoute, protocol model.Protocol, candidates []resolvedCandidate) []resolvedCandidate {
+	if len(candidates) <= 1 {
+		return append([]resolvedCandidate(nil), candidates...)
+	}
+
+	groupIndex := make(map[string]int, len(candidates))
+	groups := make([]candidateGroup, 0, len(candidates))
+	for _, candidate := range candidates {
+		key := candidate.target.ID + "\x00" + candidate.provider.ID
+		index, ok := groupIndex[key]
+		if !ok {
+			index = len(groups)
+			groupIndex[key] = index
+			groups = append(groups, candidateGroup{
+				key:          key,
+				targetID:     candidate.target.ID,
+				targetWeight: candidate.target.Weight,
+				providerName: candidate.provider.Name,
+				priority:     candidate.target.Priority,
+			})
+		}
+		groups[index].candidates = append(groups[index].candidates, candidate)
+	}
+
+	groups = s.orderCandidateGroups(route, protocol, groups)
+
+	ordered := make([]resolvedCandidate, 0, len(candidates))
+	for _, group := range groups {
+		ordered = append(ordered, s.orderProviderCandidates(route.Alias, protocol, group.key, group.candidates)...)
+	}
+	return ordered
+}
+
+func (s *Service) orderCandidateGroups(route model.ModelRoute, protocol model.Protocol, groups []candidateGroup) []candidateGroup {
+	strategy := effectiveRouteStrategy(route)
+	switch strategy {
+	case model.RouteStrategyLatency:
+		sort.SliceStable(groups, func(i, j int) bool {
+			leftLatency := candidateGroupLatency(s.runtime, groups[i])
+			rightLatency := candidateGroupLatency(s.runtime, groups[j])
+			if leftLatency != rightLatency {
+				return leftLatency < rightLatency
+			}
+			return compareCandidateGroups(groups[i], groups[j])
+		})
+	case model.RouteStrategyRoundRobin:
+		sort.SliceStable(groups, func(i, j int) bool {
+			return compareCandidateGroups(groups[i], groups[j])
+		})
+		offset := s.runtime.nextRoundRobinOffset(roundRobinKey(route.Alias, protocol, "route-groups"), len(groups))
+		groups = rotateCandidateGroups(groups, offset)
+	case model.RouteStrategyRandom:
+		sort.SliceStable(groups, func(i, j int) bool {
+			return compareCandidateGroups(groups[i], groups[j])
+		})
+		seed := time.Now().UnixNano() + int64(s.runtime.nextRoundRobinOffset(roundRobinKey(route.Alias, protocol, "route-groups-random"), len(groups)))
+		rng := rand.New(rand.NewSource(seed))
+		rng.Shuffle(len(groups), func(i, j int) {
+			groups[i], groups[j] = groups[j], groups[i]
+		})
+	case model.RouteStrategyFailover:
+		sort.SliceStable(groups, func(i, j int) bool {
+			if groups[i].priority != groups[j].priority {
+				return groups[i].priority < groups[j].priority
+			}
+			if groups[i].providerName != groups[j].providerName {
+				return groups[i].providerName < groups[j].providerName
+			}
+			return groups[i].targetID < groups[j].targetID
+		})
+	default:
+		sort.SliceStable(groups, func(i, j int) bool {
+			return compareCandidateGroups(groups[i], groups[j])
+		})
+	}
+	return groups
+}
+
+func compareCandidateGroups(left, right candidateGroup) bool {
+	if left.priority != right.priority {
+		return left.priority < right.priority
+	}
+	if left.targetWeight != right.targetWeight {
+		return left.targetWeight > right.targetWeight
+	}
+	if left.providerName != right.providerName {
+		return left.providerName < right.providerName
+	}
+	return left.targetID < right.targetID
+}
+
+func candidateGroupLatency(runtime *runtimeState, group candidateGroup) int64 {
+	best := int64(0)
+	for index, candidate := range group.candidates {
+		latency := candidateLatency(runtime.endpointLatency(candidate))
+		if index == 0 || latency < best {
+			best = latency
+		}
+	}
+	if best == 0 {
+		return candidateLatency(0)
+	}
+	return best
+}
+
+func rotateCandidateGroups(groups []candidateGroup, offset int) []candidateGroup {
+	if len(groups) == 0 {
+		return nil
+	}
+	offset %= len(groups)
+	if offset == 0 {
+		return groups
+	}
+	rotated := make([]candidateGroup, 0, len(groups))
+	rotated = append(rotated, groups[offset:]...)
+	rotated = append(rotated, groups[:offset]...)
+	return rotated
+}
+
+func (s *Service) orderProviderCandidates(alias string, protocol model.Protocol, groupKey string, candidates []resolvedCandidate) []resolvedCandidate {
+	if len(candidates) <= 1 {
+		return append([]resolvedCandidate(nil), candidates...)
+	}
+
+	bands := make(map[int][]resolvedCandidate, len(candidates))
+	priorities := make([]int, 0, len(candidates))
+	seen := make(map[int]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		priority := candidate.endpoint.Priority
+		bands[priority] = append(bands[priority], candidate)
+		if _, ok := seen[priority]; ok {
+			continue
+		}
+		seen[priority] = struct{}{}
+		priorities = append(priorities, priority)
+	}
+	sort.Ints(priorities)
+
+	mode := normalizeProviderRoutingMode(candidates[0].provider.RoutingMode)
+	ordered := make([]resolvedCandidate, 0, len(candidates))
+	for _, priority := range priorities {
+		band := append([]resolvedCandidate(nil), bands[priority]...)
+		ordered = append(ordered, s.orderCandidateBand(mode, alias, protocol, groupKey, band)...)
+	}
+	return ordered
+}
+
+func (s *Service) orderCandidateBand(mode model.ProviderRoutingMode, alias string, protocol model.Protocol, groupKey string, band []resolvedCandidate) []resolvedCandidate {
+	if len(band) <= 1 {
+		return band
+	}
+
+	switch mode {
+	case model.ProviderRoutingModeLatency:
+		sort.SliceStable(band, func(i, j int) bool {
+			leftLatency := candidateLatency(s.runtime.endpointLatency(band[i]))
+			rightLatency := candidateLatency(s.runtime.endpointLatency(band[j]))
+			if leftLatency != rightLatency {
+				return leftLatency < rightLatency
+			}
+			leftWeight := totalCandidateWeight(band[i])
+			rightWeight := totalCandidateWeight(band[j])
+			if leftWeight != rightWeight {
+				return leftWeight > rightWeight
+			}
+			return candidateIdentity(band[i]) < candidateIdentity(band[j])
+		})
+	case providerRoutingModeRoundRobin:
+		sort.SliceStable(band, func(i, j int) bool {
+			leftWeight := totalCandidateWeight(band[i])
+			rightWeight := totalCandidateWeight(band[j])
+			if leftWeight != rightWeight {
+				return leftWeight > rightWeight
+			}
+			return candidateIdentity(band[i]) < candidateIdentity(band[j])
+		})
+		offset := s.runtime.nextRoundRobinOffset(roundRobinKey(alias, protocol, groupKey), len(band))
+		band = rotateCandidates(band, offset)
+	case providerRoutingModeRandom:
+		sort.SliceStable(band, func(i, j int) bool {
+			return candidateIdentity(band[i]) < candidateIdentity(band[j])
+		})
+		seed := time.Now().UnixNano() + int64(s.runtime.nextRoundRobinOffset(roundRobinKey(alias, protocol, groupKey)+"\x00random", len(band)))
+		rng := rand.New(rand.NewSource(seed))
+		rng.Shuffle(len(band), func(i, j int) {
+			band[i], band[j] = band[j], band[i]
+		})
+	case providerRoutingModeFailover, providerRoutingModeOrdered:
+		sort.SliceStable(band, func(i, j int) bool {
+			leftWeight := totalCandidateWeight(band[i])
+			rightWeight := totalCandidateWeight(band[j])
+			if leftWeight != rightWeight {
+				return leftWeight > rightWeight
+			}
+			return candidateIdentity(band[i]) < candidateIdentity(band[j])
+		})
+	default:
+		sort.SliceStable(band, func(i, j int) bool {
+			leftWeight := totalCandidateWeight(band[i])
+			rightWeight := totalCandidateWeight(band[j])
+			if leftWeight != rightWeight {
+				return leftWeight > rightWeight
+			}
+			leftLatency := candidateLatency(s.runtime.endpointLatency(band[i]))
+			rightLatency := candidateLatency(s.runtime.endpointLatency(band[j]))
+			if leftLatency != rightLatency {
+				return leftLatency < rightLatency
+			}
+			return candidateIdentity(band[i]) < candidateIdentity(band[j])
+		})
+	}
+	return band
+}
+
+func normalizeProviderRoutingMode(mode model.ProviderRoutingMode) model.ProviderRoutingMode {
+	switch normalized := model.ProviderRoutingMode(strings.ToLower(strings.TrimSpace(string(mode)))); normalized {
+	case model.ProviderRoutingModeLatency, providerRoutingModeRoundRobin, providerRoutingModeRandom, providerRoutingModeFailover, providerRoutingModeOrdered:
+		return normalized
+	default:
+		return model.ProviderRoutingModeWeighted
+	}
+}
+
+func effectiveRouteStrategy(route model.ModelRoute) model.RouteStrategy {
+	if canonical := route.Strategy.Canonical(); canonical != "" {
+		return canonical
+	}
+	return model.RouteStrategyPriorityWeight
+}
+
+func rotateCandidates(candidates []resolvedCandidate, offset int) []resolvedCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+	offset %= len(candidates)
+	if offset == 0 {
+		return candidates
+	}
+	rotated := make([]resolvedCandidate, 0, len(candidates))
+	rotated = append(rotated, candidates[offset:]...)
+	rotated = append(rotated, candidates[:offset]...)
+	return rotated
+}
+
+func roundRobinKey(alias string, protocol model.Protocol, groupKey string) string {
+	return strings.ToLower(strings.TrimSpace(alias)) + "\x00" + strings.ToLower(strings.TrimSpace(string(protocol))) + "\x00" + groupKey
+}
+
+func candidateIdentity(candidate resolvedCandidate) string {
+	return strings.Join([]string{
+		candidate.provider.ID,
+		candidate.target.ID,
+		candidate.endpoint.ID,
+		candidate.credential.ID,
+	}, "\x00")
 }
 
 func effectiveUpstreamModel(candidate resolvedCandidate) string {
@@ -862,6 +1210,8 @@ func writeGatewayAuthError(w http.ResponseWriter, err error) {
 	case errRateLimit:
 		writeError(w, http.StatusTooManyRequests, err.Error())
 	case errConcurrencyLimit:
+		writeError(w, http.StatusTooManyRequests, err.Error())
+	case errAuthLocked:
 		writeError(w, http.StatusTooManyRequests, err.Error())
 	case errDailyBudget:
 		writeError(w, http.StatusPaymentRequired, err.Error())

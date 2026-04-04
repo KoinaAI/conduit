@@ -45,6 +45,17 @@ const (
 	ProviderRoutingModeLatency  ProviderRoutingMode = "latency"
 )
 
+// RouteStrategy controls how candidates are ordered for one public model route.
+type RouteStrategy string
+
+const (
+	RouteStrategyPriorityWeight RouteStrategy = "priority-weight"
+	RouteStrategyLatency        RouteStrategy = "latency"
+	RouteStrategyRoundRobin     RouteStrategy = "round-robin"
+	RouteStrategyRandom         RouteStrategy = "random"
+	RouteStrategyFailover       RouteStrategy = "failover"
+)
+
 // State is the persisted configuration snapshot exposed to the admin console.
 //
 // It intentionally keeps the original top-level shape so the current frontend
@@ -135,6 +146,7 @@ type CircuitBreakerConfig struct {
 // ModelRoute maps one public alias to one or more upstream targets.
 type ModelRoute struct {
 	Alias            string        `json:"alias"`
+	Strategy         RouteStrategy `json:"strategy,omitempty"`
 	PricingProfileID string        `json:"pricing_profile_id,omitempty"`
 	Targets          []RouteTarget `json:"targets"`
 	Notes            string        `json:"notes,omitempty"`
@@ -246,23 +258,60 @@ type BillingSummary struct {
 
 // RequestRecord is the top-level request history entry shown in the current UI.
 type RequestRecord struct {
-	ID              string         `json:"id"`
-	Protocol        Protocol       `json:"protocol"`
-	RouteAlias      string         `json:"route_alias"`
-	AccountID       string         `json:"account_id"`
-	ProviderName    string         `json:"provider_name"`
-	UpstreamModel   string         `json:"upstream_model"`
-	GatewayKeyID    string         `json:"gateway_key_id,omitempty"`
-	ClientSessionID string         `json:"client_session_id,omitempty"`
-	Path            string         `json:"path,omitempty"`
-	StatusCode      int            `json:"status_code"`
-	Stream          bool           `json:"stream"`
-	AttemptCount    int            `json:"attempt_count"`
-	StartedAt       time.Time      `json:"started_at"`
-	DurationMS      int64          `json:"duration_ms"`
-	Usage           UsageSummary   `json:"usage"`
-	Billing         BillingSummary `json:"billing"`
-	Error           string         `json:"error,omitempty"`
+	ID              string           `json:"id"`
+	Protocol        Protocol         `json:"protocol"`
+	RouteAlias      string           `json:"route_alias"`
+	AccountID       string           `json:"account_id"`
+	ProviderName    string           `json:"provider_name"`
+	UpstreamModel   string           `json:"upstream_model"`
+	GatewayKeyID    string           `json:"gateway_key_id,omitempty"`
+	ClientSessionID string           `json:"client_session_id,omitempty"`
+	Path            string           `json:"path,omitempty"`
+	StatusCode      int              `json:"status_code"`
+	Stream          bool             `json:"stream"`
+	AttemptCount    int              `json:"attempt_count"`
+	StartedAt       time.Time        `json:"started_at"`
+	DurationMS      int64            `json:"duration_ms"`
+	Usage           UsageSummary     `json:"usage"`
+	Billing         BillingSummary   `json:"billing"`
+	RoutingDecision *RoutingDecision `json:"routing_decision,omitempty"`
+	Error           string           `json:"error,omitempty"`
+}
+
+// RoutingDecision captures how the gateway selected and retried upstream candidates.
+type RoutingDecision struct {
+	Strategy   RouteStrategy          `json:"strategy"`
+	SessionID  string                 `json:"session_id,omitempty"`
+	Candidates []RoutingCandidate     `json:"candidates,omitempty"`
+	Selected   *RoutingCandidate      `json:"selected,omitempty"`
+	Events     []RoutingDecisionEvent `json:"events,omitempty"`
+}
+
+// RoutingCandidate summarizes one candidate considered for a request.
+type RoutingCandidate struct {
+	ProviderID    string `json:"provider_id"`
+	ProviderName  string `json:"provider_name"`
+	EndpointID    string `json:"endpoint_id"`
+	CredentialID  string `json:"credential_id"`
+	UpstreamModel string `json:"upstream_model"`
+	Priority      int    `json:"priority"`
+	Weight        int    `json:"weight"`
+	LatencyMS     int64  `json:"latency_ms,omitempty"`
+	Healthy       bool   `json:"healthy"`
+	Sticky        bool   `json:"sticky,omitempty"`
+}
+
+// RoutingDecisionEvent records one retry/failover outcome within a request.
+type RoutingDecisionEvent struct {
+	Attempt      int    `json:"attempt"`
+	ProviderID   string `json:"provider_id,omitempty"`
+	EndpointID   string `json:"endpoint_id,omitempty"`
+	CredentialID string `json:"credential_id,omitempty"`
+	Decision     string `json:"decision"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	Retryable    bool   `json:"retryable,omitempty"`
+	BackoffMS    int64  `json:"backoff_ms,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // RequestAttemptRecord stores one concrete upstream attempt for a request.
@@ -417,6 +466,11 @@ func (s *State) Normalize() {
 
 	for i := range s.ModelRoutes {
 		r := &s.ModelRoutes[i]
+		if canonical := r.Strategy.Canonical(); canonical != "" {
+			r.Strategy = canonical
+		} else {
+			r.Strategy = RouteStrategyPriorityWeight
+		}
 		for j := range r.Targets {
 			t := &r.Targets[j]
 			if t.ID == "" {
@@ -529,6 +583,26 @@ func (k GatewayKey) AllowsModel(alias string) bool {
 // IsExpired reports whether the gateway key is currently expired.
 func (k GatewayKey) IsExpired(now time.Time) bool {
 	return k.ExpiresAt != nil && now.After(*k.ExpiresAt)
+}
+
+// Canonical returns the normalized strategy value or the empty string when unsupported.
+func (s RouteStrategy) Canonical() RouteStrategy {
+	switch strings.ToLower(strings.TrimSpace(string(s))) {
+	case string(RouteStrategyPriorityWeight), "weighted":
+		return RouteStrategyPriorityWeight
+	case "":
+		return ""
+	case string(RouteStrategyLatency):
+		return RouteStrategyLatency
+	case string(RouteStrategyRoundRobin):
+		return RouteStrategyRoundRobin
+	case string(RouteStrategyRandom):
+		return RouteStrategyRandom
+	case string(RouteStrategyFailover):
+		return RouteStrategyFailover
+	default:
+		return ""
+	}
 }
 
 // FindProvider returns one provider by ID.
@@ -656,7 +730,10 @@ func (s State) Clone() State {
 	for i, integration := range s.Integrations {
 		cloned.Integrations[i] = integration.clone()
 	}
-	cloned.RequestHistory = slices.Clone(s.RequestHistory)
+	cloned.RequestHistory = make([]RequestRecord, len(s.RequestHistory))
+	for i, record := range s.RequestHistory {
+		cloned.RequestHistory[i] = record.clone()
+	}
 	cloned.Normalize()
 	return cloned
 }
@@ -715,6 +792,24 @@ func (i Integration) clone() Integration {
 	i.ModelMarkupOverrides = maps.Clone(i.ModelMarkupOverrides)
 	i.Snapshot = i.Snapshot.clone()
 	return i
+}
+
+func (r RequestRecord) clone() RequestRecord {
+	if r.RoutingDecision != nil {
+		decision := r.RoutingDecision.clone()
+		r.RoutingDecision = &decision
+	}
+	return r
+}
+
+func (d RoutingDecision) clone() RoutingDecision {
+	d.Candidates = slices.Clone(d.Candidates)
+	d.Events = slices.Clone(d.Events)
+	if d.Selected != nil {
+		selected := *d.Selected
+		d.Selected = &selected
+	}
+	return d
 }
 
 func (s IntegrationSnapshot) clone() IntegrationSnapshot {

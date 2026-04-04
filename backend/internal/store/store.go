@@ -32,6 +32,17 @@ type FileStore struct {
 	state model.State
 }
 
+// HealthCounts summarizes lightweight in-memory counts for health endpoints.
+type HealthCounts struct {
+	Providers           int
+	Routes              int
+	GatewayKeysTotal    int
+	GatewayKeysActive   int
+	Integrations        int
+	PricingProfiles     int
+	RequestHistoryItems int
+}
+
 // Open initializes the SQLite-backed store and imports legacy JSON state when
 // the configured path still contains the previous file-store format.
 func Open(path string) (*FileStore, error) {
@@ -96,6 +107,28 @@ func (s *FileStore) Ping(ctx context.Context) error {
 		return errors.New("store is closed")
 	}
 	return db.PingContext(ctx)
+}
+
+// HealthCounts returns lightweight state counts without cloning the full
+// configuration snapshot or request history.
+func (s *FileStore) HealthCounts(now time.Time) HealthCounts {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	counts := HealthCounts{
+		Providers:           len(s.state.Providers),
+		Routes:              len(s.state.ModelRoutes),
+		GatewayKeysTotal:    len(s.state.GatewayKeys),
+		Integrations:        len(s.state.Integrations),
+		PricingProfiles:     len(s.state.PricingProfiles),
+		RequestHistoryItems: len(s.state.RequestHistory),
+	}
+	for _, key := range s.state.GatewayKeys {
+		if key.Enabled && !key.IsExpired(now) {
+			counts.GatewayKeysActive++
+		}
+	}
+	return counts
 }
 
 func loadLegacyJSON(path string) (*model.State, error) {

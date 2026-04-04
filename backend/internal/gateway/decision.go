@@ -63,8 +63,7 @@ func appendRoutingEvent(trace *model.RoutingDecision, runtime *runtimeState, can
 	}
 	trace.Events = append(trace.Events, event)
 	if decision == "success" {
-		selected := routingCandidate(candidate, runtime, time.Now().UTC(), false)
-		trace.Selected = &selected
+		trace.Selected = selectedRoutingCandidate(trace, candidate)
 	}
 }
 
@@ -73,7 +72,6 @@ func writeRoutingMetadata(headers http.Header, route model.ModelRoute, candidate
 	headers.Set("X-Conduit-Strategy", string(effectiveRouteStrategy(route)))
 	headers.Set("X-Conduit-Provider", candidate.provider.ID)
 	headers.Set("X-Conduit-Endpoint", candidate.endpoint.ID)
-	headers.Set("X-Conduit-Credential", candidate.credential.ID)
 	headers.Set("X-Conduit-Upstream-Model", effectiveUpstreamModel(candidate))
 	headers.Set("X-Conduit-Latency-Ms", strconv.FormatInt(latency.Milliseconds(), 10))
 	if sessionID != "" {
@@ -85,4 +83,33 @@ func routingMetadataHeader(route model.ModelRoute, candidate resolvedCandidate, 
 	headers := http.Header{}
 	writeRoutingMetadata(headers, route, candidate, latency, sessionID)
 	return headers
+}
+
+func selectedRoutingCandidate(trace *model.RoutingDecision, candidate resolvedCandidate) *model.RoutingCandidate {
+	for index := range trace.Candidates {
+		recorded := trace.Candidates[index]
+		if recorded.ProviderID != candidate.provider.ID {
+			continue
+		}
+		if recorded.EndpointID != candidate.endpoint.ID {
+			continue
+		}
+		if recorded.CredentialID != candidate.credential.ID {
+			continue
+		}
+		selected := recorded
+		selected.Sticky = false
+		return &selected
+	}
+
+	selected := model.RoutingCandidate{
+		ProviderID:    candidate.provider.ID,
+		ProviderName:  candidate.provider.Name,
+		EndpointID:    candidate.endpoint.ID,
+		CredentialID:  candidate.credential.ID,
+		UpstreamModel: effectiveUpstreamModel(candidate),
+		Priority:      candidate.target.Priority + candidate.endpoint.Priority,
+		Weight:        totalCandidateWeight(candidate),
+	}
+	return &selected
 }

@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -53,22 +52,6 @@ func bearerToken(value string) string {
 }
 
 func gatewayRequestSource(r *http.Request) string {
-	for _, headerName := range []string{"CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"} {
-		value := strings.TrimSpace(r.Header.Get(headerName))
-		if value == "" {
-			continue
-		}
-		if headerName == "X-Forwarded-For" {
-			value, _, _ = strings.Cut(value, ",")
-			value = strings.TrimSpace(value)
-		}
-		if host, port, err := net.SplitHostPort(value); err == nil {
-			if parsedPort, parseErr := strconv.Atoi(port); parseErr == nil && parsedPort > 0 {
-				return strings.TrimSpace(host)
-			}
-		}
-		return value
-	}
 	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
 		return strings.TrimSpace(host)
 	}

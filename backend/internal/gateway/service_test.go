@@ -205,6 +205,9 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		if res.Header.Get("X-Conduit-Route") != "gpt-5.4" {
 			t.Fatalf("expected conduit route header, got %+v", res.Header)
 		}
+		if credentialHeader := res.Header.Get("X-Conduit-Credential"); credentialHeader != "" {
+			t.Fatalf("did not expect credential header to be exposed, got %q", credentialHeader)
+		}
 
 		seen := <-openAIRequests
 		if seen.Authorization != "Bearer openai-key" {

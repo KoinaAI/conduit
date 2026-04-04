@@ -185,14 +185,8 @@ func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
 		dbStatus = err.Error()
 	}
 	now := time.Now().UTC()
-	snapshot := a.store.Snapshot()
-	activeGatewayKeys := 0
+	counts := a.store.HealthCounts(now)
 	healthStatus := "ok"
-	for _, key := range snapshot.GatewayKeys {
-		if key.Enabled && !key.IsExpired(now) {
-			activeGatewayKeys++
-		}
-	}
 	if status != http.StatusOK {
 		healthStatus = "degraded"
 	}
@@ -202,13 +196,13 @@ func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
 		"uptime_seconds": int64(now.Sub(a.startedAt).Seconds()),
 		"db_status":      dbStatus,
 		"counts": map[string]any{
-			"providers":             len(snapshot.Providers),
-			"routes":                len(snapshot.ModelRoutes),
-			"gateway_keys_total":    len(snapshot.GatewayKeys),
-			"gateway_keys_active":   activeGatewayKeys,
-			"integrations":          len(snapshot.Integrations),
-			"pricing_profiles":      len(snapshot.PricingProfiles),
-			"request_history_items": len(snapshot.RequestHistory),
+			"providers":             counts.Providers,
+			"routes":                counts.Routes,
+			"gateway_keys_total":    counts.GatewayKeysTotal,
+			"gateway_keys_active":   counts.GatewayKeysActive,
+			"integrations":          counts.Integrations,
+			"pricing_profiles":      counts.PricingProfiles,
+			"request_history_items": counts.RequestHistoryItems,
 		},
 	})
 }

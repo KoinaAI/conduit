@@ -16,8 +16,8 @@ type UsageObserver struct {
 	protocol          model.Protocol
 	lastEvent         string
 	summary           model.UsageSummary
-	requestFragments  []string
-	responseFragments []string
+	requestTextBytes  int
+	responseTextBytes int
 }
 
 func NewUsageObserver(protocol model.Protocol) *UsageObserver {
@@ -25,13 +25,13 @@ func NewUsageObserver(protocol model.Protocol) *UsageObserver {
 }
 
 func (o *UsageObserver) ObserveRequestBody(payload []byte) {
-	fragments := usageTextFragments(payload)
-	if len(fragments) == 0 {
+	bytesCount := usageTextByteCount(payload)
+	if bytesCount == 0 {
 		return
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.requestFragments = append(o.requestFragments, fragments...)
+	o.requestTextBytes += bytesCount
 }
 
 func (o *UsageObserver) ObserveJSON(payload []byte) {
@@ -84,10 +84,10 @@ func (o *UsageObserver) Summary() model.UsageSummary {
 	defer o.mu.Unlock()
 	summary := o.summary
 	if summary.InputTokens == 0 {
-		summary.InputTokens = estimateFragmentsTokens(o.requestFragments)
+		summary.InputTokens = estimateTextBytesTokens(o.requestTextBytes)
 	}
 	if summary.OutputTokens == 0 {
-		summary.OutputTokens = estimateFragmentsTokens(o.responseFragments)
+		summary.OutputTokens = estimateTextBytesTokens(o.responseTextBytes)
 	}
 	if summary.TotalTokens == 0 {
 		summary.TotalTokens = summary.InputTokens + summary.OutputTokens
@@ -109,7 +109,7 @@ func (o *UsageObserver) mergeUsageMaps(body map[string]any) {
 }
 
 func (o *UsageObserver) captureResponseTextLocked(body map[string]any) {
-	o.responseFragments = append(o.responseFragments, collectUsageTextFragments(body)...)
+	o.responseTextBytes += collectUsageTextByteCount(body)
 }
 
 func collectUsageMaps(current any, out *[]map[string]any) {
@@ -181,10 +181,18 @@ func usageTextFragments(payload []byte) []string {
 	return []string{trimmed}
 }
 
+func usageTextByteCount(payload []byte) int {
+	return fragmentsByteCount(usageTextFragments(payload))
+}
+
 func collectUsageTextFragments(current any) []string {
 	fragments := make([]string, 0, 8)
 	collectUsageTextFragmentsInto(current, "", &fragments)
 	return fragments
+}
+
+func collectUsageTextByteCount(current any) int {
+	return fragmentsByteCount(collectUsageTextFragments(current))
 }
 
 func collectUsageTextFragmentsInto(current any, parentKey string, out *[]string) {
@@ -218,11 +226,15 @@ func usageTextKeyAllowed(key string) bool {
 	}
 }
 
-func estimateFragmentsTokens(fragments []string) int64 {
+func fragmentsByteCount(fragments []string) int {
 	var bytesCount int
 	for _, fragment := range fragments {
 		bytesCount += len(strings.TrimSpace(fragment))
 	}
+	return bytesCount
+}
+
+func estimateTextBytesTokens(bytesCount int) int64 {
 	if bytesCount <= 0 {
 		return 0
 	}

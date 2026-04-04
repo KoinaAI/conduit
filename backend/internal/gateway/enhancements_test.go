@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -74,6 +75,20 @@ func TestAuthenticateGatewayRequestDoesNotPoisonValidKeyOnDisallowedAlias(t *tes
 		t.Fatalf("expected gateway key gk-1, got %s", authenticated.ID)
 	}
 	service.runtime.releaseGatewayKey(authenticated.ID, 0)
+}
+
+func TestGatewayRequestSourceIgnoresSpoofedForwardHeaders(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.example/v1/models", nil)
+	req.RemoteAddr = "198.51.100.7:4321"
+	req.Header.Set("CF-Connecting-IP", "203.0.113.10")
+	req.Header.Set("X-Forwarded-For", "203.0.113.11, 203.0.113.12")
+	req.Header.Set("X-Real-IP", "203.0.113.13")
+
+	if got := gatewayRequestSource(req); got != "198.51.100.7" {
+		t.Fatalf("expected remote addr to win over spoofed proxy headers, got %q", got)
+	}
 }
 
 func TestBuildCandidatePlanWeightedRoutingPrefersHeaviestCredential(t *testing.T) {

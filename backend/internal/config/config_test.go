@@ -74,3 +74,27 @@ func TestSecretLookupPepperUsesExplicitValueOnly(t *testing.T) {
 		t.Fatalf("expected explicit lookup pepper, got %q", got)
 	}
 }
+
+func TestValidateRejectsUnknownLogFormat(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken: "super-secret-admin-token",
+		LogFormat:  "yaml",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid log format to be rejected")
+	}
+}
+
+func TestValidateRejectsUnknownLogLevel(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken: "super-secret-admin-token",
+		LogLevel:   "trace",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid log level to be rejected")
+	}
+}

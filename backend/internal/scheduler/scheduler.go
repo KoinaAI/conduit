@@ -2,7 +2,7 @@ package scheduler
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/admin"
@@ -57,14 +57,14 @@ func (s *Service) Stop() {
 	case <-s.stop:
 	default:
 		close(s.stop)
-		log.Print("scheduler stopped")
+		slog.Info("scheduler stopped")
 	}
 }
 
 func runSafely(name string, fn func()) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			log.Printf("scheduler %s task panicked: %v", name, recovered)
+			slog.Error("scheduler task panicked", "task", name, "panic", recovered)
 		}
 	}()
 	fn()

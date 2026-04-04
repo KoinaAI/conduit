@@ -199,6 +199,12 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		if res.StatusCode != http.StatusOK {
 			t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
 		}
+		if res.Header.Get("X-Conduit-Provider") != "openai" {
+			t.Fatalf("expected conduit provider header, got %+v", res.Header)
+		}
+		if res.Header.Get("X-Conduit-Route") != "gpt-5.4" {
+			t.Fatalf("expected conduit route header, got %+v", res.Header)
+		}
 
 		seen := <-openAIRequests
 		if seen.Authorization != "Bearer openai-key" {
@@ -325,6 +331,9 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		}
 		if len(saved.RequestHistory) < 4 {
 			t.Fatalf("expected request history to be populated, got %d", len(saved.RequestHistory))
+		}
+		if saved.RequestHistory[len(saved.RequestHistory)-1].RoutingDecision == nil {
+			t.Fatalf("expected request history to include routing decision trace, got %+v", saved.RequestHistory[len(saved.RequestHistory)-1])
 		}
 	})
 }
@@ -472,6 +481,65 @@ func TestGatewayRetriesTransformFailuresBeforeWritingResponse(t *testing.T) {
 	}
 	if firstCalls != 1 {
 		t.Fatalf("expected first candidate to be attempted exactly once, got %d", firstCalls)
+	}
+}
+
+func TestGatewayFallsBackToEstimatedUsageWhenUpstreamOmitsUsage(t *testing.T) {
+	t.Parallel()
+
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","choices":[{"message":{"content":"这是一个没有 usage 字段的回答"}}]}`))
+	}))
+	defer openAIServer.Close()
+
+	state := model.DefaultState()
+	state.PricingProfiles = []model.PricingProfile{{
+		ID:               "standard",
+		Name:             "standard",
+		Currency:         "USD",
+		InputPerMillion:  1,
+		OutputPerMillion: 2,
+	}}
+	state.Providers = []model.Provider{{
+		ID:                      "openai",
+		Name:                    "openai-main",
+		Kind:                    model.ProviderKindOpenAICompatible,
+		BaseURL:                 openAIServer.URL + "/v1",
+		APIKey:                  "openai-key",
+		Enabled:                 true,
+		Weight:                  1,
+		TimeoutSeconds:          30,
+		DefaultMarkupMultiplier: 1,
+		Capabilities:            []model.Protocol{model.ProtocolOpenAIChat},
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias:            "gpt-5.4",
+		PricingProfileID: "standard",
+		Targets: []model.RouteTarget{{
+			ID:               "t1",
+			AccountID:        "openai",
+			UpstreamModel:    "up-openai",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	res, body := postJSON(t, gatewayServer.URL+"/v1/chat/completions", `{"model":"gpt-5.4","messages":[{"role":"user","content":"请总结一下这段文字"}]}`)
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
+	}
+	if res.Trailer.Get("X-Gateway-Total-Tokens") == "0" || res.Trailer.Get("X-Gateway-Total-Tokens") == "" {
+		t.Fatalf("expected estimated usage trailer, got %+v", res.Trailer)
+	}
+	if res.Trailer.Get("X-Gateway-Billing-Final") == "0.000000" || res.Trailer.Get("X-Gateway-Billing-Final") == "" {
+		t.Fatalf("expected non-zero estimated billing trailer, got %+v", res.Trailer)
 	}
 }
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -84,6 +85,17 @@ func (s *FileStore) Close() error {
 	err := s.db.Close()
 	s.db = nil
 	return err
+}
+
+// Ping verifies that the backing SQLite connection is still healthy.
+func (s *FileStore) Ping(ctx context.Context) error {
+	s.mu.RLock()
+	db := s.db
+	s.mu.RUnlock()
+	if db == nil {
+		return errors.New("store is closed")
+	}
+	return db.PingContext(ctx)
 }
 
 func loadLegacyJSON(path string) (*model.State, error) {

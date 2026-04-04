@@ -3,6 +3,8 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
+	"math"
 	"strings"
 	"sync"
 
@@ -10,14 +12,26 @@ import (
 )
 
 type UsageObserver struct {
-	mu        sync.Mutex
-	protocol  model.Protocol
-	lastEvent string
-	summary   model.UsageSummary
+	mu                sync.Mutex
+	protocol          model.Protocol
+	lastEvent         string
+	summary           model.UsageSummary
+	requestFragments  []string
+	responseFragments []string
 }
 
 func NewUsageObserver(protocol model.Protocol) *UsageObserver {
 	return &UsageObserver{protocol: protocol}
+}
+
+func (o *UsageObserver) ObserveRequestBody(payload []byte) {
+	fragments := usageTextFragments(payload)
+	if len(fragments) == 0 {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.requestFragments = append(o.requestFragments, fragments...)
 }
 
 func (o *UsageObserver) ObserveJSON(payload []byte) {
@@ -28,6 +42,7 @@ func (o *UsageObserver) ObserveJSON(payload []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.mergeUsageMaps(body)
+	o.captureResponseTextLocked(body)
 }
 
 func (o *UsageObserver) ObserveLine(line []byte) {
@@ -52,18 +67,33 @@ func (o *UsageObserver) ObserveLine(line []byte) {
 
 	var body map[string]any
 	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+		slog.Warn("gateway usage observer skipped malformed sse payload",
+			"protocol", o.protocol,
+			"event", o.lastEvent,
+			"payload", truncateUsageLogPayload(payload),
+			"error", err,
+		)
 		return
 	}
 	o.mergeUsageMaps(body)
+	o.captureResponseTextLocked(body)
 }
 
 func (o *UsageObserver) Summary() model.UsageSummary {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.summary.TotalTokens == 0 {
-		o.summary.TotalTokens = o.summary.InputTokens + o.summary.OutputTokens
+	summary := o.summary
+	if summary.InputTokens == 0 {
+		summary.InputTokens = estimateFragmentsTokens(o.requestFragments)
 	}
-	return o.summary
+	if summary.OutputTokens == 0 {
+		summary.OutputTokens = estimateFragmentsTokens(o.responseFragments)
+	}
+	if summary.TotalTokens == 0 {
+		summary.TotalTokens = summary.InputTokens + summary.OutputTokens
+	}
+	o.summary = summary
+	return summary
 }
 
 func (o *UsageObserver) mergeUsageMaps(body map[string]any) {
@@ -76,6 +106,10 @@ func (o *UsageObserver) mergeUsageMaps(body map[string]any) {
 		o.summary.CachedInputTokens = maxInt64(o.summary.CachedInputTokens, readTokenInt(usageMap, "cached_tokens"), readTokenInt(usageMap, "cached_input_tokens"), readTokenInt(usageMap, "cache_read_input_tokens"), readTokenInt(usageMap, "cachedContentTokenCount"))
 		o.summary.ReasoningTokens = maxInt64(o.summary.ReasoningTokens, readTokenInt(usageMap, "reasoning_tokens"), readTokenInt(usageMap, "thoughtsTokenCount"))
 	}
+}
+
+func (o *UsageObserver) captureResponseTextLocked(body map[string]any) {
+	o.responseFragments = append(o.responseFragments, collectUsageTextFragments(body)...)
 }
 
 func collectUsageMaps(current any, out *[]map[string]any) {
@@ -133,4 +167,72 @@ func maxInt64(base int64, values ...int64) int64 {
 		}
 	}
 	return maximum
+}
+
+func usageTextFragments(payload []byte) []string {
+	var body any
+	if err := json.Unmarshal(payload, &body); err == nil {
+		return collectUsageTextFragments(body)
+	}
+	trimmed := strings.TrimSpace(string(payload))
+	if trimmed == "" {
+		return nil
+	}
+	return []string{trimmed}
+}
+
+func collectUsageTextFragments(current any) []string {
+	fragments := make([]string, 0, 8)
+	collectUsageTextFragmentsInto(current, "", &fragments)
+	return fragments
+}
+
+func collectUsageTextFragmentsInto(current any, parentKey string, out *[]string) {
+	switch value := current.(type) {
+	case map[string]any:
+		for key, nested := range value {
+			collectUsageTextFragmentsInto(nested, strings.ToLower(strings.TrimSpace(key)), out)
+		}
+	case []any:
+		for _, nested := range value {
+			collectUsageTextFragmentsInto(nested, parentKey, out)
+		}
+	case string:
+		if !usageTextKeyAllowed(parentKey) {
+			return
+		}
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return
+		}
+		*out = append(*out, trimmed)
+	}
+}
+
+func usageTextKeyAllowed(key string) bool {
+	switch key {
+	case "content", "delta", "input", "instructions", "output_text", "summary", "system", "text":
+		return true
+	default:
+		return false
+	}
+}
+
+func estimateFragmentsTokens(fragments []string) int64 {
+	var bytesCount int
+	for _, fragment := range fragments {
+		bytesCount += len(strings.TrimSpace(fragment))
+	}
+	if bytesCount <= 0 {
+		return 0
+	}
+	return int64(math.Ceil(float64(bytesCount) / 4))
+}
+
+func truncateUsageLogPayload(payload string) string {
+	const maxPayloadBytes = 240
+	if len(payload) <= maxPayloadBytes {
+		return payload
+	}
+	return payload[:maxPayloadBytes] + "...(truncated)"
 }

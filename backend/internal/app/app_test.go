@@ -121,6 +121,74 @@ func TestRealtimeCORSUsesRealtimeOrigins(t *testing.T) {
 	}
 }
 
+func TestHealthzReturnsStructuredStatus(t *testing.T) {
+	t.Parallel()
+
+	server := newTestServer(t, config.Config{
+		BindAddress: ":0",
+		StatePath:   filepath.Join(t.TempDir(), "gateway.db"),
+		AdminToken:  "admin-token",
+	})
+	defer server.Close()
+
+	res, err := http.Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("healthz request failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected healthz ok, got %d", res.StatusCode)
+	}
+
+	var payload struct {
+		Status        string `json:"status"`
+		DBStatus      string `json:"db_status"`
+		UptimeSeconds int64  `json:"uptime_seconds"`
+		Counts        struct {
+			GatewayKeysActive int `json:"gateway_keys_active"`
+			Providers         int `json:"providers"`
+			Routes            int `json:"routes"`
+		} `json:"counts"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode healthz payload: %v", err)
+	}
+	if payload.Status != "ok" || payload.DBStatus != "ok" {
+		t.Fatalf("unexpected healthz payload: %+v", payload)
+	}
+	if payload.UptimeSeconds < 0 {
+		t.Fatalf("expected non-negative uptime, got %d", payload.UptimeSeconds)
+	}
+}
+
+func TestAdminStatsRouteRegistered(t *testing.T) {
+	t.Parallel()
+
+	server := newTestServer(t, config.Config{
+		BindAddress: ":0",
+		StatePath:   filepath.Join(t.TempDir(), "gateway.db"),
+		AdminToken:  "admin-token",
+	})
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/admin/stats/summary?window=today", nil)
+	if err != nil {
+		t.Fatalf("new stats request: %v", err)
+	}
+	req.Header.Set("X-Admin-Token", "admin-token")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stats request failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected stats route to be registered, got %d", res.StatusCode)
+	}
+}
+
 func newTestServer(t *testing.T, cfg config.Config) *httptest.Server {
 	t.Helper()
 

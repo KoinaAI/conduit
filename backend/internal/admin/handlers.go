@@ -368,6 +368,9 @@ func (h *Handlers) CreateRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	saved, err := h.updateState(func(state *model.State) error {
 		payload.Alias = strings.TrimSpace(payload.Alias)
+		if !validateRouteStrategy(&payload) {
+			return errValidation("strategy must be one of priority-weight, latency, round-robin, random, failover")
+		}
 		if err := validateRouteAlias(state.ModelRoutes, payload.Alias, ""); err != nil {
 			return err
 		}
@@ -403,6 +406,10 @@ func (h *Handlers) UpdateRoute(w http.ResponseWriter, r *http.Request) {
 	payload.Alias = strings.TrimSpace(payload.Alias)
 	if payload.Alias == "" {
 		payload.Alias = strings.TrimSpace(alias)
+	}
+	if !validateRouteStrategy(&payload) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "strategy must be one of priority-weight, latency, round-robin, random, failover"})
+		return
 	}
 	saved, err := h.updateState(func(state *model.State) error {
 		if err := validateRouteAlias(state.ModelRoutes, payload.Alias, alias); err != nil {
@@ -840,6 +847,66 @@ func (h *Handlers) GetRequestAttempts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, attempts)
 }
 
+// GetStatsSummary serves GET /api/admin/stats/summary.
+func (h *Handlers) GetStatsSummary(w http.ResponseWriter, r *http.Request) {
+	window, err := readStatsWindow(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	report, err := h.store.StatsSummary(window)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// GetStatsByGatewayKey serves GET /api/admin/stats/by-key.
+func (h *Handlers) GetStatsByGatewayKey(w http.ResponseWriter, r *http.Request) {
+	window, err := readStatsWindow(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	report, err := h.store.StatsByGatewayKey(window)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// GetStatsByProvider serves GET /api/admin/stats/by-provider.
+func (h *Handlers) GetStatsByProvider(w http.ResponseWriter, r *http.Request) {
+	window, err := readStatsWindow(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	report, err := h.store.StatsByProvider(window)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// GetStatsByModel serves GET /api/admin/stats/by-model.
+func (h *Handlers) GetStatsByModel(w http.ResponseWriter, r *http.Request) {
+	window, err := readStatsWindow(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	report, err := h.store.StatsByModel(window)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
 // ProbeAllProviders executes the active endpoint probe flow.
 func (h *Handlers) ProbeAllProviders(w http.ResponseWriter, r *http.Request) {
 	if h.gateway == nil {
@@ -886,8 +953,22 @@ func (h *Handlers) updateState(mutate func(*model.State) error) (model.State, er
 }
 
 func mergeCompatibilityState(current, next *model.State) {
-	next.Normalize()
 	current.Normalize()
+	if next.Providers == nil {
+		next.Providers = []model.Provider{}
+	}
+	if next.ModelRoutes == nil {
+		next.ModelRoutes = []model.ModelRoute{}
+	}
+	if next.PricingProfiles == nil {
+		next.PricingProfiles = []model.PricingProfile{}
+	}
+	if next.Integrations == nil {
+		next.Integrations = []model.Integration{}
+	}
+	if next.GatewayKeys == nil {
+		next.GatewayKeys = []model.GatewayKey{}
+	}
 
 	if len(next.GatewayKeys) == 0 {
 		next.GatewayKeys = current.GatewayKeys
@@ -922,6 +1003,18 @@ func mergeCompatibilityState(current, next *model.State) {
 		}
 		nextProvider.CreatedAt = currentProvider.CreatedAt
 	}
+	for nextRouteIndex := range next.ModelRoutes {
+		nextRoute := &next.ModelRoutes[nextRouteIndex]
+		currentRoute, ok := current.FindRoute(nextRoute.Alias)
+		if !ok {
+			continue
+		}
+		if canonical := nextRoute.Strategy.Canonical(); canonical != "" {
+			nextRoute.Strategy = canonical
+			continue
+		}
+		nextRoute.Strategy = currentRoute.Strategy
+	}
 	for nextIntegrationIndex := range next.Integrations {
 		nextIntegration := &next.Integrations[nextIntegrationIndex]
 		currentIntegration, ok := current.FindIntegration(nextIntegration.ID)
@@ -930,6 +1023,7 @@ func mergeCompatibilityState(current, next *model.State) {
 		}
 		*nextIntegration = preserveIntegrationSecrets(currentIntegration, *nextIntegration)
 	}
+	next.Normalize()
 }
 
 func buildOpenAPISpec() map[string]any {
@@ -1004,6 +1098,18 @@ func buildOpenAPISpec() map[string]any {
 			},
 			"/api/admin/request-history/{id}/attempts": map[string]any{
 				"get": map[string]any{"summary": "Get recorded upstream attempts for one request"},
+			},
+			"/api/admin/stats/summary": map[string]any{
+				"get": map[string]any{"summary": "Get aggregate request statistics"},
+			},
+			"/api/admin/stats/by-key": map[string]any{
+				"get": map[string]any{"summary": "Get request statistics grouped by gateway key"},
+			},
+			"/api/admin/stats/by-provider": map[string]any{
+				"get": map[string]any{"summary": "Get request statistics grouped by provider"},
+			},
+			"/api/admin/stats/by-model": map[string]any{
+				"get": map[string]any{"summary": "Get request statistics grouped by routed model"},
 			},
 			"/api/admin/maintenance/probes": map[string]any{
 				"post": map[string]any{"summary": "Probe all provider endpoints"},
@@ -1226,6 +1332,21 @@ func validateGatewaySecretStrength(secret string) error {
 	return nil
 }
 
+func validateRouteStrategy(route *model.ModelRoute) bool {
+	if route == nil {
+		return false
+	}
+	if route.Strategy == "" {
+		return true
+	}
+	canonical := route.Strategy.Canonical()
+	if canonical == "" {
+		return false
+	}
+	route.Strategy = canonical
+	return true
+}
+
 func cloneMap(values map[string]any) map[string]any {
 	if values == nil {
 		return nil
@@ -1252,6 +1373,11 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 		return err
 	}
 	return nil
+}
+
+func readStatsWindow(r *http.Request) (store.StatsWindow, error) {
+	query := r.URL.Query()
+	return store.ResolveStatsWindow(query.Get("window"), query.Get("days"), time.Now().UTC())
 }
 
 func bearerToken(value string) string {

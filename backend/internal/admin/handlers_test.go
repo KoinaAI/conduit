@@ -230,6 +230,59 @@ func TestCreateRouteRejectsDuplicateAliasCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestCreateRouteRejectsInvalidStrategy(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/routes", strings.NewReader(`{"alias":"gpt-5.4","strategy":"nearest","targets":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.CreateRoute(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for invalid route strategy, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPutStatePreservesRouteStrategyWhenCompatibilityPayloadOmitsIt(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		ModelRoutes: []model.ModelRoute{{
+			Alias:    "gpt-5.4",
+			Strategy: model.RouteStrategyRoundRobin,
+			Targets: []model.RouteTarget{{
+				ID:               "target-1",
+				AccountID:        "provider-1",
+				Weight:           1,
+				Enabled:          true,
+				MarkupMultiplier: 1,
+			}},
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{"version":"2026-04-01","providers":[],"model_routes":[{"alias":"gpt-5.4","targets":[{"id":"target-1","account_id":"provider-1","weight":1,"enabled":true,"markup_multiplier":1}]}],"pricing_profiles":[],"integrations":[],"gateway_keys":[],"request_history":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.PutState(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected put state ok, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved, ok := fileStore.Snapshot().FindRoute("gpt-5.4")
+	if !ok {
+		t.Fatal("expected route to remain after put state")
+	}
+	if saved.Strategy != model.RouteStrategyRoundRobin {
+		t.Fatalf("expected route strategy to be preserved, got %q", saved.Strategy)
+	}
+}
+
 func TestDeleteProviderPrunesEmptyRoutesAndGatewayKeyReferences(t *testing.T) {
 	t.Parallel()
 
@@ -966,6 +1019,10 @@ func TestBuildOpenAPISpecCoversAdminRoutes(t *testing.T) {
 		"/api/admin/gateway-keys/{id}",
 		"/api/admin/request-history",
 		"/api/admin/request-history/{id}/attempts",
+		"/api/admin/stats/summary",
+		"/api/admin/stats/by-key",
+		"/api/admin/stats/by-provider",
+		"/api/admin/stats/by-model",
 		"/api/admin/openapi.json",
 		"/api/admin/maintenance/probes",
 	}

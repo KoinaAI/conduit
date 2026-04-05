@@ -623,3 +623,210 @@ func TestReadLimitedResponseBodyRejectsOversizedPayload(t *testing.T) {
 		t.Fatal("expected oversized upstream response to be rejected")
 	}
 }
+
+func TestPrepareUpstreamExchangeResponsesToAnthropic(t *testing.T) {
+	t.Parallel()
+
+	exchange, err := prepareUpstreamExchange(model.ProtocolOpenAIResponses, model.ProviderKindAnthropic, "/v1/responses", parsedProxyRequest{
+		routeAlias: "gpt-5.4",
+		jsonPayload: map[string]any{
+			"stream":       true,
+			"instructions": "be concise",
+			"input": []any{
+				map[string]any{
+					"role": "user",
+					"content": []any{
+						map[string]any{"type": "input_text", "text": "hello"},
+					},
+				},
+				map[string]any{
+					"type":      "function_call",
+					"call_id":   "call-1",
+					"name":      "search",
+					"arguments": map[string]any{"q": "weather"},
+				},
+				map[string]any{
+					"type":    "function_call_output",
+					"call_id": "call-1",
+					"output":  map[string]any{"result": "sunny"},
+				},
+			},
+			"tools": []any{
+				map[string]any{
+					"name":        "search",
+					"description": "search the web",
+					"parameters":  map[string]any{"type": "object"},
+				},
+			},
+		},
+	}, "claude-3-7-sonnet")
+	if err != nil {
+		t.Fatalf("prepare upstream exchange: %v", err)
+	}
+	if exchange.Path != "/v1/messages" {
+		t.Fatalf("unexpected upstream path: %s", exchange.Path)
+	}
+	if !exchange.Stream {
+		t.Fatal("expected responses stream mode to be preserved")
+	}
+	if exchange.ResponseMode != responseModeResponsesSSE {
+		t.Fatalf("unexpected response mode: %s", exchange.ResponseMode)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(exchange.Body, &payload); err != nil {
+		t.Fatalf("decode anthropic payload: %v", err)
+	}
+	if payload["model"] != "claude-3-7-sonnet" {
+		t.Fatalf("expected upstream model rewrite, got %+v", payload["model"])
+	}
+	system := payload["system"].([]any)
+	if len(system) != 1 || system[0].(map[string]any)["text"] != "be concise" {
+		t.Fatalf("expected instructions to become anthropic system blocks, got %+v", payload["system"])
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("expected user, assistant tool_use, user tool_result messages, got %d", len(messages))
+	}
+	assistant := messages[1].(map[string]any)
+	content := assistant["content"].([]any)
+	if content[0].(map[string]any)["type"] != "tool_use" {
+		t.Fatalf("expected function call to become tool_use block, got %+v", content)
+	}
+	toolResult := messages[2].(map[string]any)
+	if toolResult["role"] != "user" {
+		t.Fatalf("expected function output to become user tool_result message, got %+v", toolResult)
+	}
+}
+
+func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
+	t.Parallel()
+
+	exchange, err := prepareUpstreamExchange(model.ProtocolOpenAIResponses, model.ProviderKindGemini, "/v1/responses", parsedProxyRequest{
+		routeAlias: "gpt-5.4",
+		jsonPayload: map[string]any{
+			"input": []any{
+				map[string]any{
+					"role": "user",
+					"content": []any{
+						map[string]any{"type": "input_text", "text": "hello"},
+					},
+				},
+				map[string]any{
+					"type":      "function_call",
+					"call_id":   "call-1",
+					"name":      "search",
+					"arguments": map[string]any{"q": "weather"},
+				},
+				map[string]any{
+					"type":    "function_call_output",
+					"call_id": "call-1",
+					"output":  map[string]any{"result": "sunny"},
+				},
+			},
+			"tools": []any{
+				map[string]any{
+					"name":       "search",
+					"parameters": map[string]any{"type": "object"},
+				},
+			},
+		},
+	}, "gemini-2.5-pro")
+	if err != nil {
+		t.Fatalf("prepare upstream exchange: %v", err)
+	}
+	if exchange.Path != "/v1beta/models/gemini-2.5-pro:generateContent" {
+		t.Fatalf("unexpected upstream path: %s", exchange.Path)
+	}
+	if exchange.ResponseMode != responseModeResponsesJSON {
+		t.Fatalf("unexpected response mode: %s", exchange.ResponseMode)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(exchange.Body, &payload); err != nil {
+		t.Fatalf("decode gemini payload: %v", err)
+	}
+	contents := payload["contents"].([]any)
+	if len(contents) != 3 {
+		t.Fatalf("expected user, model functionCall, function response contents, got %d", len(contents))
+	}
+	functionMessage := contents[2].(map[string]any)
+	if functionMessage["role"] != "function" {
+		t.Fatalf("expected tool output to become gemini function role, got %+v", functionMessage)
+	}
+	tools := payload["tools"].([]any)
+	declarations := tools[0].(map[string]any)["functionDeclarations"].([]any)
+	if len(declarations) != 1 {
+		t.Fatalf("expected one gemini function declaration, got %+v", tools)
+	}
+}
+
+func TestWriteResponsesJSONFromAnthropicPayload(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	resp := &http.Response{
+		Body: io.NopCloser(strings.NewReader(`{
+			"id":"msg_1",
+			"content":[
+				{"type":"text","text":"hello"},
+				{"type":"tool_use","id":"call-1","name":"search","input":{"q":"weather"}}
+			]
+		}`)),
+	}
+
+	err := writeResponsesJSON(recorder, resp, NewUsageObserver(model.ProtocolOpenAIResponses), "gpt-5.4", nil, resolvedCandidate{
+		provider: model.Provider{Kind: model.ProviderKindAnthropic},
+	})
+	if err != nil {
+		t.Fatalf("write responses json: %v", err)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
+	if body["object"] != "response" || body["output_text"] != "hello" {
+		t.Fatalf("unexpected responses envelope: %+v", body)
+	}
+	output := body["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("expected assistant message plus tool call output, got %+v", output)
+	}
+	if output[1].(map[string]any)["type"] != "function_call" {
+		t.Fatalf("expected tool_use to map to function_call output item, got %+v", output[1])
+	}
+}
+
+func TestWriteResponsesSSEFromAnthropicStream(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	resp := &http.Response{
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			"event: message_start",
+			`data: {"message":{"id":"msg_1"}}`,
+			"",
+			"event: content_block_delta",
+			`data: {"delta":{"type":"text_delta","text":"hello"}}`,
+			"",
+		}, "\n"))),
+	}
+
+	err := writeResponsesSSE(recorder, resp, NewUsageObserver(model.ProtocolOpenAIResponses), "gpt-5.4", nil, resolvedCandidate{
+		provider: model.Provider{Kind: model.ProviderKindAnthropic},
+	})
+	if err != nil {
+		t.Fatalf("write responses sse: %v", err)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: response.created") {
+		t.Fatalf("expected response.created event, got %q", body)
+	}
+	if !strings.Contains(body, "event: response.output_text.delta") {
+		t.Fatalf("expected response.output_text.delta event, got %q", body)
+	}
+	if !strings.Contains(body, "event: response.completed") {
+		t.Fatalf("expected response.completed event, got %q", body)
+	}
+}

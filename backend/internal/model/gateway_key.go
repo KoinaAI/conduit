@@ -14,6 +14,7 @@ import (
 )
 
 const maxGatewaySecretBytes = 72
+const minGatewaySecretChars = 16
 
 // NewGatewaySecret returns a high-entropy secret suitable for public gateway use.
 func NewGatewaySecret() (string, error) {
@@ -22,6 +23,22 @@ func NewGatewaySecret() (string, error) {
 		return "", err
 	}
 	return "uag-" + base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+// ValidateGatewaySecretStrength enforces the minimum secret requirements for
+// user-supplied and bootstrap gateway credentials.
+func ValidateGatewaySecretStrength(secret string) error {
+	trimmed := strings.TrimSpace(secret)
+	if trimmed == "" {
+		return errors.New("custom gateway secret is required")
+	}
+	if len(trimmed) < minGatewaySecretChars {
+		return fmt.Errorf("custom gateway secrets must be at least %d characters long", minGatewaySecretChars)
+	}
+	if len([]byte(trimmed)) > maxGatewaySecretBytes {
+		return fmt.Errorf("custom gateway secrets must be %d bytes or fewer", maxGatewaySecretBytes)
+	}
+	return nil
 }
 
 // HashGatewaySecret hashes a gateway secret for storage.

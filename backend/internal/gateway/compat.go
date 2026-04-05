@@ -34,7 +34,7 @@ func responseWriteStarted(err error) bool {
 
 func prepareUpstreamExchange(protocol model.Protocol, providerKind model.ProviderKind, currentPath string, request parsedProxyRequest, upstreamModel string) (upstreamExchange, error) {
 	switch protocol {
-	case model.ProtocolOpenAIChat, model.ProtocolOpenAIResponses:
+	case model.ProtocolOpenAIChat:
 		if providerKind != model.ProviderKindOpenAICompatible {
 			return upstreamExchange{}, fmt.Errorf("provider kind %s does not support protocol %s", providerKind, protocol)
 		}
@@ -52,6 +52,52 @@ func prepareUpstreamExchange(protocol model.Protocol, providerKind model.Provide
 			UpstreamModel: upstreamModel,
 			PublicAlias:   request.routeAlias,
 		}, nil
+	case model.ProtocolOpenAIResponses:
+		switch providerKind {
+		case model.ProviderKindOpenAICompatible:
+			payload := cloneJSONMap(request.jsonPayload)
+			payload["model"] = upstreamModel
+			body, err := json.Marshal(payload)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			return upstreamExchange{
+				Path:          currentPath,
+				Body:          body,
+				Stream:        request.stream,
+				ResponseMode:  responseModePassthrough,
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+			}, nil
+		case model.ProviderKindAnthropic:
+			body, stream, err := responsesToAnthropic(request.jsonPayload, upstreamModel)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			return upstreamExchange{
+				Path:          "/v1/messages",
+				Body:          body,
+				Stream:        stream,
+				ResponseMode:  chooseResponseMode(stream, responseModeResponsesJSON, responseModeResponsesSSE),
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+			}, nil
+		case model.ProviderKindGemini:
+			path, body, stream, err := responsesToGemini(request.jsonPayload, upstreamModel)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			return upstreamExchange{
+				Path:          path,
+				Body:          body,
+				Stream:        stream,
+				ResponseMode:  chooseResponseMode(stream, responseModeResponsesJSON, responseModeResponsesSSE),
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+			}, nil
+		default:
+			return upstreamExchange{}, fmt.Errorf("provider kind %s does not support protocol %s", providerKind, protocol)
+		}
 	case model.ProtocolAnthropic:
 		if providerKind == model.ProviderKindAnthropic {
 			payload := cloneJSONMap(request.jsonPayload)
@@ -151,6 +197,820 @@ func cloneJSONMap(value map[string]any) map[string]any {
 		cloned[key] = item
 	}
 	return cloned
+}
+
+type responsesFunctionCall struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+type responsesEnvelope struct {
+	ID        string
+	Text      string
+	ToolCalls []responsesFunctionCall
+	Usage     model.UsageSummary
+}
+
+func responsesToAnthropic(payload map[string]any, upstreamModel string) ([]byte, bool, error) {
+	chatPayload, stream, err := responsesToOpenAIChatPayload(payload, upstreamModel)
+	if err != nil {
+		return nil, false, err
+	}
+	body, err := openAIChatPayloadToAnthropic(chatPayload)
+	return body, stream, err
+}
+
+func responsesToGemini(payload map[string]any, upstreamModel string) (string, []byte, bool, error) {
+	chatPayload, stream, err := responsesToOpenAIChatPayload(payload, upstreamModel)
+	if err != nil {
+		return "", nil, false, err
+	}
+	body, err := openAIChatPayloadToGemini(chatPayload)
+	if err != nil {
+		return "", nil, false, err
+	}
+	path := "/v1beta/models/" + upstreamModel + ":generateContent"
+	if stream {
+		path = "/v1beta/models/" + upstreamModel + ":streamGenerateContent"
+	}
+	return path, body, stream, nil
+}
+
+func responsesToOpenAIChatPayload(payload map[string]any, upstreamModel string) (map[string]any, bool, error) {
+	out := map[string]any{
+		"model": upstreamModel,
+	}
+	stream, _ := payload["stream"].(bool)
+	if stream {
+		out["stream"] = true
+	}
+	for _, field := range []string{"temperature", "top_p"} {
+		if value, ok := payload[field]; ok {
+			out[field] = value
+		}
+	}
+	if maxTokens, ok := payload["max_output_tokens"]; ok {
+		out["max_tokens"] = maxTokens
+	} else if maxTokens, ok := payload["max_tokens"]; ok {
+		out["max_tokens"] = maxTokens
+	}
+
+	messages := make([]map[string]any, 0, 8)
+	if instructions := strings.TrimSpace(stringValue(payload["instructions"])); instructions != "" {
+		messages = append(messages, map[string]any{
+			"role":    "system",
+			"content": instructions,
+		})
+	}
+
+	switch input := payload["input"].(type) {
+	case nil:
+	case string:
+		if strings.TrimSpace(input) != "" {
+			messages = append(messages, map[string]any{
+				"role":    "user",
+				"content": input,
+			})
+		}
+	case []any:
+		items, err := responseInputItemsToOpenAIMessages(input)
+		if err != nil {
+			return nil, false, err
+		}
+		messages = append(messages, items...)
+	default:
+		return nil, false, errors.New("responses input must be a string or array")
+	}
+	out["messages"] = messages
+
+	if tools, ok := normalizeResponsesToolDefinitions(payload["tools"]); ok {
+		out["tools"] = tools
+	}
+	return out, stream, nil
+}
+
+func responseInputItemsToOpenAIMessages(items []any) ([]map[string]any, error) {
+	messages := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		switch current := item.(type) {
+		case string:
+			if strings.TrimSpace(current) == "" {
+				continue
+			}
+			messages = append(messages, map[string]any{
+				"role":    "user",
+				"content": current,
+			})
+		case map[string]any:
+			next, err := responseInputItemToOpenAIMessages(current)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, next...)
+		}
+	}
+	return messages, nil
+}
+
+func responseInputItemToOpenAIMessages(item map[string]any) ([]map[string]any, error) {
+	if role := strings.TrimSpace(stringValue(item["role"])); role != "" {
+		message := map[string]any{"role": role}
+		content := responseMessageContentToOpenAIContent(item["content"])
+		if role == "tool" {
+			message["tool_call_id"] = strings.TrimSpace(firstNonEmptyString(item["tool_call_id"], item["call_id"], item["id"]))
+			message["content"] = responseContentToText(item["content"])
+			return []map[string]any{message}, nil
+		}
+		message["content"] = content
+		if toolCalls := responseMessageToolCalls(item["content"]); len(toolCalls) > 0 {
+			message["tool_calls"] = toolCalls
+		}
+		return []map[string]any{message}, nil
+	}
+
+	switch strings.TrimSpace(stringValue(item["type"])) {
+	case "", "message":
+		role := strings.TrimSpace(stringValue(item["role"]))
+		if role == "" {
+			role = "user"
+		}
+		return []map[string]any{{
+			"role":    role,
+			"content": responseMessageContentToOpenAIContent(item["content"]),
+		}}, nil
+	case "function_call":
+		call, ok := responseFunctionCallItem(item)
+		if !ok {
+			return nil, nil
+		}
+		return []map[string]any{{
+			"role":       "assistant",
+			"content":    "",
+			"tool_calls": []map[string]any{call},
+		}}, nil
+	case "function_call_output":
+		toolCallID := strings.TrimSpace(firstNonEmptyString(item["call_id"], item["tool_call_id"], item["id"]))
+		if toolCallID == "" {
+			return nil, nil
+		}
+		return []map[string]any{{
+			"role":         "tool",
+			"tool_call_id": toolCallID,
+			"content":      responseFunctionCallOutput(item["output"]),
+		}}, nil
+	default:
+		return nil, nil
+	}
+}
+
+func responseMessageContentToOpenAIContent(value any) any {
+	parts := responseContentToOpenAIParts(value)
+	return compactOpenAIContent(parts)
+}
+
+func responseContentToText(value any) string {
+	parts := responseContentToOpenAIParts(value)
+	return flattenOpenAIContent(parts)
+}
+
+func responseContentToOpenAIParts(value any) []map[string]any {
+	switch current := value.(type) {
+	case string:
+		if strings.TrimSpace(current) == "" {
+			return nil
+		}
+		return []map[string]any{{"type": "text", "text": current}}
+	case []any:
+		parts := make([]map[string]any, 0, len(current))
+		for _, item := range current {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch strings.TrimSpace(stringValue(block["type"])) {
+			case "", "input_text", "output_text", "text":
+				text := strings.TrimSpace(firstNonEmptyString(block["text"], block["value"]))
+				if text != "" {
+					parts = append(parts, map[string]any{"type": "text", "text": text})
+				}
+			case "input_image", "image_url":
+				if image := normalizeResponsesImagePart(block); image != nil {
+					parts = append(parts, image)
+				}
+			}
+		}
+		return parts
+	default:
+		return nil
+	}
+}
+
+func normalizeResponsesImagePart(block map[string]any) map[string]any {
+	if imageURL, ok := block["image_url"].(map[string]any); ok {
+		if url := strings.TrimSpace(stringValue(imageURL["url"])); url != "" {
+			return map[string]any{
+				"type": "image_url",
+				"image_url": map[string]any{
+					"url": url,
+				},
+			}
+		}
+	}
+	if imageURL := strings.TrimSpace(stringValue(block["image_url"])); imageURL != "" {
+		return map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": imageURL,
+			},
+		}
+	}
+	return nil
+}
+
+func responseMessageToolCalls(value any) []map[string]any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	toolCalls := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		block, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		call, ok := responseFunctionCallItem(block)
+		if ok {
+			toolCalls = append(toolCalls, call)
+		}
+	}
+	return toolCalls
+}
+
+func responseFunctionCallItem(item map[string]any) (map[string]any, bool) {
+	callID := strings.TrimSpace(firstNonEmptyString(item["call_id"], item["tool_call_id"], item["id"]))
+	name := strings.TrimSpace(firstNonEmptyString(item["name"], item["tool_name"]))
+	if name == "" {
+		return nil, false
+	}
+	if callID == "" {
+		callID = model.NewID("toolcall")
+	}
+	arguments := marshalJSONObject(item["arguments"])
+	if strings.TrimSpace(arguments) == "{}" {
+		if parameters, ok := item["parameters"]; ok {
+			arguments = marshalJSONObject(parameters)
+		}
+	}
+	return map[string]any{
+		"id":   callID,
+		"type": "function",
+		"function": map[string]any{
+			"name":      name,
+			"arguments": arguments,
+		},
+	}, true
+}
+
+func responseFunctionCallOutput(value any) string {
+	if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+		return text
+	}
+	return marshalJSONObject(value)
+}
+
+func normalizeResponsesToolDefinitions(value any) ([]map[string]any, bool) {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return nil, false
+	}
+	tools := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if function, ok := tool["function"].(map[string]any); ok && strings.EqualFold(strings.TrimSpace(stringValue(tool["type"])), "function") {
+			tools = append(tools, map[string]any{
+				"type":     "function",
+				"function": function,
+			})
+			continue
+		}
+		name := strings.TrimSpace(stringValue(tool["name"]))
+		if name == "" {
+			continue
+		}
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        name,
+				"description": tool["description"],
+				"parameters":  firstNonNil(tool["parameters"], tool["input_schema"]),
+			},
+		})
+	}
+	if len(tools) == 0 {
+		return nil, false
+	}
+	return tools, true
+}
+
+func openAIChatPayloadToAnthropic(payload map[string]any) ([]byte, error) {
+	out := map[string]any{
+		"model": firstNonEmptyString(payload["model"]),
+	}
+	if maxTokens, ok := firstNonNil(payload["max_tokens"], payload["max_output_tokens"]).(float64); ok && maxTokens > 0 {
+		out["max_tokens"] = int(maxTokens)
+	} else if maxTokens, ok := firstNonNil(payload["max_tokens"], payload["max_output_tokens"]).(int); ok && maxTokens > 0 {
+		out["max_tokens"] = maxTokens
+	} else {
+		out["max_tokens"] = 4096
+	}
+	if stream, _ := payload["stream"].(bool); stream {
+		out["stream"] = true
+	}
+	for _, field := range []string{"temperature", "top_p"} {
+		if value, ok := payload[field]; ok {
+			out[field] = value
+		}
+	}
+
+	systemBlocks := make([]map[string]any, 0, 2)
+	messages := make([]map[string]any, 0, 8)
+	if items := anySlice(payload["messages"]); len(items) > 0 {
+		for _, item := range items {
+			message, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			role := strings.TrimSpace(stringValue(message["role"]))
+			switch role {
+			case "system":
+				if text := flattenOpenAIContent(message["content"]); strings.TrimSpace(text) != "" {
+					systemBlocks = append(systemBlocks, map[string]any{"type": "text", "text": text})
+				}
+			case "tool":
+				if toolMessage := openAIChatToolMessageToAnthropic(message); toolMessage != nil {
+					messages = append(messages, toolMessage)
+				}
+			default:
+				if anthropicMessage := openAIChatMessageToAnthropic(message); anthropicMessage != nil {
+					messages = append(messages, anthropicMessage)
+				}
+			}
+		}
+	}
+	if len(systemBlocks) > 0 {
+		out["system"] = systemBlocks
+	}
+	out["messages"] = messages
+	if tools := openAIChatToolsToAnthropic(payload["tools"]); len(tools) > 0 {
+		out["tools"] = tools
+	}
+	return json.Marshal(out)
+}
+
+func openAIChatMessageToAnthropic(message map[string]any) map[string]any {
+	role := strings.TrimSpace(stringValue(message["role"]))
+	if role == "" {
+		role = "user"
+	}
+	content := openAIChatContentToAnthropicBlocks(message["content"])
+	if role == "assistant" {
+		if toolCalls := anySlice(message["tool_calls"]); len(toolCalls) > 0 {
+			for _, item := range toolCalls {
+				call, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				if block := openAIChatToolCallToAnthropic(call); block != nil {
+					content = append(content, block)
+				}
+			}
+		}
+	}
+	if len(content) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"role":    role,
+		"content": content,
+	}
+}
+
+func openAIChatToolMessageToAnthropic(message map[string]any) map[string]any {
+	toolCallID := strings.TrimSpace(firstNonEmptyString(message["tool_call_id"], message["call_id"], message["id"]))
+	if toolCallID == "" {
+		return openAIChatMessageToAnthropic(map[string]any{
+			"role":    "user",
+			"content": message["content"],
+		})
+	}
+	content := responseContentToText(message["content"])
+	if strings.TrimSpace(content) == "" {
+		content = marshalJSONObject(message["content"])
+	}
+	return map[string]any{
+		"role": "user",
+		"content": []map[string]any{{
+			"type":        "tool_result",
+			"tool_use_id": toolCallID,
+			"content": []map[string]any{{
+				"type": "text",
+				"text": content,
+			}},
+		}},
+	}
+}
+
+func openAIChatContentToAnthropicBlocks(value any) []map[string]any {
+	switch current := value.(type) {
+	case string:
+		if strings.TrimSpace(current) == "" {
+			return nil
+		}
+		return []map[string]any{{"type": "text", "text": current}}
+	default:
+		items := anySlice(value)
+		blocks := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			part, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch strings.TrimSpace(stringValue(part["type"])) {
+			case "", "text":
+				text := strings.TrimSpace(stringValue(part["text"]))
+				if text != "" {
+					blocks = append(blocks, map[string]any{"type": "text", "text": text})
+				}
+			case "image_url":
+				if block := openAIImagePartToAnthropic(part); block != nil {
+					blocks = append(blocks, block)
+				}
+			}
+		}
+		return blocks
+	}
+}
+
+func openAIImagePartToAnthropic(part map[string]any) map[string]any {
+	imageURL, ok := part["image_url"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawURL := strings.TrimSpace(stringValue(imageURL["url"]))
+	if rawURL == "" {
+		return nil
+	}
+	if mediaType, data, ok := splitDataURL(rawURL); ok {
+		return map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": mediaType,
+				"data":       data,
+			},
+		}
+	}
+	return map[string]any{
+		"type": "image",
+		"source": map[string]any{
+			"type": "url",
+			"url":  rawURL,
+		},
+	}
+}
+
+func openAIChatToolCallToAnthropic(call map[string]any) map[string]any {
+	function, ok := call["function"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	name := strings.TrimSpace(stringValue(function["name"]))
+	if name == "" {
+		return nil
+	}
+	callID := strings.TrimSpace(stringValue(call["id"]))
+	if callID == "" {
+		callID = model.NewID("toolcall")
+	}
+	return map[string]any{
+		"type":  "tool_use",
+		"id":    callID,
+		"name":  name,
+		"input": parseJSONObjectString(stringValue(function["arguments"])),
+	}
+}
+
+func openAIChatToolsToAnthropic(value any) []map[string]any {
+	items := anySlice(value)
+	if len(items) == 0 {
+		return nil
+	}
+	tools := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		function, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(stringValue(function["name"]))
+		if name == "" {
+			continue
+		}
+		tools = append(tools, map[string]any{
+			"name":         name,
+			"description":  function["description"],
+			"input_schema": firstNonNil(function["parameters"], map[string]any{"type": "object"}),
+		})
+	}
+	return tools
+}
+
+func openAIChatPayloadToGemini(payload map[string]any) ([]byte, error) {
+	out := map[string]any{}
+	if stream, _ := payload["stream"].(bool); stream {
+		// Gemini stream selection is encoded in the request path.
+	}
+	if generationConfig := openAIChatGenerationConfig(payload); generationConfig != nil {
+		out["generationConfig"] = generationConfig
+	}
+	if tools := openAIChatToolsToGemini(payload["tools"]); len(tools) > 0 {
+		out["tools"] = tools
+	}
+
+	systemParts := make([]map[string]any, 0, 2)
+	contents := make([]map[string]any, 0, 8)
+	toolNames := map[string]string{}
+	if items := anySlice(payload["messages"]); len(items) > 0 {
+		for _, item := range items {
+			message, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			role := strings.TrimSpace(stringValue(message["role"]))
+			switch role {
+			case "system":
+				if text := flattenOpenAIContent(message["content"]); strings.TrimSpace(text) != "" {
+					systemParts = append(systemParts, map[string]any{"text": text})
+				}
+			case "tool":
+				if content := openAIChatToolMessageToGemini(message, toolNames); content != nil {
+					contents = append(contents, content)
+				}
+			default:
+				if content := openAIChatMessageToGemini(message, toolNames); content != nil {
+					contents = append(contents, content)
+				}
+			}
+		}
+	}
+	if len(systemParts) > 0 {
+		out["systemInstruction"] = map[string]any{"parts": systemParts}
+	}
+	out["contents"] = contents
+	return json.Marshal(out)
+}
+
+func openAIChatGenerationConfig(payload map[string]any) map[string]any {
+	config := map[string]any{}
+	if maxTokens := firstNonNil(payload["max_tokens"], payload["max_output_tokens"]); maxTokens != nil {
+		config["maxOutputTokens"] = maxTokens
+	}
+	if temperature, ok := payload["temperature"]; ok {
+		config["temperature"] = temperature
+	}
+	if topP, ok := payload["top_p"]; ok {
+		config["topP"] = topP
+	}
+	if len(config) == 0 {
+		return nil
+	}
+	return config
+}
+
+func openAIChatMessageToGemini(message map[string]any, toolNames map[string]string) map[string]any {
+	role := "user"
+	if strings.EqualFold(strings.TrimSpace(stringValue(message["role"])), "assistant") {
+		role = "model"
+	}
+	parts := openAIChatContentToGeminiParts(message["content"])
+	if toolCalls := anySlice(message["tool_calls"]); len(toolCalls) > 0 {
+		for _, item := range toolCalls {
+			call, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if part := openAIChatToolCallToGemini(call, toolNames); part != nil {
+				parts = append(parts, part)
+			}
+		}
+		role = "model"
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"role":  role,
+		"parts": parts,
+	}
+}
+
+func openAIChatToolMessageToGemini(message map[string]any, toolNames map[string]string) map[string]any {
+	callID := strings.TrimSpace(firstNonEmptyString(message["tool_call_id"], message["call_id"], message["id"]))
+	if callID == "" {
+		return openAIChatMessageToGemini(map[string]any{
+			"role":    "user",
+			"content": message["content"],
+		}, toolNames)
+	}
+	name := strings.TrimSpace(toolNames[callID])
+	if name == "" {
+		name = "tool"
+	}
+	return map[string]any{
+		"role": "function",
+		"parts": []map[string]any{{
+			"functionResponse": map[string]any{
+				"name":     name,
+				"response": parseJSONObjectString(responseFunctionCallOutput(message["content"])),
+			},
+		}},
+	}
+}
+
+func openAIChatContentToGeminiParts(value any) []map[string]any {
+	switch current := value.(type) {
+	case string:
+		if strings.TrimSpace(current) == "" {
+			return nil
+		}
+		return []map[string]any{{"text": current}}
+	default:
+		items := anySlice(value)
+		parts := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch strings.TrimSpace(stringValue(block["type"])) {
+			case "", "text":
+				text := strings.TrimSpace(stringValue(block["text"]))
+				if text != "" {
+					parts = append(parts, map[string]any{"text": text})
+				}
+			case "image_url":
+				if image := normalizeResponsesImagePart(block); image != nil {
+					parts = append(parts, map[string]any{
+						"inlineData": map[string]any{
+							"mimeType": detectGeminiImageMimeType(image),
+							"data":     detectGeminiImageData(image),
+						},
+					})
+				}
+			}
+		}
+		return parts
+	}
+}
+
+func openAIChatToolCallToGemini(call map[string]any, toolNames map[string]string) map[string]any {
+	function, ok := call["function"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	name := strings.TrimSpace(stringValue(function["name"]))
+	if name == "" {
+		return nil
+	}
+	callID := strings.TrimSpace(stringValue(call["id"]))
+	if callID != "" {
+		toolNames[callID] = name
+	}
+	return map[string]any{
+		"functionCall": map[string]any{
+			"name": name,
+			"args": parseJSONObjectString(stringValue(function["arguments"])),
+		},
+	}
+}
+
+func openAIChatToolsToGemini(value any) []map[string]any {
+	items := anySlice(value)
+	if len(items) == 0 {
+		return nil
+	}
+	declarations := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		function, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(stringValue(function["name"]))
+		if name == "" {
+			continue
+		}
+		declarations = append(declarations, map[string]any{
+			"name":        name,
+			"description": function["description"],
+			"parameters":  firstNonNil(function["parameters"], map[string]any{"type": "object"}),
+		})
+	}
+	if len(declarations) == 0 {
+		return nil
+	}
+	return []map[string]any{{
+		"functionDeclarations": declarations,
+	}}
+}
+
+func splitDataURL(value string) (string, string, bool) {
+	if !strings.HasPrefix(value, "data:") {
+		return "", "", false
+	}
+	mediaType, rawData, found := strings.Cut(strings.TrimPrefix(value, "data:"), ";base64,")
+	if !found || strings.TrimSpace(mediaType) == "" || strings.TrimSpace(rawData) == "" {
+		return "", "", false
+	}
+	return strings.TrimSpace(mediaType), strings.TrimSpace(rawData), true
+}
+
+func detectGeminiImageMimeType(part map[string]any) string {
+	imageURL, _ := part["image_url"].(map[string]any)
+	if imageURL == nil {
+		return "image/png"
+	}
+	if mediaType, _, ok := splitDataURL(strings.TrimSpace(stringValue(imageURL["url"]))); ok {
+		return mediaType
+	}
+	return "image/png"
+}
+
+func detectGeminiImageData(part map[string]any) string {
+	imageURL, _ := part["image_url"].(map[string]any)
+	if imageURL == nil {
+		return ""
+	}
+	_, data, ok := splitDataURL(strings.TrimSpace(stringValue(imageURL["url"])))
+	if !ok {
+		return ""
+	}
+	return data
+}
+
+func parseJSONObjectString(raw string) any {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return map[string]any{}
+	}
+	var decoded any
+	if json.Unmarshal([]byte(trimmed), &decoded) == nil {
+		return decoded
+	}
+	return map[string]any{"value": raw}
+}
+
+func firstNonEmptyString(values ...any) string {
+	for _, value := range values {
+		if text := strings.TrimSpace(stringValue(value)); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func anySlice(value any) []any {
+	switch current := value.(type) {
+	case []any:
+		return current
+	case []map[string]any:
+		out := make([]any, 0, len(current))
+		for _, item := range current {
+			out = append(out, item)
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func anthropicToOpenAIChat(payload map[string]any, upstreamModel string) ([]byte, bool, error) {
@@ -698,6 +1558,10 @@ func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response,
 		return writeGeminiJSON(w, resp, observer, publicAlias, transformers, candidate)
 	case responseModeGeminiSSE:
 		return writeGeminiSSE(w, resp, observer, publicAlias, transformers, candidate)
+	case responseModeResponsesJSON:
+		return writeResponsesJSON(w, resp, observer, publicAlias, transformers, candidate)
+	case responseModeResponsesSSE:
+		return writeResponsesSSE(w, resp, observer, publicAlias, transformers, candidate)
 	default:
 		return fmt.Errorf("unsupported response mode %q", exchange.ResponseMode)
 	}
@@ -1047,6 +1911,416 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 	}
 	flush()
 	return nil
+}
+
+func writeResponsesJSON(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	payload, err := readLimitedResponseBody(resp.Body, maxTransformedResponseBodyBytes)
+	if err != nil {
+		return err
+	}
+	observer.ObserveJSON(payload)
+
+	var envelope responsesEnvelope
+	switch candidate.provider.Kind {
+	case model.ProviderKindAnthropic:
+		envelope, err = anthropicPayloadToResponsesEnvelope(payload, observer.Summary())
+	case model.ProviderKindGemini:
+		envelope, err = geminiPayloadToResponsesEnvelope(payload, observer.Summary())
+	default:
+		return fmt.Errorf("provider kind %s does not support responses translation", candidate.provider.Kind)
+	}
+	if err != nil {
+		return err
+	}
+
+	body := responsesBodyFromEnvelope(envelope, publicAlias)
+	body, err = applyResponseTransformers(w.Header(), body, transformers, candidate)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		return proxyResponseWriteError{err: err}
+	}
+	return nil
+}
+
+func writeResponsesSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	switch candidate.provider.Kind {
+	case model.ProviderKindAnthropic:
+		return writeResponsesFromAnthropicSSE(w, resp, observer, publicAlias, transformers, candidate)
+	case model.ProviderKindGemini:
+		return writeResponsesFromGeminiSSE(w, resp, observer, publicAlias, transformers, candidate)
+	default:
+		return fmt.Errorf("provider kind %s does not support responses translation", candidate.provider.Kind)
+	}
+}
+
+func anthropicPayloadToResponsesEnvelope(payload []byte, usage model.UsageSummary) (responsesEnvelope, error) {
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return responsesEnvelope{}, err
+	}
+	envelope := responsesEnvelope{
+		ID:    fallbackID(stringValue(body["id"]), "resp"),
+		Usage: usage,
+	}
+	if content, ok := body["content"].([]any); ok {
+		envelope.Text = flattenAnthropicTextBlocks(content)
+		for _, item := range content {
+			block, ok := item.(map[string]any)
+			if !ok || strings.TrimSpace(stringValue(block["type"])) != "tool_use" {
+				continue
+			}
+			name := strings.TrimSpace(stringValue(block["name"]))
+			if name == "" {
+				continue
+			}
+			callID := strings.TrimSpace(firstNonEmptyString(block["id"], block["tool_use_id"]))
+			if callID == "" {
+				callID = model.NewID("toolcall")
+			}
+			envelope.ToolCalls = append(envelope.ToolCalls, responsesFunctionCall{
+				ID:        callID,
+				Name:      name,
+				Arguments: marshalJSONObject(block["input"]),
+			})
+		}
+	}
+	return envelope, nil
+}
+
+func geminiPayloadToResponsesEnvelope(payload []byte, usage model.UsageSummary) (responsesEnvelope, error) {
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return responsesEnvelope{}, err
+	}
+	envelope := responsesEnvelope{
+		ID:    fallbackID(stringValue(body["responseId"]), "resp"),
+		Usage: usage,
+	}
+	if candidates, ok := body["candidates"].([]any); ok && len(candidates) > 0 {
+		if candidate, ok := candidates[0].(map[string]any); ok {
+			text, calls := geminiCandidateToResponsesOutput(candidate)
+			envelope.Text = text
+			envelope.ToolCalls = calls
+		}
+	}
+	return envelope, nil
+}
+
+func geminiCandidateToResponsesOutput(candidate map[string]any) (string, []responsesFunctionCall) {
+	content, _ := candidate["content"].(map[string]any)
+	parts, _ := content["parts"].([]any)
+	textParts := make([]string, 0, len(parts))
+	toolCalls := make([]responsesFunctionCall, 0)
+	for _, item := range parts {
+		part, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text := strings.TrimSpace(stringValue(part["text"])); text != "" {
+			textParts = append(textParts, text)
+		}
+		if functionCall, ok := part["functionCall"].(map[string]any); ok {
+			name := strings.TrimSpace(stringValue(functionCall["name"]))
+			if name == "" {
+				continue
+			}
+			toolCalls = append(toolCalls, responsesFunctionCall{
+				ID:        model.NewID("toolcall"),
+				Name:      name,
+				Arguments: marshalJSONObject(functionCall["args"]),
+			})
+		}
+	}
+	return strings.Join(textParts, "\n"), toolCalls
+}
+
+func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	clearWriteDeadline(w)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	if _, err := applyResponseTransformers(w.Header(), nil, transformers, candidate); err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusOK)
+
+	reader := bufio.NewReader(resp.Body)
+	flusher, _ := w.(http.Flusher)
+	lastEvent := ""
+	responseID := model.NewID("resp")
+	messageID := model.NewID("msg")
+	createdWritten := false
+	var textBuilder strings.Builder
+	toolCalls := make([]responsesFunctionCall, 0)
+
+	flush := func() {
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			observer.ObserveLine(line)
+			trimmed := strings.TrimSpace(string(line))
+			switch {
+			case strings.HasPrefix(trimmed, "event:"):
+				lastEvent = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+			case strings.HasPrefix(trimmed, "data:"):
+				payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+				if payload == "" || payload == "[DONE]" {
+					if payload == "[DONE]" {
+						err = io.EOF
+						goto readNextAnthropicLine
+					}
+					goto readNextAnthropicLine
+				}
+				var body map[string]any
+				if err := json.Unmarshal([]byte(payload), &body); err != nil {
+					return proxyResponseWriteError{err: err}
+				}
+				switch lastEvent {
+				case "message_start":
+					if message, ok := body["message"].(map[string]any); ok {
+						messageID = fallbackID(stringValue(message["id"]), "msg")
+						responseID = messageID
+					}
+				case "content_block_start":
+					if block, ok := body["content_block"].(map[string]any); ok && strings.TrimSpace(stringValue(block["type"])) == "tool_use" {
+						name := strings.TrimSpace(stringValue(block["name"]))
+						if name != "" {
+							callID := fallbackID(stringValue(block["id"]), "toolcall")
+							toolCalls = append(toolCalls, responsesFunctionCall{
+								ID:        callID,
+								Name:      name,
+								Arguments: marshalJSONObject(block["input"]),
+							})
+						}
+					}
+				case "content_block_delta":
+					if delta, ok := body["delta"].(map[string]any); ok && strings.TrimSpace(stringValue(delta["type"])) == "text_delta" {
+						text := stringValue(delta["text"])
+						if text != "" {
+							if !createdWritten {
+								if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+									return proxyResponseWriteError{err: err}
+								}
+								createdWritten = true
+							}
+							textBuilder.WriteString(text)
+							if err := writeResponsesTextDeltaEvent(w, messageID, text, transformers, candidate); err != nil {
+								return proxyResponseWriteError{err: err}
+							}
+							flush()
+						}
+					}
+				}
+				if !createdWritten {
+					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+						return proxyResponseWriteError{err: err}
+					}
+					createdWritten = true
+				}
+			}
+		}
+	readNextAnthropicLine:
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return proxyResponseWriteError{err: err}
+		}
+	}
+
+	if !createdWritten {
+		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+			return proxyResponseWriteError{err: err}
+		}
+	}
+	if err := writeResponsesCompletedEvent(w, responsesEnvelope{
+		ID:        responseID,
+		Text:      textBuilder.String(),
+		ToolCalls: toolCalls,
+		Usage:     observer.Summary(),
+	}, publicAlias, transformers, candidate); err != nil {
+		return proxyResponseWriteError{err: err}
+	}
+	flush()
+	return nil
+}
+
+func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	clearWriteDeadline(w)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	if _, err := applyResponseTransformers(w.Header(), nil, transformers, candidate); err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusOK)
+
+	reader := bufio.NewReader(resp.Body)
+	flusher, _ := w.(http.Flusher)
+	responseID := model.NewID("resp")
+	messageID := model.NewID("msg")
+	createdWritten := false
+	var textBuilder strings.Builder
+	toolCalls := make([]responsesFunctionCall, 0)
+
+	flush := func() {
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			observer.ObserveLine(line)
+			trimmed := strings.TrimSpace(string(line))
+			if !strings.HasPrefix(trimmed, "data:") {
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return proxyResponseWriteError{err: err}
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if payload == "" || payload == "[DONE]" {
+				if payload == "[DONE]" {
+					break
+				}
+			} else {
+				var body map[string]any
+				if err := json.Unmarshal([]byte(payload), &body); err != nil {
+					return proxyResponseWriteError{err: err}
+				}
+				if !createdWritten {
+					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+						return proxyResponseWriteError{err: err}
+					}
+					createdWritten = true
+				}
+				if candidates, ok := body["candidates"].([]any); ok && len(candidates) > 0 {
+					if candidateBody, ok := candidates[0].(map[string]any); ok {
+						text, calls := geminiCandidateToResponsesOutput(candidateBody)
+						if text != "" {
+							textBuilder.WriteString(text)
+							if err := writeResponsesTextDeltaEvent(w, messageID, text, transformers, candidate); err != nil {
+								return proxyResponseWriteError{err: err}
+							}
+							flush()
+						}
+						if len(calls) > 0 {
+							toolCalls = append(toolCalls, calls...)
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return proxyResponseWriteError{err: err}
+		}
+	}
+
+	if !createdWritten {
+		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+			return proxyResponseWriteError{err: err}
+		}
+	}
+	if err := writeResponsesCompletedEvent(w, responsesEnvelope{
+		ID:        responseID,
+		Text:      textBuilder.String(),
+		ToolCalls: toolCalls,
+		Usage:     observer.Summary(),
+	}, publicAlias, transformers, candidate); err != nil {
+		return proxyResponseWriteError{err: err}
+	}
+	flush()
+	return nil
+}
+
+func writeResponsesCreatedEvent(w http.ResponseWriter, responseID, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	return writeResponseSSEEvent(w, "response.created", map[string]any{
+		"type": "response.created",
+		"response": map[string]any{
+			"id":         fallbackID(responseID, "resp"),
+			"object":     "response",
+			"created_at": time.Now().UTC().Unix(),
+			"status":     "in_progress",
+			"model":      publicAlias,
+			"output":     []any{},
+		},
+	}, transformers, candidate)
+}
+
+func writeResponsesTextDeltaEvent(w http.ResponseWriter, messageID, delta string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	return writeResponseSSEEvent(w, "response.output_text.delta", map[string]any{
+		"type":          "response.output_text.delta",
+		"item_id":       fallbackID(messageID, "msg"),
+		"output_index":  0,
+		"content_index": 0,
+		"delta":         delta,
+	}, transformers, candidate)
+}
+
+func writeResponsesCompletedEvent(w http.ResponseWriter, envelope responsesEnvelope, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	return writeResponseSSEEvent(w, "response.completed", map[string]any{
+		"type":     "response.completed",
+		"response": responsesBodyFromEnvelope(envelope, publicAlias),
+	}, transformers, candidate)
+}
+
+func responsesBodyFromEnvelope(envelope responsesEnvelope, publicAlias string) map[string]any {
+	responseID := fallbackID(envelope.ID, "resp")
+	output := make([]map[string]any, 0, 1+len(envelope.ToolCalls))
+	if strings.TrimSpace(envelope.Text) != "" {
+		output = append(output, map[string]any{
+			"id":     model.NewID("msg"),
+			"type":   "message",
+			"status": "completed",
+			"role":   "assistant",
+			"content": []map[string]any{{
+				"type":        "output_text",
+				"text":        envelope.Text,
+				"annotations": []any{},
+			}},
+		})
+	}
+	for _, call := range envelope.ToolCalls {
+		output = append(output, map[string]any{
+			"id":        fallbackID(call.ID, "toolcall"),
+			"type":      "function_call",
+			"status":    "completed",
+			"call_id":   fallbackID(call.ID, "toolcall"),
+			"name":      call.Name,
+			"arguments": call.Arguments,
+		})
+	}
+	return map[string]any{
+		"id":          responseID,
+		"object":      "response",
+		"created_at":  time.Now().UTC().Unix(),
+		"status":      "completed",
+		"model":       publicAlias,
+		"output":      output,
+		"output_text": envelope.Text,
+		"usage": map[string]any{
+			"input_tokens":  envelope.Usage.InputTokens,
+			"output_tokens": envelope.Usage.OutputTokens,
+			"total_tokens":  envelope.Usage.TotalTokens,
+		},
+	}
 }
 
 func usageSummaryMap(summary model.UsageSummary) map[string]any {

@@ -31,9 +31,9 @@ const (
 func defaultProviderCapabilities(kind ProviderKind) []Protocol {
 	switch kind {
 	case ProviderKindAnthropic:
-		return []Protocol{ProtocolAnthropic}
+		return []Protocol{ProtocolAnthropic, ProtocolOpenAIResponses}
 	case ProviderKindGemini:
-		return []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream}
+		return []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream, ProtocolOpenAIResponses}
 	default:
 		return []Protocol{ProtocolOpenAIChat, ProtocolOpenAIResponses}
 	}
@@ -42,9 +42,9 @@ func defaultProviderCapabilities(kind ProviderKind) []Protocol {
 func providerKindSupportsProtocol(kind ProviderKind, protocol Protocol) bool {
 	switch kind {
 	case ProviderKindAnthropic:
-		return protocol == ProtocolAnthropic
+		return protocol == ProtocolAnthropic || protocol == ProtocolOpenAIResponses
 	case ProviderKindGemini:
-		return protocol == ProtocolGeminiGenerate || protocol == ProtocolGeminiStream
+		return protocol == ProtocolGeminiGenerate || protocol == ProtocolGeminiStream || protocol == ProtocolOpenAIResponses
 	default:
 		switch protocol {
 		case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolOpenAIRealtime, ProtocolAnthropic, ProtocolGeminiGenerate, ProtocolGeminiStream:
@@ -882,7 +882,6 @@ func (s State) Clone() State {
 	for i, record := range s.RequestHistory {
 		cloned.RequestHistory[i] = record.clone()
 	}
-	cloned.Normalize()
 	return cloned
 }
 

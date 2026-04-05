@@ -183,8 +183,8 @@ func TestStateNormalizeAssignsProviderCapabilitiesByKind(t *testing.T) {
 	state := DefaultState()
 	state.Providers = []Provider{
 		{ID: "openai", Kind: ProviderKindOpenAICompatible},
-		{ID: "anthropic", Kind: ProviderKindAnthropic, Capabilities: []Protocol{ProtocolOpenAIResponses, ProtocolAnthropic}},
-		{ID: "gemini", Kind: ProviderKindGemini, Capabilities: []Protocol{ProtocolGeminiGenerate, ProtocolOpenAIChat, ProtocolGeminiStream}},
+		{ID: "anthropic", Kind: ProviderKindAnthropic},
+		{ID: "gemini", Kind: ProviderKindGemini},
 	}
 
 	state.Normalize()
@@ -192,10 +192,36 @@ func TestStateNormalizeAssignsProviderCapabilitiesByKind(t *testing.T) {
 	if got := state.Providers[0].Capabilities; !slices.Equal(got, []Protocol{ProtocolOpenAIChat, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected openai-compatible capabilities: %+v", got)
 	}
-	if got := state.Providers[1].Capabilities; !slices.Equal(got, []Protocol{ProtocolAnthropic}) {
+	if got := state.Providers[1].Capabilities; !slices.Equal(got, []Protocol{ProtocolAnthropic, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected anthropic capabilities: %+v", got)
 	}
-	if got := state.Providers[2].Capabilities; !slices.Equal(got, []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream}) {
+	if got := state.Providers[2].Capabilities; !slices.Equal(got, []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected gemini capabilities: %+v", got)
+	}
+}
+
+func TestStateCloneDoesNotNormalizeMissingIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	state := State{
+		Providers: []Provider{{
+			Name:        "provider-without-id",
+			Kind:        ProviderKindOpenAICompatible,
+			Enabled:     true,
+			Endpoints:   []ProviderEndpoint{{BaseURL: "https://provider.example/v1", Enabled: true}},
+			Credentials: []ProviderCredential{{APIKey: "provider-key", Enabled: true}},
+		}},
+	}
+
+	cloned := state.Clone()
+
+	if cloned.Providers[0].ID != "" {
+		t.Fatalf("expected clone to preserve missing provider id, got %q", cloned.Providers[0].ID)
+	}
+	if cloned.Providers[0].Endpoints[0].ID != "" {
+		t.Fatalf("expected clone to preserve missing endpoint id, got %q", cloned.Providers[0].Endpoints[0].ID)
+	}
+	if cloned.Providers[0].Credentials[0].ID != "" {
+		t.Fatalf("expected clone to preserve missing credential id, got %q", cloned.Providers[0].Credentials[0].ID)
 	}
 }

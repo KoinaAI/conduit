@@ -210,3 +210,27 @@ func TestValidateAcceptsPostgresDatabaseURL(t *testing.T) {
 		t.Fatalf("expected store locator to prefer database url, got %q", got)
 	}
 }
+
+func TestValidateRejectsWeakBootstrapGatewayKey(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:          "super-secret-admin-token",
+		BootstrapGatewayKey: "too-short",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected weak bootstrap gateway key to be rejected")
+	}
+}
+
+func TestValidateAcceptsStrongBootstrapGatewayKey(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:          "super-secret-admin-token",
+		BootstrapGatewayKey: "bootstrap-secret-123",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected bootstrap gateway key to be accepted: %v", err)
+	}
+}

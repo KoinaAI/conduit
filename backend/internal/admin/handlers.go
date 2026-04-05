@@ -1490,17 +1490,7 @@ func decodeOptionalProtocols(raw json.RawMessage, field string) ([]model.Protoco
 }
 
 func validateGatewaySecretStrength(secret string) error {
-	trimmed := strings.TrimSpace(secret)
-	if trimmed == "" {
-		return errors.New("custom gateway secret is required")
-	}
-	if len(trimmed) < 16 {
-		return errors.New("custom gateway secrets must be at least 16 characters long")
-	}
-	if len([]byte(trimmed)) > 72 {
-		return errors.New("custom gateway secrets must be 72 bytes or fewer")
-	}
-	return nil
+	return model.ValidateGatewaySecretStrength(secret)
 }
 
 func validateRouteStrategy(route *model.ModelRoute) bool {

@@ -12,15 +12,18 @@ import (
 )
 
 const (
-	defaultStickySweepInterval = 64
-	defaultRetryAfterCooldown  = 2 * time.Minute
-	maxRetryAfterCooldown      = 15 * time.Minute
-	defaultAuthFailureWindow   = 5 * time.Minute
-	defaultAuthLockDuration    = 10 * time.Minute
-	defaultAuthFailureLimit    = 20
-	defaultInvalidLookupTTL    = 60 * time.Second
-	defaultAuthSweepInterval   = 64
-	maxAuthRuntimeEntries      = 4096
+	defaultStickySweepInterval  = 64
+	defaultRetryAfterCooldown   = 2 * time.Minute
+	maxRetryAfterCooldown       = 15 * time.Minute
+	defaultAuthFailureWindow    = 5 * time.Minute
+	defaultAuthLockDuration     = 10 * time.Minute
+	defaultAuthFailureLimit     = 20
+	defaultInvalidLookupTTL     = 60 * time.Second
+	defaultAuthSweepInterval    = 64
+	defaultRuntimeSweepInterval = 128
+	maxEndpointRuntimeAge       = 6 * time.Hour
+	maxCredentialRuntimeAge     = 6 * time.Hour
+	maxAuthRuntimeEntries       = 4096
 )
 
 type endpointRuntimeState struct {
@@ -39,6 +42,7 @@ type credentialRuntimeState struct {
 	ConsecutiveFailures int
 	LastStatusCode      int
 	LastError           string
+	LastCheckedAt       time.Time
 }
 
 type stickyBinding struct {
@@ -84,6 +88,7 @@ type runtimeState struct {
 	invalidGatewayLookups map[string]invalidGatewayLookupState
 	authFailures          map[string]*gatewayAuthFailureState
 	authWrites            int
+	runtimeWrites         int
 }
 
 func newRuntimeState(stickyStore ...stickyBindingStore) *runtimeState {
@@ -124,7 +129,10 @@ func (r *runtimeState) credentialState(key string) *credentialRuntimeState {
 func (r *runtimeState) endpointLatency(candidate resolvedCandidate) int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.endpointState(endpointRuntimeKey(candidate)).LastLatencyMS
+	if state := r.endpoints[endpointRuntimeKey(candidate)]; state != nil {
+		return state.LastLatencyMS
+	}
+	return 0
 }
 
 func (r *runtimeState) endpointOpen(candidate resolvedCandidate, now time.Time) bool {
@@ -144,7 +152,10 @@ func (r *runtimeState) endpointOpen(candidate resolvedCandidate, now time.Time) 
 func (r *runtimeState) credentialCoolingDown(candidate resolvedCandidate, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := r.credentialState(credentialRuntimeKey(candidate))
+	state := r.credentials[credentialRuntimeKey(candidate)]
+	if state == nil {
+		return false
+	}
 	return state.PermanentlyDisabled || state.DisabledUntil.After(now)
 }
 
@@ -212,8 +223,14 @@ func (r *runtimeState) reportSuccess(candidate resolvedCandidate, latency time.D
 	credential.PermanentlyDisabled = false
 	credential.LastStatusCode = 200
 	credential.LastError = ""
+	credential.LastCheckedAt = now
 
 	stickyWrite = r.bindStickyLocked(candidate, candidate.sessionID, now)
+	r.runtimeWrites++
+	if r.runtimeWrites >= defaultRuntimeSweepInterval {
+		r.sweepRuntimeStateLocked(now)
+		r.runtimeWrites = 0
+	}
 	r.mu.Unlock()
 
 	r.persistStickyWrite(stickyWrite)
@@ -294,6 +311,7 @@ func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int
 	credential.ConsecutiveFailures++
 	credential.LastStatusCode = statusCode
 	credential.LastError = errMessage
+	credential.LastCheckedAt = now
 	switch statusCode {
 	case httpStatusUnauthorized, httpStatusForbidden:
 		credential.PermanentlyDisabled = true
@@ -308,6 +326,11 @@ func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int
 		if retryAfter > 0 {
 			credential.DisabledUntil = now.Add(clampRetryAfterCooldown(retryAfter))
 		}
+	}
+	r.runtimeWrites++
+	if r.runtimeWrites >= defaultRuntimeSweepInterval {
+		r.sweepRuntimeStateLocked(now)
+		r.runtimeWrites = 0
 	}
 }
 
@@ -660,11 +683,46 @@ func (r *runtimeState) nextRoundRobinOffset(key string, size int) int {
 	return offset
 }
 
+func (r *runtimeState) sweepRuntimeStateLocked(now time.Time) {
+	for key, state := range r.endpoints {
+		if state == nil {
+			delete(r.endpoints, key)
+			continue
+		}
+		if state.HalfOpenInFlight > 0 {
+			continue
+		}
+		if state.OpenUntil.After(now) {
+			continue
+		}
+		if !state.LastCheckedAt.IsZero() && state.LastCheckedAt.Add(maxEndpointRuntimeAge).After(now) {
+			continue
+		}
+		delete(r.endpoints, key)
+	}
+	for key, state := range r.credentials {
+		if state == nil {
+			delete(r.credentials, key)
+			continue
+		}
+		if state.PermanentlyDisabled || state.DisabledUntil.After(now) {
+			continue
+		}
+		if !state.LastCheckedAt.IsZero() && state.LastCheckedAt.Add(maxCredentialRuntimeAge).After(now) {
+			continue
+		}
+		delete(r.credentials, key)
+	}
+}
+
 func (r *runtimeState) endpointOpenLocked(candidate resolvedCandidate, now time.Time) bool {
 	if !candidate.provider.CircuitBreaker.IsEnabled() {
 		return false
 	}
-	endpoint := r.endpointState(endpointRuntimeKey(candidate))
+	endpoint := r.endpoints[endpointRuntimeKey(candidate)]
+	if endpoint == nil {
+		return false
+	}
 	if endpoint.OpenUntil.After(now) {
 		return true
 	}

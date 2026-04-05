@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
 type Config struct {
@@ -110,6 +112,11 @@ func (c Config) Validate() error {
 	}
 	if c.RedisDB < 0 {
 		return errors.New("GATEWAY_REDIS_DB must be greater than or equal to 0")
+	}
+	if strings.TrimSpace(c.BootstrapGatewayKey) != "" {
+		if err := model.ValidateGatewaySecretStrength(c.BootstrapGatewayKey); err != nil {
+			return err
+		}
 	}
 	if c.DatabaseURL != "" {
 		switch {

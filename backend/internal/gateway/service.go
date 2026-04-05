@@ -86,6 +86,8 @@ const (
 	responseModeAnthropicSSE  responseMode = "anthropic-sse"
 	responseModeGeminiJSON    responseMode = "gemini-json"
 	responseModeGeminiSSE     responseMode = "gemini-sse"
+	responseModeResponsesJSON responseMode = "responses-json"
+	responseModeResponsesSSE  responseMode = "responses-sse"
 	maxRealtimeFrameBytes     int64        = 8 << 20
 )
 

@@ -444,6 +444,9 @@ func ensureBootstrapGatewayKey(cfg config.Config, stateStore *store.FileStore) e
 	if secret == "" {
 		return nil
 	}
+	if err := model.ValidateGatewaySecretStrength(secret); err != nil {
+		return err
+	}
 	lookupHash := model.GatewaySecretLookupHash(secret, cfg.SecretLookupPepper())
 
 	snapshot := stateStore.Snapshot()

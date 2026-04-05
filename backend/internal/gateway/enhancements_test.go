@@ -169,6 +169,64 @@ func TestReleaseGatewayKeyAppendsRollingSpendEvent(t *testing.T) {
 	}
 }
 
+func TestRuntimeReadPathsDoNotAllocateState(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	now := time.Now().UTC()
+	candidate := resolvedCandidate{
+		provider: model.Provider{
+			ID: "provider-1",
+			CircuitBreaker: model.CircuitBreakerConfig{
+				FailureThreshold: 1,
+				CooldownSeconds:  30,
+			},
+		},
+		endpoint:   model.ProviderEndpoint{ID: "endpoint-1"},
+		credential: model.ProviderCredential{ID: "credential-1"},
+	}
+
+	if got := runtime.endpointLatency(candidate); got != 0 {
+		t.Fatalf("expected zero latency for unseen endpoint, got %d", got)
+	}
+	if runtime.endpointOpen(candidate, now) {
+		t.Fatal("did not expect unseen endpoint to appear open")
+	}
+	if runtime.credentialCoolingDown(candidate, now) {
+		t.Fatal("did not expect unseen credential to appear cooling down")
+	}
+	if len(runtime.endpoints) != 0 {
+		t.Fatalf("expected endpoint reads to avoid allocations, got %d entries", len(runtime.endpoints))
+	}
+	if len(runtime.credentials) != 0 {
+		t.Fatalf("expected credential reads to avoid allocations, got %d entries", len(runtime.credentials))
+	}
+}
+
+func TestRuntimeSweepRemovesStaleEndpointAndCredentialState(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	now := time.Now().UTC()
+	runtime.endpoints["stale-endpoint"] = &endpointRuntimeState{
+		LastCheckedAt: now.Add(-maxEndpointRuntimeAge - time.Minute),
+	}
+	runtime.credentials["stale-credential"] = &credentialRuntimeState{
+		LastCheckedAt: now.Add(-maxCredentialRuntimeAge - time.Minute),
+	}
+
+	runtime.mu.Lock()
+	runtime.sweepRuntimeStateLocked(now)
+	runtime.mu.Unlock()
+
+	if len(runtime.endpoints) != 0 {
+		t.Fatalf("expected stale endpoint state to be swept, got %+v", runtime.endpoints)
+	}
+	if len(runtime.credentials) != 0 {
+		t.Fatalf("expected stale credential state to be swept, got %+v", runtime.credentials)
+	}
+}
+
 func TestBuildCandidatePlanWeightedRoutingPrefersHeaviestCredential(t *testing.T) {
 	t.Parallel()
 

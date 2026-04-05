@@ -98,3 +98,115 @@ func TestValidateRejectsUnknownLogLevel(t *testing.T) {
 		t.Fatal("expected invalid log level to be rejected")
 	}
 }
+
+func TestValidateRejectsInvalidLogFileRotationConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:    "super-secret-admin-token",
+		LogFile:       "/tmp/conduit.log",
+		LogMaxSizeMB:  0,
+		LogMaxBackups: 5,
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid log rotation config to be rejected")
+	}
+}
+
+func TestValidateRejectsInvalidBackupConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:            "super-secret-admin-token",
+		BackupDirectory:       "/tmp/conduit-backups",
+		BackupIntervalSeconds: 0,
+		BackupRetention:       5,
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid backup config to be rejected")
+	}
+}
+
+func TestValidateAcceptsLogFileAndBackupConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:            "super-secret-admin-token",
+		LogFile:               "/tmp/conduit.log",
+		LogMaxSizeMB:          20,
+		LogMaxBackups:         5,
+		BackupDirectory:       "/tmp/conduit-backups",
+		BackupIntervalSeconds: 3600,
+		BackupRetention:       10,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected log file and backup config to be accepted: %v", err)
+	}
+}
+
+func TestValidateRejectsInvalidPricingSyncConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:                 "super-secret-admin-token",
+		PricingSyncEnabled:         true,
+		PricingCatalogURL:          "https://models.dev/api.json",
+		PricingSyncIntervalSeconds: 0,
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid pricing sync config to be rejected")
+	}
+}
+
+func TestValidateAcceptsPricingSyncConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:                 "super-secret-admin-token",
+		PricingSyncEnabled:         true,
+		PricingCatalogURL:          "https://models.dev/api.json",
+		PricingSyncIntervalSeconds: 86400,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected pricing sync config to be accepted: %v", err)
+	}
+}
+
+func TestValidateRejectsNegativeRedisDB(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken: "super-secret-admin-token",
+		RedisDB:    -1,
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected negative redis db to be rejected")
+	}
+}
+
+func TestValidateRejectsUnsupportedDatabaseURLScheme(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:  "super-secret-admin-token",
+		DatabaseURL: "sqlite:///tmp/gateway.db",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unsupported database url scheme to be rejected")
+	}
+}
+
+func TestValidateAcceptsPostgresDatabaseURL(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		AdminToken:  "super-secret-admin-token",
+		DatabaseURL: "postgres://conduit:secret@db.example/conduit?sslmode=disable",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected postgres database url to be accepted: %v", err)
+	}
+	if got := cfg.StoreLocator(); got != cfg.DatabaseURL {
+		t.Fatalf("expected store locator to prefer database url, got %q", got)
+	}
+}

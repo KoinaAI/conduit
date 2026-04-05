@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 
@@ -11,7 +12,20 @@ import (
 
 func main() {
 	cfg := config.Load()
-	observability.ConfigureDefaultLogger(cfg, nil)
+	if _, err := observability.ConfigureDefaultLogger(cfg, nil); err != nil {
+		slog.Error("gateway logger initialization failed", "error", err)
+		os.Exit(1)
+	}
+	shutdownTracing, err := observability.ConfigureTracing(context.Background())
+	if err != nil {
+		slog.Error("gateway tracing initialization failed", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := shutdownTracing(context.Background()); err != nil {
+			slog.Error("gateway tracing shutdown failed", "error", err)
+		}
+	}()
 	if err := app.Run(cfg); err != nil {
 		slog.Error("gateway stopped with error", "error", err)
 		os.Exit(1)

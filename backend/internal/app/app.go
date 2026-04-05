@@ -33,7 +33,7 @@ func New(cfg config.Config) (*App, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	store, err := store.Open(cfg.StatePath)
+	store, err := store.Open(cfg.StoreLocator())
 	if err != nil {
 		return nil, err
 	}
@@ -46,11 +46,15 @@ func New(cfg config.Config) (*App, error) {
 	adminHandlers := admin.New(cfg, store, integrationService, gatewayService)
 
 	return &App{
-		cfg:       cfg,
-		store:     store,
-		admin:     adminHandlers,
-		gateway:   gatewayService,
-		scheduler: scheduler.New(adminHandlers, time.Duration(cfg.ProbeIntervalSeconds)*time.Second),
+		cfg:     cfg,
+		store:   store,
+		admin:   adminHandlers,
+		gateway: gatewayService,
+		scheduler: scheduler.New(
+			adminHandlers,
+			time.Duration(cfg.ProbeIntervalSeconds)*time.Second,
+			pricingSyncInterval(cfg),
+		),
 		startedAt: time.Now().UTC(),
 	}, nil
 }
@@ -97,6 +101,7 @@ func (a *App) Handler() http.Handler {
 	adminMux.HandleFunc("GET /api/admin/meta", a.admin.GetMeta)
 	adminMux.HandleFunc("GET /api/admin/openapi.json", a.admin.OpenAPI)
 	adminMux.HandleFunc("POST /api/admin/maintenance/probes", a.admin.ProbeAllProviders)
+	adminMux.HandleFunc("POST /api/admin/maintenance/pricing-sync", a.admin.SyncPricingCatalog)
 	mux.Handle("/api/admin/", withCORS(
 		a.admin.Middleware(adminMux),
 		a.cfg,
@@ -110,7 +115,7 @@ func (a *App) Handler() http.Handler {
 		methodHandler(http.MethodGet, http.HandlerFunc(a.gateway.HandleModels)),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"GET, OPTIONS",
 		false,
 	))
@@ -118,7 +123,7 @@ func (a *App) Handler() http.Handler {
 		methodHandler(http.MethodPost, http.HandlerFunc(a.gateway.ProxyHTTP(model.ProtocolOpenAIChat))),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"POST, OPTIONS",
 		false,
 	))
@@ -126,7 +131,7 @@ func (a *App) Handler() http.Handler {
 		methodHandler(http.MethodPost, http.HandlerFunc(a.gateway.ProxyHTTP(model.ProtocolOpenAIResponses))),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"POST, OPTIONS",
 		false,
 	))
@@ -134,7 +139,7 @@ func (a *App) Handler() http.Handler {
 		methodHandler(http.MethodPost, http.HandlerFunc(a.gateway.ProxyHTTP(model.ProtocolAnthropic))),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"POST, OPTIONS",
 		false,
 	))
@@ -156,7 +161,7 @@ func (a *App) Handler() http.Handler {
 		}),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"POST, OPTIONS",
 		false,
 	))
@@ -165,7 +170,7 @@ func (a *App) Handler() http.Handler {
 			methodHandler(http.MethodGet, http.HandlerFunc(a.gateway.ProxyRealtime)),
 			a.cfg,
 			a.cfg.RealtimeAllowedOrigins,
-			"Authorization, Content-Type, X-API-Key",
+			gatewayAllowedHeaders(),
 			"GET, OPTIONS",
 			false,
 		))
@@ -174,7 +179,7 @@ func (a *App) Handler() http.Handler {
 	return mux
 }
 
-// Healthz reports process uptime plus SQLite connectivity for external probes.
+// Healthz reports process uptime plus database connectivity for external probes.
 func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
 	status := http.StatusOK
 	dbStatus := "ok"
@@ -195,6 +200,7 @@ func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
 		"server_time":    now,
 		"uptime_seconds": int64(now.Sub(a.startedAt).Seconds()),
 		"db_status":      dbStatus,
+		"db_backend":     a.store.Backend(),
 		"counts": map[string]any{
 			"providers":             counts.Providers,
 			"routes":                counts.Routes,
@@ -209,13 +215,42 @@ func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
 
 func (a *App) StartBackground(ctx context.Context) {
 	go a.scheduler.Start(ctx)
+	if strings.TrimSpace(a.cfg.BackupDirectory) != "" && a.cfg.BackupIntervalSeconds > 0 && a.store.SupportsBackup() {
+		go a.runBackupLoop(ctx)
+	}
 }
 
 func (a *App) Close() error {
 	if a == nil {
 		return nil
 	}
-	return a.store.Close()
+	var errs []error
+	if a.gateway != nil {
+		errs = append(errs, a.gateway.Close())
+	}
+	if a.store != nil {
+		errs = append(errs, a.store.Close())
+	}
+	return errors.Join(errs...)
+}
+
+func (a *App) runBackupLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(a.cfg.BackupIntervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			backupPath, err := a.store.Backup(a.cfg.BackupDirectory, a.cfg.BackupRetention)
+			if err != nil {
+				slog.Error("gateway backup failed", "error", err, "backup_dir", a.cfg.BackupDirectory)
+				continue
+			}
+			slog.Info("gateway backup completed", "path", backupPath)
+		}
+	}
 }
 
 func newHTTPServer(addr string, handler http.Handler) *http.Server {
@@ -226,6 +261,32 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+}
+
+func pricingSyncInterval(cfg config.Config) time.Duration {
+	if !cfg.PricingSyncEnabled || cfg.PricingSyncIntervalSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(cfg.PricingSyncIntervalSeconds) * time.Second
+}
+
+func gatewayAllowedHeaders() string {
+	return strings.Join([]string{
+		"Authorization",
+		"Content-Type",
+		"X-API-Key",
+		"X-Session-ID",
+		"Session-ID",
+		"X-Routing-Scenario",
+		"Routing-Scenario",
+		"X-Codex-Turn-State",
+		"X-Codex-Turn-Metadata",
+		"X-Codex-Parent-Thread-Id",
+		"X-Codex-Window-Id",
+		"X-OpenAI-Subagent",
+		"OpenAI-Beta",
+		"X-ResponsesAPI-Include-Timing-Metrics",
+	}, ", ")
 }
 
 func Run(cfg config.Config) error {
@@ -385,12 +446,14 @@ func ensureBootstrapGatewayKey(cfg config.Config, stateStore *store.FileStore) e
 	lookupHash := model.GatewaySecretLookupHash(secret, cfg.SecretLookupPepper())
 
 	snapshot := stateStore.Snapshot()
+	matchedKeyID := ""
 	for _, key := range snapshot.GatewayKeys {
 		if model.VerifyGatewaySecret(key.SecretHash, secret) {
+			matchedKeyID = key.ID
 			if key.SecretLookupHash != lookupHash {
 				_, err := stateStore.Update(func(state *model.State) error {
 					for index := range state.GatewayKeys {
-						if state.GatewayKeys[index].ID == key.ID {
+						if state.GatewayKeys[index].ID == matchedKeyID {
 							state.GatewayKeys[index].SecretLookupHash = lookupHash
 							state.GatewayKeys[index].UpdatedAt = time.Now().UTC()
 							return nil
@@ -413,7 +476,7 @@ func ensureBootstrapGatewayKey(cfg config.Config, stateStore *store.FileStore) e
 	now := time.Now().UTC()
 	_, err = stateStore.Update(func(state *model.State) error {
 		for _, key := range state.GatewayKeys {
-			if model.VerifyGatewaySecret(key.SecretHash, secret) {
+			if key.ID == matchedKeyID || key.SecretLookupHash == lookupHash {
 				return nil
 			}
 		}

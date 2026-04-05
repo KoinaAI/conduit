@@ -202,6 +202,46 @@ func TestAdminMiddlewareRejectsEmptyConfiguredToken(t *testing.T) {
 	}
 }
 
+func TestRunPricingSyncPersistsManagedCatalogProfiles(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"openai": map[string]any{
+				"models": map[string]any{
+					"gpt-5.4": map[string]any{
+						"cost": map[string]any{
+							"input":      2.5,
+							"output":     10.0,
+							"cache_read": 0.5,
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{
+		PricingCatalogURL: server.URL,
+	}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	result := handlers.RunPricingSync(context.Background())
+	if errValue := result["error"]; errValue != nil {
+		t.Fatalf("expected pricing sync to succeed, got %+v", result)
+	}
+
+	saved := fileStore.Snapshot()
+	profile, ok := saved.FindPricingProfile("pricing-catalog-models-dev-openai-gpt-5-4")
+	if !ok {
+		t.Fatalf("expected managed pricing profile to be persisted, got %+v", saved.PricingProfiles)
+	}
+	if profile.InputPerMillion != 2.5 || profile.CachedInputPerMillion != 0.5 {
+		t.Fatalf("unexpected managed pricing profile values: %+v", profile)
+	}
+}
+
 func TestCreateRouteRejectsDuplicateAliasCaseInsensitive(t *testing.T) {
 	t.Parallel()
 
@@ -230,6 +270,194 @@ func TestCreateRouteRejectsDuplicateAliasCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestCreateProviderRejectsInvalidProxyURL(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/providers", strings.NewReader(`{
+		"id":"provider-1",
+		"name":"Provider",
+		"kind":"openai-compatible",
+		"base_url":"https://provider.example",
+		"api_key":"provider-key",
+		"enabled":true,
+		"capabilities":["openai.chat"],
+		"proxy_url":"ftp://proxy.example:21"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.CreateProvider(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid proxy url to be rejected, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCreateProviderAcceptsSOCKSProxyURL(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/providers", strings.NewReader(`{
+		"id":"provider-1",
+		"name":"Provider",
+		"kind":"openai-compatible",
+		"base_url":"https://provider.example",
+		"api_key":"provider-key",
+		"enabled":true,
+		"capabilities":["openai.chat"],
+		"proxy_url":"socks5://127.0.0.1:1080"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.CreateProvider(recorder, req)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected SOCKS proxy url to be accepted, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	provider, ok := saved.FindProvider("provider-1")
+	if !ok {
+		t.Fatal("expected provider to be created")
+	}
+	if provider.ProxyURL != "socks5://127.0.0.1:1080" {
+		t.Fatalf("expected proxy url to persist, got %q", provider.ProxyURL)
+	}
+}
+
+func TestDeleteIntegrationCleansLinkedProviderRoutesAndManagedPricing(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		Providers: []model.Provider{{
+			ID:      "provider-1",
+			Name:    "Relay",
+			Kind:    model.ProviderKindOpenAICompatible,
+			BaseURL: "https://relay.example",
+			APIKey:  "relay-key",
+			Enabled: true,
+		}},
+		Integrations: []model.Integration{{
+			ID:               "integration-1",
+			Name:             "Relay",
+			Kind:             model.IntegrationKindNewAPI,
+			BaseURL:          "https://relay.example",
+			AccessKey:        "access-key",
+			Enabled:          true,
+			LinkedProviderID: "provider-1",
+		}},
+		ModelRoutes: []model.ModelRoute{
+			{
+				Alias:            "gpt-5.4",
+				PricingProfileID: "pricing-sync-integration-1-gpt-5-4",
+				Targets: []model.RouteTarget{{
+					ID:               "target-1",
+					AccountID:        "provider-1",
+					UpstreamModel:    "gpt-5.4",
+					Weight:           1,
+					Enabled:          true,
+					MarkupMultiplier: 1,
+				}},
+			},
+			{
+				Alias: "shared-route",
+				Scenarios: []model.RouteScenario{{
+					Name: "background",
+					Targets: []model.RouteTarget{
+						{
+							ID:               "scenario-target-1",
+							AccountID:        "provider-1",
+							UpstreamModel:    "shared-route-bg",
+							Weight:           1,
+							Enabled:          true,
+							MarkupMultiplier: 1,
+						},
+						{
+							ID:               "scenario-target-2",
+							AccountID:        "provider-2",
+							UpstreamModel:    "shared-route-bg",
+							Weight:           1,
+							Enabled:          true,
+							MarkupMultiplier: 1,
+						},
+					},
+				}},
+				Targets: []model.RouteTarget{
+					{
+						ID:               "target-2",
+						AccountID:        "provider-1",
+						UpstreamModel:    "shared-route",
+						Weight:           1,
+						Enabled:          true,
+						MarkupMultiplier: 1,
+					},
+					{
+						ID:               "target-3",
+						AccountID:        "provider-2",
+						UpstreamModel:    "shared-route",
+						Weight:           1,
+						Enabled:          true,
+						MarkupMultiplier: 1,
+					},
+				},
+			},
+		},
+		PricingProfiles: []model.PricingProfile{
+			{ID: "pricing-sync-integration-1-gpt-5-4", Name: "managed"},
+			{ID: "manual-profile", Name: "manual"},
+		},
+		GatewayKeys: []model.GatewayKey{{
+			ID:            "gk-1",
+			Name:          "gateway",
+			SecretPreview: "uag-12...abcd",
+			Enabled:       true,
+			AllowedModels: []string{"gpt-5.4", "shared-route"},
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/integrations/integration-1", nil)
+	req.SetPathValue("id", "integration-1")
+	recorder := httptest.NewRecorder()
+	handlers.DeleteIntegration(recorder, req)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("expected delete integration to succeed, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	if len(saved.Integrations) != 0 {
+		t.Fatalf("expected integration to be removed, got %+v", saved.Integrations)
+	}
+	if _, ok := saved.FindProvider("provider-1"); ok {
+		t.Fatalf("expected linked provider to be removed, got %+v", saved.Providers)
+	}
+	if _, ok := saved.FindRoute("gpt-5.4"); ok {
+		t.Fatalf("expected orphaned route to be removed, got %+v", saved.ModelRoutes)
+	}
+	shared, ok := saved.FindRoute("shared-route")
+	if !ok {
+		t.Fatal("expected shared route to remain")
+	}
+	if len(shared.Targets) != 1 || shared.Targets[0].AccountID != "provider-2" {
+		t.Fatalf("expected shared route to retain only non-linked provider targets, got %+v", shared.Targets)
+	}
+	if len(shared.Scenarios) != 1 || len(shared.Scenarios[0].Targets) != 1 || shared.Scenarios[0].Targets[0].AccountID != "provider-2" {
+		t.Fatalf("expected shared route scenario targets to drop linked provider, got %+v", shared.Scenarios)
+	}
+	if _, ok := saved.FindPricingProfile("pricing-sync-integration-1-gpt-5-4"); ok {
+		t.Fatalf("expected managed pricing profile to be removed, got %+v", saved.PricingProfiles)
+	}
+	if len(saved.GatewayKeys) != 1 || len(saved.GatewayKeys[0].AllowedModels) != 1 || saved.GatewayKeys[0].AllowedModels[0] != "shared-route" {
+		t.Fatalf("expected gateway key model allow-list to drop removed route alias, got %+v", saved.GatewayKeys)
+	}
+}
+
 func TestCreateRouteRejectsInvalidStrategy(t *testing.T) {
 	t.Parallel()
 
@@ -243,6 +471,26 @@ func TestCreateRouteRejectsInvalidStrategy(t *testing.T) {
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected bad request for invalid route strategy, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCreateRouteRejectsInvalidTransformer(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/routes", strings.NewReader(`{
+		"alias":"gpt-5.4",
+		"targets":[],
+		"transformers":[{"phase":"request","type":"set_json","target":""}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.CreateRoute(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for invalid route transformer, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -1025,6 +1273,7 @@ func TestBuildOpenAPISpecCoversAdminRoutes(t *testing.T) {
 		"/api/admin/stats/by-model",
 		"/api/admin/openapi.json",
 		"/api/admin/maintenance/probes",
+		"/api/admin/maintenance/pricing-sync",
 	}
 	for _, path := range required {
 		if _, ok := paths[path]; !ok {

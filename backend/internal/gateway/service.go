@@ -16,9 +16,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	netproxy "golang.org/x/net/proxy"
 
 	"github.com/KoinaAI/conduit/backend/internal/billing"
 	"github.com/KoinaAI/conduit/backend/internal/config"
@@ -33,6 +39,9 @@ type Service struct {
 	transport       *http.Transport
 	websocketDialer *websocket.Dialer
 	runtime         *runtimeState
+	proxyMu         sync.Mutex
+	proxyClients    map[string]*http.Client
+	proxyDialers    map[string]*websocket.Dialer
 }
 
 type resolvedCandidate struct {
@@ -45,23 +54,28 @@ type resolvedCandidate struct {
 	multiplier   float64
 	gatewayKeyID string
 	sessionID    string
+	scenario     string
 }
 
 type parsedProxyRequest struct {
 	routeAlias  string
 	stream      bool
 	rawBody     []byte
+	rawQuery    string
 	jsonPayload map[string]any
 	sessionID   string
+	scenario    string
 }
 
 type upstreamExchange struct {
-	Path          string
-	Body          []byte
-	Stream        bool
-	ResponseMode  responseMode
-	UpstreamModel string
-	PublicAlias   string
+	Path                string
+	Body                []byte
+	Stream              bool
+	ResponseMode        responseMode
+	UpstreamModel       string
+	PublicAlias         string
+	RequestHeaderSet    http.Header
+	RequestHeaderRemove []string
 }
 
 type responseMode string
@@ -76,6 +90,10 @@ const (
 )
 
 const (
+	headerCodexTurnState = "X-Codex-Turn-State"
+)
+
+const (
 	providerRoutingModeRoundRobin model.ProviderRoutingMode = "round-robin"
 	providerRoutingModeRandom     model.ProviderRoutingMode = "random"
 	providerRoutingModeFailover   model.ProviderRoutingMode = "failover"
@@ -86,6 +104,8 @@ type cancelReadCloser struct {
 	io.ReadCloser
 	cancel context.CancelFunc
 }
+
+var gatewayTracer = otel.Tracer("github.com/KoinaAI/conduit/backend/internal/gateway")
 
 func (c cancelReadCloser) Close() error {
 	err := c.ReadCloser.Close()
@@ -137,8 +157,35 @@ func NewService(cfg config.Config, store *store.FileStore) *Service {
 			HandshakeTimeout: 10 * time.Second,
 			NetDialContext:   (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		},
-		runtime: newRuntimeState(),
+		runtime:      newRuntimeState(newRedisStickyStore(cfg)),
+		proxyClients: map[string]*http.Client{},
+		proxyDialers: map[string]*websocket.Dialer{},
 	}
+}
+
+func (s *Service) Close() error {
+	if s == nil {
+		return nil
+	}
+	if s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
+	s.proxyMu.Lock()
+	for _, client := range s.proxyClients {
+		if client != nil {
+			if transport, ok := client.Transport.(*http.Transport); ok {
+				transport.CloseIdleConnections()
+			}
+		}
+	}
+	s.proxyMu.Unlock()
+	type closer interface {
+		Close() error
+	}
+	if stickyStore, ok := s.runtime.stickyStore.(closer); ok {
+		return stickyStore.Close()
+	}
+	return nil
 }
 
 // HandleModels serves GET /v1/models and filters aliases by the authenticated
@@ -174,22 +221,43 @@ func (s *Service) HandleModels(w http.ResponseWriter, r *http.Request) {
 // ProxyHTTP handles all HTTP-based gateway protocols.
 func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
 		reqBody, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("failed to read request body: %v", err))
 			return
 		}
-		defer r.Body.Close()
 
 		parsedRequest, err := parseProxyRequest(protocol, r, reqBody)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		responseTurnState := codexResponseTurnState(protocol, r.Header)
+		ctx, requestSpan := gatewayTracer.Start(r.Context(), "gateway.proxy_http",
+			trace.WithAttributes(
+				attribute.String("gateway.protocol", string(protocol)),
+				attribute.String("http.method", r.Method),
+				attribute.String("http.route", r.URL.Path),
+				attribute.String("gateway.route_alias", parsedRequest.routeAlias),
+			),
+		)
+		defer requestSpan.End()
+		if parsedRequest.sessionID != "" {
+			requestSpan.SetAttributes(attribute.String("gateway.session_id", parsedRequest.sessionID))
+		}
+		if parsedRequest.scenario != "" {
+			requestSpan.SetAttributes(attribute.String("gateway.requested_scenario", parsedRequest.scenario))
+		}
+		r = r.WithContext(ctx)
 
 		state := s.store.RoutingSnapshot()
+		_, authSpan := gatewayTracer.Start(ctx, "gateway.authenticate")
 		gatewayKey, err := s.authenticateGatewayRequest(state, r.Header, protocol, parsedRequest.routeAlias, gatewayRequestSource(r))
+		authSpan.End()
 		if err != nil {
+			requestSpan.RecordError(err)
+			requestSpan.SetStatus(codes.Error, err.Error())
 			writeGatewayAuthError(w, err)
 			return
 		}
@@ -198,8 +266,16 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			s.runtime.releaseGatewayKey(gatewayKey.ID, finalCost)
 		}()
 
-		candidates, route, pricing, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, gatewayKey.ID, parsedRequest.sessionID)
+		_, planSpan := gatewayTracer.Start(ctx, "gateway.route_plan")
+		candidates, route, pricing, appliedScenario, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, gatewayKey.ID, parsedRequest.sessionID, parsedRequest.scenario)
+		planSpan.SetAttributes(attribute.Int("gateway.candidate_count", len(candidates)))
+		if appliedScenario != "" {
+			planSpan.SetAttributes(attribute.String("gateway.scenario", appliedScenario))
+		}
+		planSpan.End()
 		if err != nil {
+			requestSpan.RecordError(err)
+			requestSpan.SetStatus(codes.Error, err.Error())
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -215,7 +291,10 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			StartedAt:       started,
 			Stream:          parsedRequest.stream,
 		}
-		record.RoutingDecision = newRoutingDecision(route, gatewayKey.ID, parsedRequest.sessionID, candidates, s.runtime, started)
+		if record.ClientSessionID == "" && responseTurnState != "" {
+			record.ClientSessionID = responseTurnState
+		}
+		record.RoutingDecision = newRoutingDecision(route, appliedScenario, gatewayKey.ID, parsedRequest.sessionID, candidates, s.runtime, started)
 		logger := slog.With(
 			"request_id", record.ID,
 			"protocol", protocol,
@@ -228,8 +307,31 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 		var lastStatusCode int
 
 		for index, candidate := range candidates {
+			attemptCtx, attemptSpan := gatewayTracer.Start(ctx, "gateway.upstream_attempt",
+				trace.WithAttributes(
+					attribute.Int("gateway.attempt", index+1),
+					attribute.String("gateway.provider_id", candidate.provider.ID),
+					attribute.String("gateway.endpoint_id", candidate.endpoint.ID),
+					attribute.String("gateway.credential_id", candidate.credential.ID),
+				),
+			)
 			exchange, err := prepareUpstreamExchange(protocol, candidate.provider.Kind, r.URL.Path, parsedRequest, effectiveUpstreamModel(candidate))
 			if err != nil {
+				attemptSpan.RecordError(err)
+				attemptSpan.SetStatus(codes.Error, err.Error())
+				attemptSpan.End()
+				requestSpan.RecordError(err)
+				requestSpan.SetStatus(codes.Error, err.Error())
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			exchange, err = applyRequestTransformers(exchange, candidate)
+			if err != nil {
+				attemptSpan.RecordError(err)
+				attemptSpan.SetStatus(codes.Error, err.Error())
+				attemptSpan.End()
+				requestSpan.RecordError(err)
+				requestSpan.SetStatus(codes.Error, err.Error())
 				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
@@ -237,8 +339,11 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			candidate.sessionID = parsedRequest.sessionID
 
 			attemptStarted := time.Now().UTC()
-			resp, err := s.doProxyRequest(r.Context(), candidate, exchange, r.Method, r.Header)
+			resp, err := s.doProxyRequest(attemptCtx, candidate, exchange, r.Method, r.Header, parsedRequest.rawQuery)
 			if err != nil {
+				attemptSpan.RecordError(err)
+				attemptSpan.SetStatus(codes.Error, err.Error())
+				attemptSpan.End()
 				lastErr = err
 				attempts = append(attempts, model.RequestAttemptRecord{
 					RequestID:     record.ID,
@@ -268,7 +373,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 						"backoff_ms", backoff.Milliseconds(),
 						"error", err,
 					)
-					sleepBackoff(0, index+1)
+					sleepBackoff(ctx, 0, index+1)
 					continue
 				}
 				appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "abort", true, 0, 0, err)
@@ -276,10 +381,14 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			}
 
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				attemptSpan.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
 				_ = resp.Body.Close()
 				lastStatusCode = resp.StatusCode
 				lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+				attemptSpan.RecordError(lastErr)
+				attemptSpan.SetStatus(codes.Error, lastErr.Error())
+				attemptSpan.End()
 				retryable := isRetryableStatus(resp.StatusCode)
 				retryAfter := parseRetryAfter(resp.Header)
 				attempts = append(attempts, model.RequestAttemptRecord{
@@ -311,7 +420,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 						"backoff_ms", backoff.Milliseconds(),
 						"error", lastErr,
 					)
-					sleepBackoff(resp.StatusCode, index+1)
+					sleepBackoff(ctx, resp.StatusCode, index+1)
 					continue
 				}
 				appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, nextDecision(retryable, false), retryable, resp.StatusCode, 0, lastErr)
@@ -327,10 +436,20 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			observer := NewUsageObserver(protocol)
 			observer.ObserveRequestBody(exchange.Body)
 			setBillingTrailers(w.Header())
-			writeRoutingMetadata(w.Header(), route, candidate, time.Since(attemptStarted), parsedRequest.sessionID)
-			writeErr := s.writeProxyResponse(w, resp, observer, exchange, parsedRequest.routeAlias)
+			routingSessionID := parsedRequest.sessionID
+			if routingSessionID == "" && responseTurnState != "" {
+				routingSessionID = responseTurnState
+			}
+			writeRoutingMetadata(w.Header(), route, candidate, time.Since(attemptStarted), routingSessionID, appliedScenario)
+			if responseTurnState != "" {
+				w.Header().Set(headerCodexTurnState, responseTurnState)
+			}
+			writeErr := s.writeProxyResponse(w, resp, observer, exchange, parsedRequest.routeAlias, candidate.route.Transformers, candidate)
 			_ = resp.Body.Close()
 			if writeErr != nil {
+				attemptSpan.RecordError(writeErr)
+				attemptSpan.SetStatus(codes.Error, writeErr.Error())
+				attemptSpan.End()
 				lastErr = writeErr
 				retryable := !responseWriteStarted(writeErr)
 				hasNext := index < len(candidates)-1
@@ -364,7 +483,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 						"backoff_ms", backoff.Milliseconds(),
 						"error", writeErr,
 					)
-					sleepBackoff(0, index+1)
+					sleepBackoff(ctx, 0, index+1)
 					continue
 				}
 				appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, nextDecision(retryable, false), retryable, http.StatusBadGateway, 0, writeErr)
@@ -375,7 +494,15 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			record.Usage = observer.Summary()
 			record.Billing = billing.Calculate(pricing, record.Usage, candidate.multiplier, pricing.Name)
 			finalCost = record.Billing.FinalCost
+			attemptSpan.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+			attemptSpan.End()
 			appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "success", false, resp.StatusCode, 0, nil)
+			requestSpan.SetAttributes(
+				attribute.String("gateway.provider_id", candidate.provider.ID),
+				attribute.String("gateway.endpoint_id", candidate.endpoint.ID),
+				attribute.Int("gateway.attempt_count", index+1),
+				attribute.Float64("gateway.final_cost", record.Billing.FinalCost),
+			)
 			writeBillingMetadata(w.Header(), record)
 			attempts = append(attempts, model.RequestAttemptRecord{
 				RequestID:     record.ID,
@@ -393,6 +520,9 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 				DurationMS:    time.Since(attemptStarted).Milliseconds(),
 			})
 			s.runtime.reportSuccess(candidate, time.Since(attemptStarted))
+			if responseTurnState != "" && responseTurnState != parsedRequest.sessionID {
+				s.runtime.bindStickyCandidate(candidate, responseTurnState, time.Now().UTC())
+			}
 			logger.Info("gateway request completed",
 				"provider_id", candidate.provider.ID,
 				"endpoint_id", candidate.endpoint.ID,
@@ -425,6 +555,10 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			"error", record.Error,
 		)
 		s.appendRecord(record, attempts)
+		if lastErr != nil {
+			requestSpan.RecordError(lastErr)
+			requestSpan.SetStatus(codes.Error, lastErr.Error())
+		}
 		if responseWriteStarted(lastErr) {
 			return
 		}
@@ -439,10 +573,32 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "model query parameter is required")
 		return
 	}
+	sessionID := extractRealtimeSessionID(r)
+	scenario := extractRealtimeScenario(r)
+	ctx, requestSpan := gatewayTracer.Start(r.Context(), "gateway.proxy_realtime",
+		trace.WithAttributes(
+			attribute.String("gateway.protocol", string(model.ProtocolOpenAIRealtime)),
+			attribute.String("http.method", r.Method),
+			attribute.String("http.route", r.URL.Path),
+			attribute.String("gateway.route_alias", routeAlias),
+		),
+	)
+	defer requestSpan.End()
+	if sessionID != "" {
+		requestSpan.SetAttributes(attribute.String("gateway.session_id", sessionID))
+	}
+	if scenario != "" {
+		requestSpan.SetAttributes(attribute.String("gateway.requested_scenario", scenario))
+	}
+	r = r.WithContext(ctx)
 
 	state := s.store.RoutingSnapshot()
+	_, authSpan := gatewayTracer.Start(ctx, "gateway.authenticate")
 	gatewayKey, err := s.authenticateGatewayRequest(state, r.Header, model.ProtocolOpenAIRealtime, routeAlias, gatewayRequestSource(r))
+	authSpan.End()
 	if err != nil {
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
 		writeGatewayAuthError(w, err)
 		return
 	}
@@ -451,8 +607,16 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		s.runtime.releaseGatewayKey(gatewayKey.ID, finalCost)
 	}()
 
-	candidates, route, pricing, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, gatewayKey.ID, "")
+	_, planSpan := gatewayTracer.Start(ctx, "gateway.route_plan")
+	candidates, route, pricing, appliedScenario, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, gatewayKey.ID, sessionID, scenario)
+	planSpan.SetAttributes(attribute.Int("gateway.candidate_count", len(candidates)))
+	if appliedScenario != "" {
+		planSpan.SetAttributes(attribute.String("gateway.scenario", appliedScenario))
+	}
+	planSpan.End()
 	if err != nil {
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -463,6 +627,8 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	candidate := candidates[0]
 	upstreamURL, err := joinProxyURL(candidate.endpoint.BaseURL, "/v1/realtime")
 	if err != nil {
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -476,8 +642,15 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	query.Set("model", effectiveUpstreamModel(candidate))
 	upstreamURL.RawQuery = query.Encode()
 
+	dialer, err := s.websocketDialerForProvider(candidate.provider)
+	if err != nil {
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
 	upgrader := websocket.Upgrader{CheckOrigin: s.allowRealtimeOrigin}
-	clientConn, err := upgrader.Upgrade(w, r, routingMetadataHeader(route, candidate, 0, ""))
+	clientConn, err := upgrader.Upgrade(w, r, routingMetadataHeader(route, candidate, 0, sessionID, appliedScenario))
 	if err != nil {
 		return
 	}
@@ -497,8 +670,10 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		headers.Set(key, value)
 	}
 
-	serverConn, _, err := s.websocketDialer.DialContext(r.Context(), upstreamURL.String(), headers)
+	serverConn, _, err := dialer.DialContext(ctx, upstreamURL.String(), headers)
 	if err != nil {
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
 		_ = clientConn.WriteJSON(map[string]any{"type": "error", "error": err.Error()})
 		return
 	}
@@ -508,18 +683,19 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	started := time.Now().UTC()
 	observer := NewUsageObserver(model.ProtocolOpenAIRealtime)
 	record := model.RequestRecord{
-		ID:            model.NewID("req"),
-		Protocol:      model.ProtocolOpenAIRealtime,
-		RouteAlias:    routeAlias,
-		AccountID:     candidate.provider.ID,
-		ProviderName:  candidate.provider.Name,
-		UpstreamModel: effectiveUpstreamModel(candidate),
-		GatewayKeyID:  gatewayKey.ID,
-		StatusCode:    http.StatusSwitchingProtocols,
-		StartedAt:     started,
-		Stream:        true,
+		ID:              model.NewID("req"),
+		Protocol:        model.ProtocolOpenAIRealtime,
+		RouteAlias:      routeAlias,
+		AccountID:       candidate.provider.ID,
+		ProviderName:    candidate.provider.Name,
+		UpstreamModel:   effectiveUpstreamModel(candidate),
+		GatewayKeyID:    gatewayKey.ID,
+		ClientSessionID: sessionID,
+		StatusCode:      http.StatusSwitchingProtocols,
+		StartedAt:       started,
+		Stream:          true,
 	}
-	record.RoutingDecision = newRoutingDecision(route, gatewayKey.ID, "", candidates, s.runtime, started)
+	record.RoutingDecision = newRoutingDecision(route, appliedScenario, gatewayKey.ID, sessionID, candidates, s.runtime, started)
 	logger := slog.With(
 		"request_id", record.ID,
 		"protocol", model.ProtocolOpenAIRealtime,
@@ -546,9 +722,16 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	record.Usage = observer.Summary()
 	record.Billing = billing.Calculate(pricing, record.Usage, candidate.multiplier, pricing.Name)
 	finalCost = record.Billing.FinalCost
+	requestSpan.SetAttributes(
+		attribute.String("gateway.provider_id", candidate.provider.ID),
+		attribute.String("gateway.endpoint_id", candidate.endpoint.ID),
+		attribute.Float64("gateway.final_cost", record.Billing.FinalCost),
+	)
 	appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, 1, "success", false, http.StatusSwitchingProtocols, 0, nil)
 	if err != nil && !isNormalClose(err) {
 		record.Error = err.Error()
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
 		logger.Warn("gateway realtime session closed with error",
 			"duration_ms", record.DurationMS,
 			"input_tokens", record.Usage.InputTokens,
@@ -584,10 +767,13 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
-func (s *Service) doProxyRequest(ctx context.Context, candidate resolvedCandidate, exchange upstreamExchange, method string, incoming http.Header) (*http.Response, error) {
+func (s *Service) doProxyRequest(ctx context.Context, candidate resolvedCandidate, exchange upstreamExchange, method string, incoming http.Header, rawQuery string) (*http.Response, error) {
 	upstreamURL, err := joinProxyURL(candidate.endpoint.BaseURL, exchange.Path)
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(rawQuery) != "" {
+		upstreamURL.RawQuery = rawQuery
 	}
 
 	timeout := time.Duration(candidate.provider.TimeoutSeconds) * time.Second
@@ -612,10 +798,24 @@ func (s *Service) doProxyRequest(ctx context.Context, candidate resolvedCandidat
 	for key, value := range candidate.credential.Headers {
 		req.Header.Set(key, value)
 	}
+	for _, key := range exchange.RequestHeaderRemove {
+		req.Header.Del(key)
+	}
+	for key, values := range exchange.RequestHeaderSet {
+		req.Header.Del(key)
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 	req.Header.Del("Content-Length")
 	req.ContentLength = int64(len(exchange.Body))
 
-	resp, err := s.httpClient.Do(req)
+	client, err := s.httpClientForProvider(candidate.provider)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -625,6 +825,109 @@ func (s *Service) doProxyRequest(ctx context.Context, candidate resolvedCandidat
 		cancel:     cancel,
 	}
 	return resp, nil
+}
+
+func (s *Service) httpClientForProvider(provider model.Provider) (*http.Client, error) {
+	rawProxyURL := strings.TrimSpace(provider.ProxyURL)
+	if rawProxyURL == "" {
+		return s.httpClient, nil
+	}
+
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+
+	if client := s.proxyClients[rawProxyURL]; client != nil {
+		return client, nil
+	}
+	transport, err := transportWithProxy(s.transport, rawProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Transport: transport}
+	s.proxyClients[rawProxyURL] = client
+	return client, nil
+}
+
+func (s *Service) websocketDialerForProvider(provider model.Provider) (*websocket.Dialer, error) {
+	rawProxyURL := strings.TrimSpace(provider.ProxyURL)
+	if rawProxyURL == "" {
+		return s.websocketDialer, nil
+	}
+
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+
+	if dialer := s.proxyDialers[rawProxyURL]; dialer != nil {
+		return dialer, nil
+	}
+	dialer, err := dialerWithProxy(s.websocketDialer, rawProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	s.proxyDialers[rawProxyURL] = dialer
+	return dialer, nil
+}
+
+func transportWithProxy(base *http.Transport, rawProxyURL string) (*http.Transport, error) {
+	proxyURL, err := url.Parse(strings.TrimSpace(rawProxyURL))
+	if err != nil {
+		return nil, fmt.Errorf("invalid provider proxy url: %w", err)
+	}
+	transport := base.Clone()
+	switch strings.ToLower(strings.TrimSpace(proxyURL.Scheme)) {
+	case "http", "https":
+		transport.Proxy = http.ProxyURL(proxyURL)
+		return transport, nil
+	case "socks5", "socks5h":
+		dialContext, err := proxyDialContext(proxyURL)
+		if err != nil {
+			return nil, err
+		}
+		transport.Proxy = nil
+		transport.DialContext = dialContext
+		return transport, nil
+	default:
+		return nil, fmt.Errorf("provider proxy url must use http, https, socks5, or socks5h")
+	}
+}
+
+func dialerWithProxy(base *websocket.Dialer, rawProxyURL string) (*websocket.Dialer, error) {
+	proxyURL, err := url.Parse(strings.TrimSpace(rawProxyURL))
+	if err != nil {
+		return nil, fmt.Errorf("invalid provider proxy url: %w", err)
+	}
+	dialer := *base
+	switch strings.ToLower(strings.TrimSpace(proxyURL.Scheme)) {
+	case "http", "https":
+		dialer.Proxy = http.ProxyURL(proxyURL)
+		return &dialer, nil
+	case "socks5", "socks5h":
+		dialContext, err := proxyDialContext(proxyURL)
+		if err != nil {
+			return nil, err
+		}
+		dialer.Proxy = nil
+		dialer.NetDialContext = dialContext
+		return &dialer, nil
+	default:
+		return nil, fmt.Errorf("provider proxy url must use http, https, socks5, or socks5h")
+	}
+}
+
+func proxyDialContext(proxyURL *url.URL) (func(context.Context, string, string) (net.Conn, error), error) {
+	dialer, err := netproxy.FromURL(proxyURL, &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("invalid provider proxy url: %w", err)
+	}
+	type contextDialer interface {
+		DialContext(context.Context, string, string) (net.Conn, error)
+	}
+	if contextDialer, ok := dialer.(contextDialer); ok {
+		return contextDialer.DialContext, nil
+	}
+	return func(_ context.Context, network, address string) (net.Conn, error) {
+		return dialer.Dial(network, address)
+	}, nil
 }
 
 func (s *Service) appendRecord(record model.RequestRecord, attempts []model.RequestAttemptRecord) {
@@ -676,7 +979,15 @@ func (s *Service) RunProbes(ctx context.Context) map[string]any {
 				continue
 			}
 
-			resp, err := s.httpClient.Do(req)
+			client, err := s.httpClientForProvider(provider)
+			if err != nil {
+				result["status"] = "error"
+				result["error"] = err.Error()
+				results = append(results, result)
+				continue
+			}
+
+			resp, err := client.Do(req)
 			durationMS := time.Since(started).Milliseconds()
 			result["duration_ms"] = durationMS
 			result["credential_id"] = credential.ID
@@ -705,11 +1016,12 @@ func (s *Service) RunProbes(ctx context.Context) map[string]any {
 	}
 }
 
-func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, protocol model.Protocol, gatewayKeyID, sessionID string) ([]resolvedCandidate, model.ModelRoute, model.PricingProfile, error) {
+func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, protocol model.Protocol, gatewayKeyID, sessionID, scenario string) ([]resolvedCandidate, model.ModelRoute, model.PricingProfile, string, error) {
 	route, ok := state.FindRoute(alias)
 	if !ok {
-		return nil, model.ModelRoute{}, model.PricingProfile{}, fmt.Errorf("route %q is not configured", alias)
+		return nil, model.ModelRoute{}, model.PricingProfile{}, "", fmt.Errorf("route %q is not configured", alias)
 	}
+	route, scenario = applyRouteScenario(route, scenario)
 	profile, ok := state.FindPricingProfile(route.PricingProfileID)
 	if !ok {
 		profile = model.PricingProfile{
@@ -752,6 +1064,7 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 					multiplier:   multiplier,
 					gatewayKeyID: gatewayKeyID,
 					sessionID:    sessionID,
+					scenario:     scenario,
 				}
 				if s.runtime.endpointOpen(candidate, now) || s.runtime.credentialCoolingDown(candidate, now) {
 					degraded = append(degraded, candidate)
@@ -762,7 +1075,7 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 		}
 	}
 	if len(healthy) == 0 && len(degraded) == 0 {
-		return nil, model.ModelRoute{}, model.PricingProfile{}, fmt.Errorf("route %q has no enabled provider for protocol %s", alias, protocol)
+		return nil, model.ModelRoute{}, model.PricingProfile{}, "", fmt.Errorf("route %q has no enabled provider for protocol %s", alias, protocol)
 	}
 
 	candidates := healthy
@@ -771,7 +1084,7 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 	}
 	candidates = s.orderCandidatePlan(route, protocol, candidates)
 
-	if binding, ok := s.runtime.stickyBindingFor(gatewayKeyID, alias, sessionID, now); ok {
+	if binding, ok := s.runtime.stickyBindingFor(gatewayKeyID, stickyRouteKey(alias, scenario), sessionID, now); ok {
 		for index, candidate := range candidates {
 			if candidate.provider.ID == binding.ProviderID && candidate.endpoint.ID == binding.EndpointID && candidate.credential.ID == binding.CredentialID {
 				if index > 0 {
@@ -793,9 +1106,44 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 		providerAttempts[candidate.provider.ID]++
 	}
 	if len(filteredCandidates) == 0 {
-		return nil, model.ModelRoute{}, model.PricingProfile{}, fmt.Errorf("route %q has no candidate within provider retry budgets", alias)
+		return nil, model.ModelRoute{}, model.PricingProfile{}, "", fmt.Errorf("route %q has no candidate within provider retry budgets", alias)
 	}
-	return filteredCandidates, route, profile, nil
+	return filteredCandidates, route, profile, scenario, nil
+}
+
+func applyRouteScenario(route model.ModelRoute, requested string) (model.ModelRoute, string) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return route, ""
+	}
+	for _, scenario := range route.Scenarios {
+		if !strings.EqualFold(strings.TrimSpace(scenario.Name), requested) {
+			continue
+		}
+		if len(scenario.Targets) == 0 {
+			return route, strings.TrimSpace(scenario.Name)
+		}
+		effective := route
+		effective.Targets = make([]model.RouteTarget, len(scenario.Targets))
+		for index, target := range scenario.Targets {
+			target.Protocols = append([]model.Protocol(nil), target.Protocols...)
+			effective.Targets[index] = target
+		}
+		if canonical := scenario.Strategy.Canonical(); canonical != "" {
+			effective.Strategy = canonical
+		}
+		return effective, strings.TrimSpace(scenario.Name)
+	}
+	return route, ""
+}
+
+func stickyRouteKey(alias, scenario string) string {
+	alias = strings.TrimSpace(alias)
+	scenario = strings.TrimSpace(scenario)
+	if scenario == "" {
+		return alias
+	}
+	return alias + "\x00" + scenario
 }
 
 type candidateGroup struct {
@@ -1154,12 +1502,17 @@ func nextDecision(retryable, hasNext bool) string {
 	}
 }
 
-func sleepBackoff(statusCode, retryIndex int) {
+func sleepBackoff(ctx context.Context, statusCode, retryIndex int) {
 	delay := retryBackoffDelay(statusCode, retryIndex)
 	if delay <= 0 {
 		return
 	}
-	time.Sleep(delay)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
 }
 
 func retryBackoffDelay(statusCode, retryIndex int) time.Duration {
@@ -1213,7 +1566,7 @@ func writeGatewayAuthError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusTooManyRequests, err.Error())
 	case errAuthLocked:
 		writeError(w, http.StatusTooManyRequests, err.Error())
-	case errDailyBudget:
+	case errHourlyBudget, errDailyBudget, errWeeklyBudget, errMonthlyBudget:
 		writeError(w, http.StatusPaymentRequired, err.Error())
 	default:
 		writeError(w, http.StatusUnauthorized, errUnauthorized.Error())
@@ -1237,6 +1590,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func parseProxyRequest(protocol model.Protocol, r *http.Request, body []byte) (parsedProxyRequest, error) {
 	sessionID := extractClientSessionID(r.Header, body)
+	scenario := extractRoutingScenario(r.Header, body)
 	switch protocol {
 	case model.ProtocolGeminiGenerate, model.ProtocolGeminiStream:
 		alias, err := extractGeminiModelFromPath(r.URL.Path)
@@ -1247,7 +1601,9 @@ func parseProxyRequest(protocol model.Protocol, r *http.Request, body []byte) (p
 			routeAlias: alias,
 			stream:     protocol == model.ProtocolGeminiStream,
 			rawBody:    body,
+			rawQuery:   r.URL.RawQuery,
 			sessionID:  sessionID,
+			scenario:   scenario,
 		}, nil
 	default:
 		if len(body) == 0 {
@@ -1269,13 +1625,18 @@ func parseProxyRequest(protocol model.Protocol, r *http.Request, body []byte) (p
 			routeAlias:  modelValue,
 			stream:      stream,
 			rawBody:     body,
+			rawQuery:    r.URL.RawQuery,
 			jsonPayload: payload,
 			sessionID:   sessionID,
+			scenario:    scenario,
 		}, nil
 	}
 }
 
 func extractClientSessionID(headers http.Header, body []byte) string {
+	if value := extractCodexTurnState(headers); value != "" {
+		return value
+	}
 	for _, headerName := range []string{"X-Session-ID", "Session-ID"} {
 		if value := strings.TrimSpace(headers.Get(headerName)); value != "" {
 			return value
@@ -1305,6 +1666,84 @@ func extractClientSessionID(headers http.Header, body []byte) string {
 		}
 	}
 	return ""
+}
+
+func extractRealtimeSessionID(r *http.Request) string {
+	if value := extractCodexTurnState(r.Header); value != "" {
+		return value
+	}
+	for _, headerName := range []string{"X-Session-ID", "Session-ID"} {
+		if value := strings.TrimSpace(r.Header.Get(headerName)); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"session_id", "conversation_id", "thread_id", "chat_id", "prompt_cache_key", "previous_response_id"} {
+		if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func extractRoutingScenario(headers http.Header, body []byte) string {
+	for _, headerName := range []string{"X-Routing-Scenario", "Routing-Scenario"} {
+		if value := strings.TrimSpace(headers.Get(headerName)); value != "" {
+			return value
+		}
+	}
+	if len(body) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	for _, key := range []string{"routing_scenario", "scenario"} {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	if metadata, ok := payload["metadata"].(map[string]any); ok {
+		for _, key := range []string{"routing_scenario", "scenario"} {
+			if value, ok := metadata[key].(string); ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return ""
+}
+
+func extractRealtimeScenario(r *http.Request) string {
+	for _, headerName := range []string{"X-Routing-Scenario", "Routing-Scenario"} {
+		if value := strings.TrimSpace(r.Header.Get(headerName)); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"routing_scenario", "scenario"} {
+		if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func extractCodexTurnState(headers http.Header) string {
+	for _, headerName := range []string{headerCodexTurnState, "Codex-Turn-State"} {
+		if value := strings.TrimSpace(headers.Get(headerName)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func codexResponseTurnState(protocol model.Protocol, headers http.Header) string {
+	if protocol != model.ProtocolOpenAIResponses {
+		return ""
+	}
+	if value := extractCodexTurnState(headers); value != "" {
+		return value
+	}
+	return model.NewID("cts")
 }
 
 func extractGeminiModelFromPath(path string) (string, error) {
@@ -1419,12 +1858,15 @@ func copyStreamingResponse(w http.ResponseWriter, body io.Reader, observer *Usag
 			if _, writeErr := w.Write(line); writeErr != nil {
 				return writeErr
 			}
-			if flusher != nil {
+			if flusher != nil && len(bytes.TrimSpace(line)) == 0 {
 				flusher.Flush()
 			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if flusher != nil {
+					flusher.Flush()
+				}
 				return nil
 			}
 			return err

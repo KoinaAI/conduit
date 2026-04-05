@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -45,11 +46,15 @@ type stickyBinding struct {
 	ExpiresAt    time.Time
 }
 
+type gatewaySpendEvent struct {
+	At      time.Time
+	CostUSD float64
+}
+
 type gatewayKeyWindow struct {
 	MinuteBucket time.Time
 	RequestCount int
-	DailyBucket  time.Time
-	DailyCostUSD float64
+	SpendEvents  []gatewaySpendEvent
 	InFlight     int
 }
 
@@ -70,6 +75,7 @@ type runtimeState struct {
 	endpoints             map[string]*endpointRuntimeState
 	credentials           map[string]*credentialRuntimeState
 	sticky                map[string]stickyBinding
+	stickyStore           stickyBindingStore
 	stickyWrites          int
 	keyWindows            map[string]*gatewayKeyWindow
 	roundRobin            map[string]uint64
@@ -78,11 +84,16 @@ type runtimeState struct {
 	authWrites            int
 }
 
-func newRuntimeState() *runtimeState {
+func newRuntimeState(stickyStore ...stickyBindingStore) *runtimeState {
+	var currentStickyStore stickyBindingStore
+	if len(stickyStore) > 0 {
+		currentStickyStore = stickyStore[0]
+	}
 	return &runtimeState{
 		endpoints:             map[string]*endpointRuntimeState{},
 		credentials:           map[string]*credentialRuntimeState{},
 		sticky:                map[string]stickyBinding{},
+		stickyStore:           currentStickyStore,
 		keyWindows:            map[string]*gatewayKeyWindow{},
 		roundRobin:            map[string]uint64{},
 		invalidGatewayLookups: map[string]invalidGatewayLookupState{},
@@ -128,10 +139,10 @@ func (r *runtimeState) credentialCoolingDown(candidate resolvedCandidate, now ti
 }
 
 func (r *runtimeState) reportSuccess(candidate resolvedCandidate, latency time.Duration) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	now := time.Now().UTC()
+	var stickyWrite stickyWrite
+
+	r.mu.Lock()
 	endpoint := r.endpointState(endpointRuntimeKey(candidate))
 	endpoint.LastLatencyMS = latency.Milliseconds()
 	endpoint.ConsecutiveFailures = 0
@@ -147,20 +158,52 @@ func (r *runtimeState) reportSuccess(candidate resolvedCandidate, latency time.D
 	credential.LastStatusCode = 200
 	credential.LastError = ""
 
-	if candidate.sessionID == "" {
-		return
+	stickyWrite = r.bindStickyLocked(candidate, candidate.sessionID, now)
+	r.mu.Unlock()
+
+	r.persistStickyWrite(stickyWrite)
+}
+
+func (r *runtimeState) bindStickyCandidate(candidate resolvedCandidate, sessionID string, now time.Time) {
+	r.mu.Lock()
+	stickyWrite := r.bindStickyLocked(candidate, sessionID, now)
+	r.mu.Unlock()
+	r.persistStickyWrite(stickyWrite)
+}
+
+type stickyWrite struct {
+	Key     string
+	Binding stickyBinding
+}
+
+func (r *runtimeState) bindStickyLocked(candidate resolvedCandidate, sessionID string, now time.Time) stickyWrite {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return stickyWrite{}
 	}
 
-	r.sticky[r.stickyKey(candidate.gatewayKeyID, candidate.route.Alias, candidate.sessionID)] = stickyBinding{
+	key := r.stickyKey(candidate.gatewayKeyID, stickyRouteKey(candidate.route.Alias, candidate.scenario), sessionID)
+	binding := stickyBinding{
 		ProviderID:   candidate.provider.ID,
 		EndpointID:   candidate.endpoint.ID,
 		CredentialID: candidate.credential.ID,
 		ExpiresAt:    now.Add(time.Duration(candidate.provider.StickySessionTTLSeconds) * time.Second),
 	}
+	r.sticky[key] = binding
 	r.stickyWrites++
 	if r.stickyWrites >= defaultStickySweepInterval {
 		r.sweepExpiredStickyLocked(now)
 		r.stickyWrites = 0
+	}
+	return stickyWrite{Key: key, Binding: binding}
+}
+
+func (r *runtimeState) persistStickyWrite(write stickyWrite) {
+	if r.stickyStore == nil || strings.TrimSpace(write.Key) == "" {
+		return
+	}
+	if err := r.stickyStore.SaveStickyBinding(write.Key, write.Binding); err != nil {
+		slog.Warn("gateway sticky binding cache write failed", "key", write.Key, "error", err)
 	}
 }
 
@@ -210,18 +253,36 @@ func (r *runtimeState) stickyBindingFor(gatewayKeyID, alias, sessionID string, n
 	if strings.TrimSpace(sessionID) == "" {
 		return stickyBinding{}, false
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	key := r.stickyKey(gatewayKeyID, alias, sessionID)
+
+	r.mu.Lock()
 	binding, ok := r.sticky[key]
+	if ok {
+		if !binding.ExpiresAt.After(now) {
+			delete(r.sticky, key)
+			r.mu.Unlock()
+			r.deleteRemoteStickyBinding(key)
+			return stickyBinding{}, false
+		}
+		r.mu.Unlock()
+		return binding, true
+	}
+	r.mu.Unlock()
+
+	if r.stickyStore == nil {
+		return stickyBinding{}, false
+	}
+	binding, ok, err := r.stickyStore.LoadStickyBinding(key, now)
+	if err != nil {
+		slog.Warn("gateway sticky binding cache read failed", "key", key, "error", err)
+		return stickyBinding{}, false
+	}
 	if !ok {
 		return stickyBinding{}, false
 	}
-	if !binding.ExpiresAt.After(now) {
-		delete(r.sticky, key)
-		return stickyBinding{}, false
-	}
+	r.mu.Lock()
+	r.sticky[key] = binding
+	r.mu.Unlock()
 	return binding, true
 }
 
@@ -230,6 +291,15 @@ func (r *runtimeState) sweepExpiredStickyLocked(now time.Time) {
 		if !binding.ExpiresAt.After(now) {
 			delete(r.sticky, key)
 		}
+	}
+}
+
+func (r *runtimeState) deleteRemoteStickyBinding(key string) {
+	if r.stickyStore == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	if err := r.stickyStore.DeleteStickyBinding(key); err != nil {
+		slog.Warn("gateway sticky binding cache delete failed", "key", key, "error", err)
 	}
 }
 
@@ -248,11 +318,8 @@ func (r *runtimeState) acquireGatewayKey(key model.GatewayKey, now time.Time) er
 		window.MinuteBucket = minuteBucket
 		window.RequestCount = 0
 	}
-	dailyBucket := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	if window.DailyBucket.IsZero() || !window.DailyBucket.Equal(dailyBucket) {
-		window.DailyBucket = dailyBucket
-		window.DailyCostUSD = 0
-	}
+	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
+	hourlyCost, dailyCost, weeklyCost, monthlyCost := gatewaySpendTotals(window.SpendEvents, now)
 
 	if key.RateLimitRPM > 0 && window.RequestCount >= key.RateLimitRPM {
 		return errRateLimit
@@ -260,8 +327,17 @@ func (r *runtimeState) acquireGatewayKey(key model.GatewayKey, now time.Time) er
 	if key.MaxConcurrency > 0 && window.InFlight >= key.MaxConcurrency {
 		return errConcurrencyLimit
 	}
-	if key.DailyBudgetUSD > 0 && window.DailyCostUSD >= key.DailyBudgetUSD {
+	if key.HourlyBudgetUSD > 0 && hourlyCost >= key.HourlyBudgetUSD {
+		return errHourlyBudget
+	}
+	if key.DailyBudgetUSD > 0 && dailyCost >= key.DailyBudgetUSD {
 		return errDailyBudget
+	}
+	if key.WeeklyBudgetUSD > 0 && weeklyCost >= key.WeeklyBudgetUSD {
+		return errWeeklyBudget
+	}
+	if key.MonthlyBudgetUSD > 0 && monthlyCost >= key.MonthlyBudgetUSD {
+		return errMonthlyBudget
 	}
 
 	window.RequestCount++
@@ -281,8 +357,47 @@ func (r *runtimeState) releaseGatewayKey(keyID string, costUSD float64) {
 		window.InFlight--
 	}
 	if costUSD > 0 {
-		window.DailyCostUSD += costUSD
+		window.SpendEvents = append(pruneGatewaySpendEvents(window.SpendEvents, time.Now().UTC()), gatewaySpendEvent{
+			At:      time.Now().UTC(),
+			CostUSD: costUSD,
+		})
 	}
+}
+
+func pruneGatewaySpendEvents(events []gatewaySpendEvent, now time.Time) []gatewaySpendEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	cutoff := now.Add(-30 * 24 * time.Hour)
+	trimmed := events[:0]
+	for _, event := range events {
+		if !event.At.Before(cutoff) {
+			trimmed = append(trimmed, event)
+		}
+	}
+	if len(trimmed) == 0 {
+		return nil
+	}
+	return trimmed
+}
+
+func gatewaySpendTotals(events []gatewaySpendEvent, now time.Time) (hourly, daily, weekly, monthly float64) {
+	for _, event := range events {
+		age := now.Sub(event.At)
+		if age <= time.Hour {
+			hourly += event.CostUSD
+		}
+		if age <= 24*time.Hour {
+			daily += event.CostUSD
+		}
+		if age <= 7*24*time.Hour {
+			weekly += event.CostUSD
+		}
+		if age <= 30*24*time.Hour {
+			monthly += event.CostUSD
+		}
+	}
+	return hourly, daily, weekly, monthly
 }
 
 func (r *runtimeState) gatewayAuthSourceLocked(source string, now time.Time) bool {

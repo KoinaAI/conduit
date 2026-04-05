@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/gateway"
 	"github.com/KoinaAI/conduit/backend/internal/integration"
 	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/pricing"
 	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
@@ -26,6 +28,7 @@ type Handlers struct {
 	cfg         config.Config
 	store       *store.FileStore
 	integration *integration.Service
+	pricing     *pricing.Service
 	gateway     *gateway.Service
 }
 
@@ -41,6 +44,7 @@ func New(cfg config.Config, store *store.FileStore, integration *integration.Ser
 		cfg:         cfg,
 		store:       store,
 		integration: integration,
+		pricing:     pricing.NewService(cfg.PricingCatalogURL, nil),
 		gateway:     currentGateway,
 	}
 }
@@ -98,9 +102,11 @@ func (h *Handlers) PutState(w http.ResponseWriter, r *http.Request) {
 // GetMeta serves lightweight control-plane metadata.
 func (h *Handlers) GetMeta(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enable_realtime": h.cfg.EnableRealtime,
-		"server_time":     time.Now().UTC(),
-		"openapi_url":     "/api/admin/openapi.json",
+		"enable_realtime":      h.cfg.EnableRealtime,
+		"pricing_sync_enabled": h.cfg.PricingSyncEnabled,
+		"pricing_catalog_url":  strings.TrimSpace(h.cfg.PricingCatalogURL),
+		"server_time":          time.Now().UTC(),
+		"openapi_url":          "/api/admin/openapi.json",
 	})
 }
 
@@ -260,6 +266,10 @@ func (h *Handlers) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	if err := validateProviderProxyURL(payload.ProxyURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	if payload.ID == "" {
 		payload.ID = model.NewID("provider")
 	}
@@ -296,6 +306,10 @@ func (h *Handlers) UpdateProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	if err := validateProviderProxyURL(payload.ProxyURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	payload.ID = id
 	saved, err := h.updateState(func(state *model.State) error {
 		for index := range state.Providers {
@@ -327,24 +341,7 @@ func (h *Handlers) DeleteProvider(w http.ResponseWriter, r *http.Request) {
 		if len(state.Providers) == before {
 			return errNotFound("provider")
 		}
-		removedAliases := map[string]struct{}{}
-		filteredRoutes := state.ModelRoutes[:0]
-		for _, route := range state.ModelRoutes {
-			filteredTargets := route.Targets[:0]
-			for _, target := range route.Targets {
-				if target.AccountID != id {
-					filteredTargets = append(filteredTargets, target)
-				}
-			}
-			route.Targets = filteredTargets
-			if len(route.Targets) == 0 {
-				removedAliases[strings.ToLower(strings.TrimSpace(route.Alias))] = struct{}{}
-				continue
-			}
-			filteredRoutes = append(filteredRoutes, route)
-		}
-		state.ModelRoutes = filteredRoutes
-		removeGatewayKeyModelReferences(state.GatewayKeys, removedAliases)
+		removeProviderReferences(state, id)
 		return nil
 	})
 	if err != nil {
@@ -369,7 +366,7 @@ func (h *Handlers) CreateRoute(w http.ResponseWriter, r *http.Request) {
 	saved, err := h.updateState(func(state *model.State) error {
 		payload.Alias = strings.TrimSpace(payload.Alias)
 		if !validateRouteStrategy(&payload) {
-			return errValidation("strategy must be one of priority-weight, latency, round-robin, random, failover")
+			return errValidation("route strategy or transformers are invalid")
 		}
 		if err := validateRouteAlias(state.ModelRoutes, payload.Alias, ""); err != nil {
 			return err
@@ -408,7 +405,7 @@ func (h *Handlers) UpdateRoute(w http.ResponseWriter, r *http.Request) {
 		payload.Alias = strings.TrimSpace(alias)
 	}
 	if !validateRouteStrategy(&payload) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "strategy must be one of priority-weight, latency, round-robin, random, failover"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "route strategy or transformers are invalid"})
 		return
 	}
 	saved, err := h.updateState(func(state *model.State) error {
@@ -418,6 +415,9 @@ func (h *Handlers) UpdateRoute(w http.ResponseWriter, r *http.Request) {
 		for index := range state.ModelRoutes {
 			if !strings.EqualFold(state.ModelRoutes[index].Alias, alias) {
 				continue
+			}
+			if len(payload.Scenarios) == 0 {
+				payload.Scenarios = state.ModelRoutes[index].Scenarios
 			}
 			state.ModelRoutes[index] = payload
 			return nil
@@ -603,8 +603,12 @@ func (h *Handlers) DeleteIntegration(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	_, err := h.updateState(func(state *model.State) error {
 		before := len(state.Integrations)
+		linkedProviderID := ""
 		filtered := state.Integrations[:0]
 		for _, integration := range state.Integrations {
+			if integration.ID == id {
+				linkedProviderID = strings.TrimSpace(integration.LinkedProviderID)
+			}
 			if integration.ID != id {
 				filtered = append(filtered, integration)
 			}
@@ -613,6 +617,11 @@ func (h *Handlers) DeleteIntegration(w http.ResponseWriter, r *http.Request) {
 		if len(state.Integrations) == before {
 			return errNotFound("integration")
 		}
+		if linkedProviderID != "" {
+			state.Providers = slicesDeleteProvider(state.Providers, linkedProviderID)
+			removeProviderReferences(state, linkedProviderID)
+		}
+		removeIntegrationPricingProfiles(state, id)
 		return nil
 	})
 	if err != nil {
@@ -639,7 +648,10 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		AllowedProtocols []model.Protocol `json:"allowed_protocols"`
 		MaxConcurrency   int              `json:"max_concurrency"`
 		RateLimitRPM     int              `json:"rate_limit_rpm"`
+		HourlyBudgetUSD  float64          `json:"hourly_budget_usd"`
 		DailyBudgetUSD   float64          `json:"daily_budget_usd"`
+		WeeklyBudgetUSD  float64          `json:"weekly_budget_usd"`
+		MonthlyBudgetUSD float64          `json:"monthly_budget_usd"`
 		Notes            string           `json:"notes"`
 	}
 	if err := decodeJSONBody(w, r, &payload); err != nil {
@@ -680,7 +692,10 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		AllowedProtocols: payload.AllowedProtocols,
 		MaxConcurrency:   payload.MaxConcurrency,
 		RateLimitRPM:     payload.RateLimitRPM,
+		HourlyBudgetUSD:  payload.HourlyBudgetUSD,
 		DailyBudgetUSD:   payload.DailyBudgetUSD,
+		WeeklyBudgetUSD:  payload.WeeklyBudgetUSD,
+		MonthlyBudgetUSD: payload.MonthlyBudgetUSD,
 		Notes:            payload.Notes,
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -715,7 +730,10 @@ func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		AllowedProtocols json.RawMessage `json:"allowed_protocols"`
 		MaxConcurrency   *int            `json:"max_concurrency"`
 		RateLimitRPM     *int            `json:"rate_limit_rpm"`
+		HourlyBudgetUSD  *float64        `json:"hourly_budget_usd"`
 		DailyBudgetUSD   *float64        `json:"daily_budget_usd"`
+		WeeklyBudgetUSD  *float64        `json:"weekly_budget_usd"`
+		MonthlyBudgetUSD *float64        `json:"monthly_budget_usd"`
 		Notes            *string         `json:"notes"`
 	}
 	if err := decodeJSONBody(w, r, &payload); err != nil {
@@ -767,8 +785,17 @@ func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
 			if payload.RateLimitRPM != nil {
 				current.RateLimitRPM = *payload.RateLimitRPM
 			}
+			if payload.HourlyBudgetUSD != nil {
+				current.HourlyBudgetUSD = *payload.HourlyBudgetUSD
+			}
 			if payload.DailyBudgetUSD != nil {
 				current.DailyBudgetUSD = *payload.DailyBudgetUSD
+			}
+			if payload.WeeklyBudgetUSD != nil {
+				current.WeeklyBudgetUSD = *payload.WeeklyBudgetUSD
+			}
+			if payload.MonthlyBudgetUSD != nil {
+				current.MonthlyBudgetUSD = *payload.MonthlyBudgetUSD
 			}
 			if payload.Notes != nil {
 				current.Notes = *payload.Notes
@@ -917,6 +944,16 @@ func (h *Handlers) ProbeAllProviders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// SyncPricingCatalog executes a managed pricing catalog refresh.
+func (h *Handlers) SyncPricingCatalog(w http.ResponseWriter, r *http.Request) {
+	result := h.RunPricingSync(r.Context())
+	if errValue, ok := result["error"].(string); ok && errValue != "" {
+		writeJSON(w, http.StatusBadGateway, result)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 // RunCheckins executes background daily check-ins.
 func (h *Handlers) RunCheckins(ctx context.Context) {
 	now := time.Now().UTC()
@@ -942,6 +979,47 @@ func (h *Handlers) RunProbes(ctx context.Context) map[string]any {
 		}
 	}
 	return h.gateway.RunProbes(ctx)
+}
+
+// RunPricingSync refreshes managed pricing profiles from the configured public catalog.
+func (h *Handlers) RunPricingSync(ctx context.Context) map[string]any {
+	if h.pricing == nil || !h.pricing.Enabled() {
+		return map[string]any{
+			"checked_at": time.Now().UTC(),
+			"profiles":   0,
+			"error":      "pricing catalog is not configured",
+		}
+	}
+
+	result := h.pricing.PrepareSync(ctx)
+	if result.Err != nil {
+		return map[string]any{
+			"checked_at": result.FinishedAt,
+			"source_url": result.SourceURL,
+			"profiles":   len(result.Profiles),
+			"error":      result.Err.Error(),
+		}
+	}
+
+	saved, err := h.store.Update(func(state *model.State) error {
+		pricing.ApplySyncResult(state, result)
+		return nil
+	})
+	if err != nil {
+		return map[string]any{
+			"checked_at": result.FinishedAt,
+			"source_url": result.SourceURL,
+			"profiles":   len(result.Profiles),
+			"error":      err.Error(),
+		}
+	}
+
+	return map[string]any{
+		"checked_at": result.FinishedAt,
+		"source_url": result.SourceURL,
+		"profiles":   len(result.Profiles),
+		"state":      saved,
+	}
 }
 
 func (h *Handlers) updateState(mutate func(*model.State) error) (model.State, error) {
@@ -989,6 +1067,9 @@ func mergeCompatibilityState(current, next *model.State) {
 		if len(nextProvider.Credentials) == 0 {
 			nextProvider.Credentials = currentProvider.Credentials
 		}
+		if strings.TrimSpace(nextProvider.ProxyURL) == "" {
+			nextProvider.ProxyURL = currentProvider.ProxyURL
+		}
 		if nextProvider.RoutingMode == "" {
 			nextProvider.RoutingMode = currentProvider.RoutingMode
 		}
@@ -1011,9 +1092,12 @@ func mergeCompatibilityState(current, next *model.State) {
 		}
 		if canonical := nextRoute.Strategy.Canonical(); canonical != "" {
 			nextRoute.Strategy = canonical
-			continue
+		} else {
+			nextRoute.Strategy = currentRoute.Strategy
 		}
-		nextRoute.Strategy = currentRoute.Strategy
+		if len(nextRoute.Scenarios) == 0 {
+			nextRoute.Scenarios = currentRoute.Scenarios
+		}
 	}
 	for nextIntegrationIndex := range next.Integrations {
 		nextIntegration := &next.Integrations[nextIntegrationIndex]
@@ -1022,6 +1106,9 @@ func mergeCompatibilityState(current, next *model.State) {
 			continue
 		}
 		*nextIntegration = preserveIntegrationSecrets(currentIntegration, *nextIntegration)
+		if !nextIntegration.AutoSyncPricingProfiles {
+			nextIntegration.AutoSyncPricingProfiles = currentIntegration.AutoSyncPricingProfiles
+		}
 	}
 	next.Normalize()
 }
@@ -1113,6 +1200,9 @@ func buildOpenAPISpec() map[string]any {
 			},
 			"/api/admin/maintenance/probes": map[string]any{
 				"post": map[string]any{"summary": "Probe all provider endpoints"},
+			},
+			"/api/admin/maintenance/pricing-sync": map[string]any{
+				"post": map[string]any{"summary": "Refresh managed pricing profiles from the public catalog"},
 			},
 			"/api/admin/openapi.json": map[string]any{
 				"get": map[string]any{"summary": "OpenAPI document"},
@@ -1219,6 +1309,9 @@ func sanitizeGatewayKey(key model.GatewayKey) model.GatewayKey {
 func preserveProviderSecrets(current, next model.Provider) model.Provider {
 	if strings.TrimSpace(next.APIKey) == "" {
 		next.APIKey = current.APIKey
+	}
+	if strings.TrimSpace(next.ProxyURL) == "" {
+		next.ProxyURL = current.ProxyURL
 	}
 	if len(next.Endpoints) == 0 {
 		next.Endpoints = current.Endpoints
@@ -1336,15 +1429,69 @@ func validateRouteStrategy(route *model.ModelRoute) bool {
 	if route == nil {
 		return false
 	}
-	if route.Strategy == "" {
-		return true
+	if route.Strategy != "" {
+		canonical := route.Strategy.Canonical()
+		if canonical == "" {
+			return false
+		}
+		route.Strategy = canonical
 	}
-	canonical := route.Strategy.Canonical()
-	if canonical == "" {
-		return false
+	for index := range route.Scenarios {
+		scenario := &route.Scenarios[index]
+		scenario.Name = strings.TrimSpace(scenario.Name)
+		if scenario.Name == "" {
+			return false
+		}
+		if scenario.Strategy == "" {
+			continue
+		}
+		canonical := scenario.Strategy.Canonical()
+		if canonical == "" {
+			return false
+		}
+		scenario.Strategy = canonical
 	}
-	route.Strategy = canonical
+	for index := range route.Transformers {
+		transformer := &route.Transformers[index]
+		transformer.Name = strings.TrimSpace(transformer.Name)
+		transformer.Target = strings.TrimSpace(transformer.Target)
+		transformer.Phase = transformer.Phase.Canonical()
+		transformer.Type = transformer.Type.Canonical()
+		if transformer.Phase == "" || transformer.Type == "" {
+			return false
+		}
+		switch transformer.Type {
+		case model.TransformerTypeSetHeader, model.TransformerTypeRemoveHeader, model.TransformerTypeSetJSON, model.TransformerTypeDeleteJSON:
+			if transformer.Target == "" {
+				return false
+			}
+		case model.TransformerTypePrependMessage:
+			if transformer.Phase != model.TransformerPhaseRequest {
+				return false
+			}
+		}
+	}
 	return true
+}
+
+func validateProviderProxyURL(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("proxy_url must be a valid URL: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return errors.New("proxy_url must use http, https, socks5, or socks5h")
+	}
+	if strings.TrimSpace(parsed.Host) == "" {
+		return errors.New("proxy_url host is required")
+	}
+	return nil
 }
 
 func cloneMap(values map[string]any) map[string]any {
@@ -1479,6 +1626,77 @@ func removeGatewayKeyModelReferences(keys []model.GatewayKey, aliases map[string
 		if removedAny {
 			keys[keyIndex].AllowedModels = slices.Clone(filtered)
 			keys[keyIndex].UpdatedAt = updatedAt
+		}
+	}
+}
+
+func removeProviderReferences(state *model.State, providerID string) {
+	if state == nil || strings.TrimSpace(providerID) == "" {
+		return
+	}
+	removedAliases := map[string]struct{}{}
+	filteredRoutes := state.ModelRoutes[:0]
+	for _, route := range state.ModelRoutes {
+		filteredTargets := route.Targets[:0]
+		for _, target := range route.Targets {
+			if target.AccountID != providerID {
+				filteredTargets = append(filteredTargets, target)
+			}
+		}
+		route.Targets = filteredTargets
+		filteredScenarios := route.Scenarios[:0]
+		for _, scenario := range route.Scenarios {
+			scenarioTargets := scenario.Targets[:0]
+			for _, target := range scenario.Targets {
+				if target.AccountID != providerID {
+					scenarioTargets = append(scenarioTargets, target)
+				}
+			}
+			scenario.Targets = scenarioTargets
+			filteredScenarios = append(filteredScenarios, scenario)
+		}
+		route.Scenarios = filteredScenarios
+		routeHasScenarioTargets := false
+		for _, scenario := range route.Scenarios {
+			if len(scenario.Targets) > 0 {
+				routeHasScenarioTargets = true
+				break
+			}
+		}
+		if len(route.Targets) == 0 && !routeHasScenarioTargets {
+			removedAliases[strings.ToLower(strings.TrimSpace(route.Alias))] = struct{}{}
+			continue
+		}
+		filteredRoutes = append(filteredRoutes, route)
+	}
+	state.ModelRoutes = filteredRoutes
+	removeGatewayKeyModelReferences(state.GatewayKeys, removedAliases)
+}
+
+func removeIntegrationPricingProfiles(state *model.State, integrationID string) {
+	if state == nil {
+		return
+	}
+	prefix := "pricing-sync-" + strings.TrimSpace(integrationID) + "-"
+	if strings.TrimSpace(prefix) == "pricing-sync--" {
+		return
+	}
+	filtered := state.PricingProfiles[:0]
+	removedProfiles := map[string]struct{}{}
+	for _, profile := range state.PricingProfiles {
+		if strings.HasPrefix(profile.ID, prefix) {
+			removedProfiles[profile.ID] = struct{}{}
+			continue
+		}
+		filtered = append(filtered, profile)
+	}
+	state.PricingProfiles = filtered
+	if len(removedProfiles) == 0 {
+		return
+	}
+	for routeIndex := range state.ModelRoutes {
+		if _, removed := removedProfiles[state.ModelRoutes[routeIndex].PricingProfileID]; removed {
+			state.ModelRoutes[routeIndex].PricingProfileID = ""
 		}
 	}
 }

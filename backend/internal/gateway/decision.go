@@ -3,22 +3,24 @@ package gateway
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
-func newRoutingDecision(route model.ModelRoute, gatewayKeyID, sessionID string, candidates []resolvedCandidate, runtime *runtimeState, now time.Time) *model.RoutingDecision {
+func newRoutingDecision(route model.ModelRoute, scenario, gatewayKeyID, sessionID string, candidates []resolvedCandidate, runtime *runtimeState, now time.Time) *model.RoutingDecision {
 	if len(candidates) == 0 {
 		return nil
 	}
 	trace := &model.RoutingDecision{
 		Strategy:  effectiveRouteStrategy(route),
+		Scenario:  strings.TrimSpace(scenario),
 		SessionID: sessionID,
 		Events:    []model.RoutingDecisionEvent{},
 	}
 	trace.Candidates = make([]model.RoutingCandidate, 0, len(candidates))
-	stickyBinding, hasSticky := runtime.stickyBindingFor(gatewayKeyID, route.Alias, sessionID, now)
+	stickyBinding, hasSticky := runtime.stickyBindingFor(gatewayKeyID, stickyRouteKey(route.Alias, scenario), sessionID, now)
 	for _, candidate := range candidates {
 		sticky := hasSticky &&
 			candidate.provider.ID == stickyBinding.ProviderID &&
@@ -67,7 +69,7 @@ func appendRoutingEvent(trace *model.RoutingDecision, runtime *runtimeState, can
 	}
 }
 
-func writeRoutingMetadata(headers http.Header, route model.ModelRoute, candidate resolvedCandidate, latency time.Duration, sessionID string) {
+func writeRoutingMetadata(headers http.Header, route model.ModelRoute, candidate resolvedCandidate, latency time.Duration, sessionID, scenario string) {
 	headers.Set("X-Conduit-Route", route.Alias)
 	headers.Set("X-Conduit-Strategy", string(effectiveRouteStrategy(route)))
 	headers.Set("X-Conduit-Provider", candidate.provider.ID)
@@ -77,11 +79,14 @@ func writeRoutingMetadata(headers http.Header, route model.ModelRoute, candidate
 	if sessionID != "" {
 		headers.Set("X-Conduit-Session-Id", sessionID)
 	}
+	if strings.TrimSpace(scenario) != "" {
+		headers.Set("X-Conduit-Scenario", strings.TrimSpace(scenario))
+	}
 }
 
-func routingMetadataHeader(route model.ModelRoute, candidate resolvedCandidate, latency time.Duration, sessionID string) http.Header {
+func routingMetadataHeader(route model.ModelRoute, candidate resolvedCandidate, latency time.Duration, sessionID, scenario string) http.Header {
 	headers := http.Header{}
-	writeRoutingMetadata(headers, route, candidate, latency, sessionID)
+	writeRoutingMetadata(headers, route, candidate, latency, sessionID, scenario)
 	return headers
 }
 

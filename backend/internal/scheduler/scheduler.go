@@ -9,16 +9,18 @@ import (
 )
 
 type Service struct {
-	admin         *admin.Handlers
-	stop          chan struct{}
-	probeInterval time.Duration
+	admin           *admin.Handlers
+	stop            chan struct{}
+	probeInterval   time.Duration
+	pricingInterval time.Duration
 }
 
-func New(admin *admin.Handlers, probeInterval time.Duration) *Service {
+func New(admin *admin.Handlers, probeInterval, pricingInterval time.Duration) *Service {
 	return &Service{
-		admin:         admin,
-		stop:          make(chan struct{}),
-		probeInterval: probeInterval,
+		admin:           admin,
+		stop:            make(chan struct{}),
+		probeInterval:   probeInterval,
+		pricingInterval: pricingInterval,
 	}
 }
 
@@ -34,6 +36,14 @@ func (s *Service) Start(ctx context.Context) {
 		defer probeTicker.Stop()
 	}
 
+	var pricingTicker *time.Ticker
+	var pricingCh <-chan time.Time
+	if s.pricingInterval > 0 {
+		pricingTicker = time.NewTicker(s.pricingInterval)
+		pricingCh = pricingTicker.C
+		defer pricingTicker.Stop()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -47,6 +57,10 @@ func (s *Service) Start(ctx context.Context) {
 		case <-probeCh:
 			runSafely("probes", func() {
 				s.admin.RunProbes(ctx)
+			})
+		case <-pricingCh:
+			runSafely("pricing_sync", func() {
+				s.admin.RunPricingSync(ctx)
 			})
 		}
 	}

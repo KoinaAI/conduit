@@ -92,13 +92,12 @@ func (o *UsageObserver) Summary() model.UsageSummary {
 	if summary.TotalTokens == 0 {
 		summary.TotalTokens = summary.InputTokens + summary.OutputTokens
 	}
-	o.summary = summary
 	return summary
 }
 
 func (o *UsageObserver) mergeUsageMaps(body map[string]any) {
 	usageMaps := []map[string]any{}
-	collectUsageMaps(body, &usageMaps)
+	collectUsageMaps(body, &usageMaps, 0)
 	for _, usageMap := range usageMaps {
 		o.summary.InputTokens = maxInt64(o.summary.InputTokens, readTokenInt(usageMap, "prompt_tokens"), readTokenInt(usageMap, "input_tokens"), readTokenInt(usageMap, "promptTokenCount"))
 		o.summary.OutputTokens = maxInt64(o.summary.OutputTokens, readTokenInt(usageMap, "completion_tokens"), readTokenInt(usageMap, "output_tokens"), readTokenInt(usageMap, "candidatesTokenCount"))
@@ -112,7 +111,12 @@ func (o *UsageObserver) captureResponseTextLocked(body map[string]any) {
 	o.responseTextBytes += collectUsageTextByteCount(body)
 }
 
-func collectUsageMaps(current any, out *[]map[string]any) {
+const maxUsageMapDepth = 32
+
+func collectUsageMaps(current any, out *[]map[string]any, depth int) {
+	if depth > maxUsageMapDepth {
+		return
+	}
 	switch value := current.(type) {
 	case map[string]any:
 		for key, nested := range value {
@@ -121,11 +125,11 @@ func collectUsageMaps(current any, out *[]map[string]any) {
 					*out = append(*out, usageMap)
 				}
 			}
-			collectUsageMaps(nested, out)
+			collectUsageMaps(nested, out, depth+1)
 		}
 	case []any:
 		for _, nested := range value {
-			collectUsageMaps(nested, out)
+			collectUsageMaps(nested, out, depth+1)
 		}
 	}
 }

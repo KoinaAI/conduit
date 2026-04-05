@@ -12,9 +12,16 @@ import (
 // ConfigureDefaultLogger installs the process-wide slog default used by the
 // gateway. Text output is the default for local readability; JSON is available
 // for machine-ingested logs.
-func ConfigureDefaultLogger(cfg config.Config, writer io.Writer) *slog.Logger {
+func ConfigureDefaultLogger(cfg config.Config, writer io.Writer) (*slog.Logger, error) {
 	if writer == nil {
 		writer = os.Stdout
+		if strings.TrimSpace(cfg.LogFile) != "" {
+			rotating, err := newRotatingWriter(cfg.LogFile, cfg.LogMaxSizeMB, cfg.LogMaxBackups)
+			if err != nil {
+				return nil, err
+			}
+			writer = rotating
+		}
 	}
 	options := &slog.HandlerOptions{
 		Level: parseLevel(cfg.LogLevel),
@@ -27,7 +34,7 @@ func ConfigureDefaultLogger(cfg config.Config, writer io.Writer) *slog.Logger {
 	}
 	logger := slog.New(handler)
 	slog.SetDefault(logger)
-	return logger
+	return logger, nil
 }
 
 func parseLevel(value string) slog.Leveler {

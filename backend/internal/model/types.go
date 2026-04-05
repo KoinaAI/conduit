@@ -56,6 +56,23 @@ const (
 	RouteStrategyFailover       RouteStrategy = "failover"
 )
 
+type TransformerPhase string
+
+const (
+	TransformerPhaseRequest  TransformerPhase = "request"
+	TransformerPhaseResponse TransformerPhase = "response"
+)
+
+type TransformerType string
+
+const (
+	TransformerTypeSetHeader      TransformerType = "set_header"
+	TransformerTypeRemoveHeader   TransformerType = "remove_header"
+	TransformerTypeSetJSON        TransformerType = "set_json"
+	TransformerTypeDeleteJSON     TransformerType = "delete_json"
+	TransformerTypePrependMessage TransformerType = "prepend_message"
+)
+
 // State is the persisted configuration snapshot exposed to the admin console.
 //
 // It intentionally keeps the original top-level shape so the current frontend
@@ -90,6 +107,7 @@ type Provider struct {
 	BaseURL                 string               `json:"base_url"`
 	APIKey                  string               `json:"api_key"`
 	APIKeyPreview           string               `json:"api_key_preview,omitempty"`
+	ProxyURL                string               `json:"proxy_url,omitempty"`
 	Enabled                 bool                 `json:"enabled"`
 	Weight                  int                  `json:"weight"`
 	TimeoutSeconds          int                  `json:"timeout_seconds"`
@@ -145,11 +163,30 @@ type CircuitBreakerConfig struct {
 
 // ModelRoute maps one public alias to one or more upstream targets.
 type ModelRoute struct {
-	Alias            string        `json:"alias"`
-	Strategy         RouteStrategy `json:"strategy,omitempty"`
-	PricingProfileID string        `json:"pricing_profile_id,omitempty"`
-	Targets          []RouteTarget `json:"targets"`
-	Notes            string        `json:"notes,omitempty"`
+	Alias            string             `json:"alias"`
+	Strategy         RouteStrategy      `json:"strategy,omitempty"`
+	PricingProfileID string             `json:"pricing_profile_id,omitempty"`
+	Targets          []RouteTarget      `json:"targets"`
+	Scenarios        []RouteScenario    `json:"scenarios,omitempty"`
+	Transformers     []RouteTransformer `json:"transformers,omitempty"`
+	Notes            string             `json:"notes,omitempty"`
+}
+
+// RouteTransformer defines one ordered request/response mutation step.
+type RouteTransformer struct {
+	Name   string           `json:"name,omitempty"`
+	Phase  TransformerPhase `json:"phase"`
+	Type   TransformerType  `json:"type"`
+	Target string           `json:"target,omitempty"`
+	Value  any              `json:"value,omitempty"`
+}
+
+// RouteScenario overrides route targets and strategy for one named scenario.
+type RouteScenario struct {
+	Name     string        `json:"name"`
+	Strategy RouteStrategy `json:"strategy,omitempty"`
+	Targets  []RouteTarget `json:"targets"`
+	Notes    string        `json:"notes,omitempty"`
 }
 
 // RouteTarget points at a provider inventory item.
@@ -190,6 +227,7 @@ type Integration struct {
 	Enabled                 bool                `json:"enabled"`
 	LinkedProviderID        string              `json:"linked_provider_id,omitempty"`
 	AutoCreateRoutes        bool                `json:"auto_create_routes"`
+	AutoSyncPricingProfiles bool                `json:"auto_sync_pricing_profiles,omitempty"`
 	DefaultProtocols        []Protocol          `json:"default_protocols"`
 	DefaultMarkupMultiplier float64             `json:"default_markup_multiplier"`
 	ModelMarkupOverrides    map[string]float64  `json:"model_markup_overrides,omitempty"`
@@ -231,7 +269,10 @@ type GatewayKey struct {
 	AllowedProtocols []Protocol `json:"allowed_protocols,omitempty"`
 	MaxConcurrency   int        `json:"max_concurrency,omitempty"`
 	RateLimitRPM     int        `json:"rate_limit_rpm,omitempty"`
+	HourlyBudgetUSD  float64    `json:"hourly_budget_usd,omitempty"`
 	DailyBudgetUSD   float64    `json:"daily_budget_usd,omitempty"`
+	WeeklyBudgetUSD  float64    `json:"weekly_budget_usd,omitempty"`
+	MonthlyBudgetUSD float64    `json:"monthly_budget_usd,omitempty"`
 	Notes            string     `json:"notes,omitempty"`
 	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
@@ -281,6 +322,7 @@ type RequestRecord struct {
 // RoutingDecision captures how the gateway selected and retried upstream candidates.
 type RoutingDecision struct {
 	Strategy   RouteStrategy          `json:"strategy"`
+	Scenario   string                 `json:"scenario,omitempty"`
 	SessionID  string                 `json:"session_id,omitempty"`
 	Candidates []RoutingCandidate     `json:"candidates,omitempty"`
 	Selected   *RoutingCandidate      `json:"selected,omitempty"`
@@ -372,6 +414,7 @@ func (s *State) Normalize() {
 
 	for i := range s.Providers {
 		p := &s.Providers[i]
+		p.ProxyURL = strings.TrimSpace(p.ProxyURL)
 		if p.ID == "" {
 			p.ID = NewID("provider")
 		}
@@ -484,6 +527,45 @@ func (s *State) Normalize() {
 			}
 			if t.Protocols == nil {
 				t.Protocols = []Protocol{}
+			}
+		}
+		if r.Scenarios == nil {
+			r.Scenarios = []RouteScenario{}
+		}
+		if r.Transformers == nil {
+			r.Transformers = []RouteTransformer{}
+		}
+		for j := range r.Transformers {
+			transformer := &r.Transformers[j]
+			transformer.Name = strings.TrimSpace(transformer.Name)
+			transformer.Target = strings.TrimSpace(transformer.Target)
+			transformer.Phase = transformer.Phase.Canonical()
+			transformer.Type = transformer.Type.Canonical()
+			transformer.Value = cloneJSONValue(transformer.Value)
+		}
+		for j := range r.Scenarios {
+			scenario := &r.Scenarios[j]
+			scenario.Name = strings.TrimSpace(scenario.Name)
+			if canonical := scenario.Strategy.Canonical(); canonical != "" {
+				scenario.Strategy = canonical
+			}
+			if scenario.Targets == nil {
+				scenario.Targets = []RouteTarget{}
+			}
+			for k := range scenario.Targets {
+				target := &scenario.Targets[k]
+				if target.ID == "" {
+					target.ID = NewID("target")
+				}
+				if target.Weight <= 0 {
+					target.Weight = 1
+				}
+				if target.MarkupMultiplier <= 0 {
+					target.MarkupMultiplier = 1
+				}
+				if target.Protocols == nil {
+					target.Protocols = []Protocol{}
+				}
 			}
 		}
 	}
@@ -600,6 +682,34 @@ func (s RouteStrategy) Canonical() RouteStrategy {
 		return RouteStrategyRandom
 	case string(RouteStrategyFailover):
 		return RouteStrategyFailover
+	default:
+		return ""
+	}
+}
+
+func (p TransformerPhase) Canonical() TransformerPhase {
+	switch strings.ToLower(strings.TrimSpace(string(p))) {
+	case string(TransformerPhaseRequest):
+		return TransformerPhaseRequest
+	case string(TransformerPhaseResponse):
+		return TransformerPhaseResponse
+	default:
+		return ""
+	}
+}
+
+func (t TransformerType) Canonical() TransformerType {
+	switch strings.ToLower(strings.TrimSpace(string(t))) {
+	case string(TransformerTypeSetHeader):
+		return TransformerTypeSetHeader
+	case string(TransformerTypeRemoveHeader):
+		return TransformerTypeRemoveHeader
+	case string(TransformerTypeSetJSON):
+		return TransformerTypeSetJSON
+	case string(TransformerTypeDeleteJSON):
+		return TransformerTypeDeleteJSON
+	case string(TransformerTypePrependMessage):
+		return TransformerTypePrependMessage
 	default:
 		return ""
 	}
@@ -771,11 +881,35 @@ func (r ModelRoute) clone() ModelRoute {
 		targets[i] = target.clone()
 	}
 	r.Targets = targets
+	scenarios := make([]RouteScenario, len(r.Scenarios))
+	for i, scenario := range r.Scenarios {
+		scenarios[i] = scenario.clone()
+	}
+	r.Scenarios = scenarios
+	transformers := make([]RouteTransformer, len(r.Transformers))
+	for i, transformer := range r.Transformers {
+		transformers[i] = transformer.clone()
+	}
+	r.Transformers = transformers
 	return r
+}
+
+func (s RouteScenario) clone() RouteScenario {
+	targets := make([]RouteTarget, len(s.Targets))
+	for i, target := range s.Targets {
+		targets[i] = target.clone()
+	}
+	s.Targets = targets
+	return s
 }
 
 func (t RouteTarget) clone() RouteTarget {
 	t.Protocols = slices.Clone(t.Protocols)
+	return t
+}
+
+func (t RouteTransformer) clone() RouteTransformer {
+	t.Value = cloneJSONValue(t.Value)
 	return t
 }
 
@@ -810,6 +944,25 @@ func (d RoutingDecision) clone() RoutingDecision {
 		d.Selected = &selected
 	}
 	return d
+}
+
+func cloneJSONValue(value any) any {
+	switch current := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(current))
+		for key, item := range current {
+			cloned[key] = cloneJSONValue(item)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(current))
+		for index, item := range current {
+			cloned[index] = cloneJSONValue(item)
+		}
+		return cloned
+	default:
+		return current
+	}
 }
 
 func (s IntegrationSnapshot) clone() IntegrationSnapshot {

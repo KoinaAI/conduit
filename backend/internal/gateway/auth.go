@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"slices"
@@ -18,7 +19,10 @@ var (
 	errAuthLocked       = errors.New("too many failed authentication attempts")
 	errRateLimit        = errors.New("gateway key rpm limit exceeded")
 	errConcurrencyLimit = errors.New("gateway key concurrency limit exceeded")
+	errHourlyBudget     = errors.New("gateway key hourly budget exceeded")
 	errDailyBudget      = errors.New("gateway key daily budget exceeded")
+	errWeeklyBudget     = errors.New("gateway key weekly budget exceeded")
+	errMonthlyBudget    = errors.New("gateway key monthly budget exceeded")
 )
 
 type gatewayAuthContextKey struct{}
@@ -61,11 +65,23 @@ func gatewayRequestSource(r *http.Request) string {
 func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers http.Header, protocol model.Protocol, alias, source string) (model.GatewayKey, error) {
 	secret := extractGatewaySecret(headers)
 	if secret == "" {
+		slog.Warn("gateway authentication failed",
+			"reason", "missing_secret",
+			"source", source,
+			"protocol", protocol,
+			"route_alias", alias,
+		)
 		return model.GatewayKey{}, errUnauthorized
 	}
 	now := time.Now().UTC()
 	source = normalizeGatewayAuthSource(source)
 	if s.runtime.gatewayAuthSourceLocked(source, now) {
+		slog.Warn("gateway authentication blocked",
+			"reason", "source_locked",
+			"source", source,
+			"protocol", protocol,
+			"route_alias", alias,
+		)
 		return model.GatewayKey{}, errAuthLocked
 	}
 	lookupHash := model.GatewaySecretLookupHash(secret, s.cfg.SecretLookupPepper())
@@ -94,23 +110,57 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 	candidateFingerprint := gatewayAuthCandidateFingerprint(fastCandidates, legacyLookupCandidates, legacyCandidates)
 	if s.runtime.invalidGatewayLookupCached(lookupHash, candidateFingerprint, now) {
 		s.runtime.recordGatewayAuthFailure(source, lookupHash, candidateFingerprint, now)
+		slog.Warn("gateway authentication failed",
+			"reason", "cached_invalid_secret",
+			"source", source,
+			"protocol", protocol,
+			"route_alias", alias,
+		)
 		return model.GatewayKey{}, errUnauthorized
 	}
 
 	key, ok := findGatewayKeyMatch(secret, fastCandidates, legacyLookupCandidates, legacyCandidates)
 	if !ok {
 		s.runtime.recordGatewayAuthFailure(source, lookupHash, candidateFingerprint, now)
+		slog.Warn("gateway authentication failed",
+			"reason", "secret_mismatch",
+			"source", source,
+			"protocol", protocol,
+			"route_alias", alias,
+		)
 		return model.GatewayKey{}, errUnauthorized
 	}
 
 	s.runtime.clearGatewayAuthFailures(source, lookupHash)
 	if protocol != "" && !key.AllowsProtocol(protocol) {
+		slog.Warn("gateway authentication failed",
+			"reason", "protocol_denied",
+			"source", source,
+			"protocol", protocol,
+			"route_alias", alias,
+			"gateway_key_id", key.ID,
+		)
 		return model.GatewayKey{}, errUnauthorized
 	}
 	if alias != "" && !key.AllowsModel(alias) {
+		slog.Warn("gateway authentication failed",
+			"reason", "model_denied",
+			"source", source,
+			"protocol", protocol,
+			"route_alias", alias,
+			"gateway_key_id", key.ID,
+		)
 		return model.GatewayKey{}, errUnauthorized
 	}
 	if err := s.runtime.acquireGatewayKey(key, now); err != nil {
+		slog.Warn("gateway authentication failed",
+			"reason", "key_limits",
+			"source", source,
+			"protocol", protocol,
+			"route_alias", alias,
+			"gateway_key_id", key.ID,
+			"error", err,
+		)
 		return model.GatewayKey{}, err
 	}
 	return key, nil

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -88,6 +89,83 @@ func TestGatewayRequestSourceIgnoresSpoofedForwardHeaders(t *testing.T) {
 
 	if got := gatewayRequestSource(req); got != "198.51.100.7" {
 		t.Fatalf("expected remote addr to win over spoofed proxy headers, got %q", got)
+	}
+}
+
+func TestAcquireGatewayKeyEnforcesRollingBudgets(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 5, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		key    model.GatewayKey
+		events []gatewaySpendEvent
+		want   error
+	}{
+		{
+			name: "hourly",
+			key: model.GatewayKey{
+				ID:              "gk-hourly",
+				HourlyBudgetUSD: 5,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-30 * time.Minute), CostUSD: 5}},
+			want:   errHourlyBudget,
+		},
+		{
+			name: "daily",
+			key: model.GatewayKey{
+				ID:             "gk-daily",
+				DailyBudgetUSD: 10,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-23 * time.Hour), CostUSD: 10}},
+			want:   errDailyBudget,
+		},
+		{
+			name: "weekly",
+			key: model.GatewayKey{
+				ID:              "gk-weekly",
+				WeeklyBudgetUSD: 20,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-6 * 24 * time.Hour), CostUSD: 20}},
+			want:   errWeeklyBudget,
+		},
+		{
+			name: "monthly",
+			key: model.GatewayKey{
+				ID:               "gk-monthly",
+				MonthlyBudgetUSD: 30,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-29 * 24 * time.Hour), CostUSD: 30}},
+			want:   errMonthlyBudget,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			runtime := newRuntimeState()
+			runtime.keyWindows[tc.key.ID] = &gatewayKeyWindow{SpendEvents: tc.events}
+			if err := runtime.acquireGatewayKey(tc.key, now); !errors.Is(err, tc.want) {
+				t.Fatalf("expected %v, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestReleaseGatewayKeyAppendsRollingSpendEvent(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	runtime.keyWindows["gk-1"] = &gatewayKeyWindow{InFlight: 1}
+
+	runtime.releaseGatewayKey("gk-1", 1.25)
+
+	window := runtime.keyWindows["gk-1"]
+	if window.InFlight != 0 {
+		t.Fatalf("expected in-flight counter to be decremented, got %+v", window)
+	}
+	if len(window.SpendEvents) != 1 || window.SpendEvents[0].CostUSD != 1.25 {
+		t.Fatalf("expected rolling spend event to be recorded, got %+v", window.SpendEvents)
 	}
 }
 
@@ -197,16 +275,88 @@ func TestBuildCandidatePlanRouteStrategyRoundRobinRotatesProviderGroups(t *testi
 	}}
 	state.Normalize()
 
-	first, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "")
+	first, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "")
 	if err != nil {
 		t.Fatalf("build first candidate plan: %v", err)
 	}
-	second, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "")
+	second, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "")
 	if err != nil {
 		t.Fatalf("build second candidate plan: %v", err)
 	}
 	if first[0].provider.ID == second[0].provider.ID {
 		t.Fatalf("expected route strategy round-robin to rotate providers, got %s twice", first[0].provider.ID)
+	}
+}
+
+func TestBuildCandidatePlanAppliesScenarioOverride(t *testing.T) {
+	t.Parallel()
+
+	service := &Service{runtime: newRuntimeState()}
+	state := model.DefaultState()
+	state.Providers = []model.Provider{
+		{
+			ID:             "provider-primary",
+			Name:           "Primary",
+			Kind:           model.ProviderKindOpenAICompatible,
+			Enabled:        true,
+			RoutingMode:    model.ProviderRoutingModeWeighted,
+			MaxAttempts:    1,
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-primary",
+				BaseURL: "https://primary.example/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{ID: "cred-primary", APIKey: "key-primary", Enabled: true}},
+		},
+		{
+			ID:             "provider-background",
+			Name:           "Background",
+			Kind:           model.ProviderKindOpenAICompatible,
+			Enabled:        true,
+			RoutingMode:    model.ProviderRoutingModeWeighted,
+			MaxAttempts:    1,
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-background",
+				BaseURL: "https://background.example/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{ID: "cred-background", APIKey: "key-background", Enabled: true}},
+		},
+	}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{
+			{ID: "target-primary", AccountID: "provider-primary", Enabled: true, Weight: 1, MarkupMultiplier: 1},
+		},
+		Scenarios: []model.RouteScenario{{
+			Name:     "background",
+			Strategy: model.RouteStrategyFailover,
+			Targets: []model.RouteTarget{
+				{ID: "target-background", AccountID: "provider-background", Enabled: true, Weight: 1, MarkupMultiplier: 1},
+			},
+		}},
+	}}
+	state.Normalize()
+
+	candidates, route, _, appliedScenario, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "background")
+	if err != nil {
+		t.Fatalf("build scenario candidate plan: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].provider.ID != "provider-background" {
+		t.Fatalf("expected background scenario to swap targets, got %+v", candidates)
+	}
+	if route.Strategy != model.RouteStrategyFailover {
+		t.Fatalf("expected background scenario strategy to override route strategy, got %q", route.Strategy)
+	}
+	if candidates[0].scenario != "background" {
+		t.Fatalf("expected resolved candidate to retain scenario, got %+v", candidates[0])
+	}
+	if appliedScenario != "background" {
+		t.Fatalf("expected applied scenario to be returned, got %q", appliedScenario)
 	}
 }
 
@@ -258,7 +408,9 @@ func TestUsageObserverEstimatesUsageWhenUpstreamOmitsUsage(t *testing.T) {
 func TestUsageObserverLogsMalformedSSEPayloadAndKeepsLaterUsage(t *testing.T) {
 	var logBuffer bytes.Buffer
 	originalLogger := slog.Default()
-	observability.ConfigureDefaultLogger(config.Config{LogFormat: "text", LogLevel: "warn"}, &logBuffer)
+	if _, err := observability.ConfigureDefaultLogger(config.Config{LogFormat: "text", LogLevel: "warn"}, &logBuffer); err != nil {
+		t.Fatalf("configure logger: %v", err)
+	}
 	defer slog.SetDefault(originalLogger)
 
 	observer := NewUsageObserver(model.ProtocolOpenAIResponses)
@@ -272,6 +424,36 @@ func TestUsageObserverLogsMalformedSSEPayloadAndKeepsLaterUsage(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(logBuffer.String()), "malformed sse payload") {
 		t.Fatalf("expected malformed SSE payload to be logged, got %q", logBuffer.String())
+	}
+}
+
+func TestUsageObserverSummaryDoesNotFreezeEstimatedUsage(t *testing.T) {
+	t.Parallel()
+
+	observer := NewUsageObserver(model.ProtocolOpenAIChat)
+	observer.ObserveRequestBody([]byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"这是一段明显比真实 usage 更长的输入文本，用来触发估算"}]}`))
+	estimated := observer.Summary()
+	if estimated.InputTokens <= 1 {
+		t.Fatalf("expected initial usage summary to be estimated, got %+v", estimated)
+	}
+
+	observer.ObserveJSON([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	actual := observer.Summary()
+	if actual.InputTokens != 1 || actual.OutputTokens != 2 || actual.TotalTokens != 3 {
+		t.Fatalf("expected later upstream usage to override prior estimate, got %+v", actual)
+	}
+}
+
+func TestSleepBackoffReturnsWhenContextIsCanceled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	started := time.Now()
+	sleepBackoff(ctx, 0, 5)
+	if elapsed := time.Since(started); elapsed > 50*time.Millisecond {
+		t.Fatalf("expected canceled backoff to return immediately, took %v", elapsed)
 	}
 }
 
@@ -294,7 +476,7 @@ func mustGatewayKey(t *testing.T, id, secret, pepper string) model.GatewayKey {
 func mustBuildCandidatePlan(t *testing.T, service *Service, state model.State) []resolvedCandidate {
 	t.Helper()
 
-	candidates, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "")
+	candidates, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "")
 	if err != nil {
 		t.Fatalf("build candidate plan: %v", err)
 	}

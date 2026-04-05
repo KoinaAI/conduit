@@ -38,8 +38,11 @@ Conduit 当前支持以下常见请求面：
 
 - 将多个上游模型映射到统一别名
 - 为同一别名配置多个目标并进行路由选择
+- 支持 route transformer pipeline，可按顺序改写上游请求/下游响应的 header 与 JSON 字段
+- 支持场景路由、Codex turn-state 粘性路由与可选 Redis 会话缓存
 - 从 JSON、SSE、WebSocket 响应中提取 usage
 - 根据本地 Pricing Profile 计算成本
+- 支持公共价格目录同步与中转站价格同步
 - 保存请求历史和单次请求的 attempt 明细
 
 ### 管理面
@@ -59,11 +62,19 @@ Conduit 当前支持以下常见请求面：
 - 管理凭据与请求凭据分离
 - 集成同步
 - 签到调度
+- 公共价格目录定时同步
+
+### CLI 工具
+
+- 内置 `conduit-cli`
+- 支持健康检查、管理面统计查询、创建 Gateway Key、输出客户端环境变量
 
 ## 仓库结构
 
 - `backend/`
   Go 后端源码与单元测试。
+- `backend/cmd/conduit-cli/`
+  个人使用场景的命令行辅助工具。
 - `Dockerfile`
   后端容器镜像构建入口。
 - `.github/workflows/`
@@ -97,7 +108,7 @@ Conduit 可以理解成三层：
 2. 控制面
    负责管理 Provider、Route、Pricing Profile、Integration 与 Gateway Key。
 3. 持久化与后台任务
-   使用 SQLite 保存状态，并通过后台调度器执行签到、同步和探测任务。
+   使用 SQLite 或 PostgreSQL 保存状态，并通过后台调度器执行签到、同步和探测任务。
 
 关键代码入口：
 
@@ -204,12 +215,28 @@ docker login ghcr.io
   后端监听地址，默认 `:8080`。
 - `GATEWAY_STATE_PATH`
   SQLite 数据库路径。
+- `GATEWAY_DATABASE_URL`
+  可选 PostgreSQL 连接串；设置后优先于 `GATEWAY_STATE_PATH`。
 - `GATEWAY_ENABLE_REALTIME`
   是否启用 realtime 接口。
 - `GATEWAY_REQUEST_HISTORY`
   请求历史保留条数。
 - `GATEWAY_PROBE_INTERVAL_SECONDS`
   Provider 主动探测间隔秒数。
+- `GATEWAY_PRICING_SYNC_ENABLED`
+  是否启用公共价格目录定时同步。
+- `GATEWAY_PRICING_CATALOG_URL`
+  公共价格目录地址，默认使用 `https://models.dev/api.json`。
+- `GATEWAY_PRICING_SYNC_INTERVAL_SECONDS`
+  公共价格目录同步周期秒数。
+- `GATEWAY_REDIS_ADDR`
+  可选 Redis 地址，用于 sticky session 跨实例共享。
+- `GATEWAY_REDIS_PASSWORD`
+  可选 Redis 密码。
+- `GATEWAY_REDIS_DB`
+  Redis DB 序号。
+- `GATEWAY_REDIS_KEY_PREFIX`
+  Redis 键前缀。
 
 ### 服务器直接运行建议
 
@@ -231,12 +258,12 @@ docker login ghcr.io
 
 ### 数据存储建议
 
-Conduit 当前使用 SQLite 持久化状态，建议：
+Conduit 支持 SQLite 与 PostgreSQL：
 
-- 将数据库文件放在稳定的持久化卷中
-- 定期做冷备份
-- 升级前保留数据库快照
-- 不要把数据库文件和镜像层混在一起
+- 个人单机部署优先使用 SQLite，并将数据库文件放在稳定的持久化卷中
+- 如需接入现有数据库体系，可通过 `GATEWAY_DATABASE_URL` 切换到 PostgreSQL
+- SQLite 建议定期做冷备份，并在升级前保留数据库快照
+- 不要把持久化数据和镜像层混在一起
 
 ## 使用方式
 

@@ -213,9 +213,25 @@ func TestWriteAnthropicSSEReturnsErrorOnMalformedJSONEvent(t *testing.T) {
 	resp := &http.Response{
 		Body: io.NopCloser(strings.NewReader("data: {bad json}\n\n")),
 	}
-	err := writeAnthropicSSE(recorder, resp, NewUsageObserver(model.ProtocolOpenAIChat), "gpt-5.4")
+	err := writeAnthropicSSE(recorder, resp, NewUsageObserver(model.ProtocolOpenAIChat), "gpt-5.4", nil, resolvedCandidate{})
 	if err == nil || !responseWriteStarted(err) {
 		t.Fatalf("expected malformed SSE payload to fail after write start, got %v", err)
+	}
+}
+
+func TestWriteAnthropicSSEReturnsErrorOnEmptyStream(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	resp := &http.Response{
+		Body: io.NopCloser(strings.NewReader("")),
+	}
+	err := writeAnthropicSSE(recorder, resp, NewUsageObserver(model.ProtocolOpenAIChat), "gpt-5.4", nil, resolvedCandidate{})
+	if err == nil || !responseWriteStarted(err) {
+		t.Fatalf("expected empty SSE stream to fail after write start, got %v", err)
+	}
+	if strings.Contains(recorder.Body.String(), "message_start") {
+		t.Fatalf("did not expect empty upstream stream to fabricate anthropic events, got %q", recorder.Body.String())
 	}
 }
 
@@ -320,7 +336,7 @@ func TestBuildCandidatePlanRespectsPerProviderMaxAttempts(t *testing.T) {
 	})
 
 	service := &Service{runtime: newRuntimeState()}
-	candidates, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "")
+	candidates, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "")
 	if err != nil {
 		t.Fatalf("build candidate plan: %v", err)
 	}

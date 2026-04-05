@@ -17,6 +17,10 @@ import (
 	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/model"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Service struct {
@@ -59,6 +63,8 @@ type DailyCheckinResult struct {
 	IntegrationID string
 	Result        CheckinResult
 }
+
+var integrationTracer = otel.Tracer("github.com/KoinaAI/conduit/backend/internal/integration")
 
 func NewService(options ...Option) *Service {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -106,7 +112,21 @@ func (s *Service) ValidateBaseURL(baseURL string) error {
 }
 
 func (s *Service) PrepareSync(ctx context.Context, integration model.Integration) SyncResult {
+	ctx, span := integrationTracer.Start(ctx, "integration.prepare_sync",
+		trace.WithAttributes(
+			attribute.String("integration.id", integration.ID),
+			attribute.String("integration.kind", string(integration.Kind)),
+			attribute.String("integration.base_url", strings.TrimSpace(integration.BaseURL)),
+		),
+	)
+	defer span.End()
 	snapshot, err := s.sync(ctx, integration)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetAttributes(attribute.Int("integration.model_count", len(snapshot.ModelNames)))
+	}
 	return SyncResult{
 		Snapshot:   snapshot,
 		FinishedAt: time.Now().UTC(),
@@ -142,13 +162,28 @@ func (s *Service) ApplySyncResult(state *model.State, integrationID string, resu
 	if integration.AutoCreateRoutes {
 		ensureRoutes(state, integration, result.Snapshot)
 	}
+	if integration.AutoSyncPricingProfiles {
+		syncManagedPricingProfiles(state, integration, result.Snapshot)
+	}
 
 	state.Integrations[index] = integration
 	return result.Snapshot, nil
 }
 
 func (s *Service) PrepareCheckin(ctx context.Context, integration model.Integration) CheckinResult {
+	ctx, span := integrationTracer.Start(ctx, "integration.prepare_checkin",
+		trace.WithAttributes(
+			attribute.String("integration.id", integration.ID),
+			attribute.String("integration.kind", string(integration.Kind)),
+			attribute.String("integration.base_url", strings.TrimSpace(integration.BaseURL)),
+		),
+	)
+	defer span.End()
 	message, at, err := s.checkin(ctx, integration)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 	return CheckinResult{
 		Message:    message,
 		At:         at,
@@ -353,6 +388,91 @@ func integrationMarkup(integration model.Integration, modelName string) float64 
 		return integration.DefaultMarkupMultiplier
 	}
 	return 1
+}
+
+func syncManagedPricingProfiles(state *model.State, integration model.Integration, snapshot model.IntegrationSnapshot) {
+	prefix := managedPricingProfilePrefix(integration.ID)
+	desired := map[string]model.PricingProfile{}
+	for modelName, pricing := range snapshot.Prices {
+		modelName = strings.TrimSpace(modelName)
+		if modelName == "" {
+			continue
+		}
+		profileID := managedPricingProfileID(integration.ID, modelName)
+		currency := strings.TrimSpace(pricing.Currency)
+		if currency == "" {
+			currency = strings.TrimSpace(snapshot.Currency)
+		}
+		if currency == "" {
+			currency = "USD"
+		}
+		desired[profileID] = model.PricingProfile{
+			ID:               profileID,
+			Name:             integration.Name + " / " + modelName,
+			Currency:         currency,
+			InputPerMillion:  pricing.InputPerMillion,
+			OutputPerMillion: pricing.OutputPerMillion,
+		}
+	}
+
+	filtered := make([]model.PricingProfile, 0, len(state.PricingProfiles)+len(desired))
+	for _, profile := range state.PricingProfiles {
+		if strings.HasPrefix(profile.ID, prefix) {
+			if next, ok := desired[profile.ID]; ok {
+				filtered = append(filtered, next)
+				delete(desired, profile.ID)
+			}
+			continue
+		}
+		filtered = append(filtered, profile)
+	}
+	for _, profile := range desired {
+		filtered = append(filtered, profile)
+	}
+	state.PricingProfiles = filtered
+
+	validManagedIDs := map[string]struct{}{}
+	for _, profile := range filtered {
+		if strings.HasPrefix(profile.ID, prefix) {
+			validManagedIDs[profile.ID] = struct{}{}
+		}
+	}
+	for routeIndex := range state.ModelRoutes {
+		route := &state.ModelRoutes[routeIndex]
+		managedID := managedPricingProfileID(integration.ID, route.Alias)
+		if _, ok := validManagedIDs[managedID]; ok {
+			if strings.TrimSpace(route.PricingProfileID) == "" || strings.HasPrefix(route.PricingProfileID, prefix) {
+				route.PricingProfileID = managedID
+			}
+			continue
+		}
+		if strings.HasPrefix(route.PricingProfileID, prefix) {
+			route.PricingProfileID = ""
+		}
+	}
+}
+
+func managedPricingProfilePrefix(integrationID string) string {
+	return "pricing-sync-" + strings.TrimSpace(integrationID) + "-"
+}
+
+func managedPricingProfileID(integrationID, modelName string) string {
+	var builder strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(modelName)) {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('-')
+		}
+	}
+	slug := strings.Trim(builder.String(), "-")
+	if slug == "" {
+		slug = "model"
+	}
+	return managedPricingProfilePrefix(integrationID) + slug
 }
 
 func (s *Service) syncNewAPI(ctx context.Context, integration model.Integration) (model.IntegrationSnapshot, error) {

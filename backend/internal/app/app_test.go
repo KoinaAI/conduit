@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/KoinaAI/conduit/backend/internal/app"
@@ -72,6 +73,9 @@ func TestGatewayCORSAllowsWildcardOrigins(t *testing.T) {
 	}
 	if got := res.Header.Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Fatalf("expected wildcard gateway CORS header, got %q", got)
+	}
+	if got := res.Header.Get("Access-Control-Allow-Headers"); !strings.Contains(got, "X-Codex-Turn-State") {
+		t.Fatalf("expected Codex turn-state header to be allowed, got %q", got)
 	}
 }
 

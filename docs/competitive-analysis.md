@@ -3,6 +3,9 @@
 > Comparison of Conduit against five open-source AI gateway / proxy projects.
 > Date: 2026-04-03
 
+> Update: 2026-04-05
+> This document started as a gap analysis snapshot. Since then, Conduit has already landed structured logging, routing decision tracing, stats APIs, request-history retention increase, scenario routing, public pricing sync, Codex turn-state compatibility, provider-level proxy support, log rotation, OTEL tracing, automatic backups, Redis-backed sticky session sharing, a helper CLI, PostgreSQL persistence support, and route transformer pipelines. Treat the "Current State" sections below as historical analysis, not as the current code truth.
+
 ## Compared Projects
 
 | Project | Stack | Stars | Positioning |

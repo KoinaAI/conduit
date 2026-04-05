@@ -231,7 +231,7 @@ func (s *FileStore) statsRecords(window StatsWindow) ([]model.RequestRecord, err
 	}
 
 	rows, err := db.Query(
-		`SELECT payload FROM request_records WHERE started_at >= ? AND started_at <= ? ORDER BY started_at DESC`,
+		s.rebind(`SELECT payload FROM request_records WHERE started_at >= ? AND started_at <= ? ORDER BY started_at DESC`),
 		window.StartAt.UTC().Format(time.RFC3339Nano),
 		window.EndAt.UTC().Format(time.RFC3339Nano),
 	)

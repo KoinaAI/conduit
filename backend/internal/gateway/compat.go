@@ -661,12 +661,15 @@ func stringValue(value any) string {
 	return text
 }
 
-func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string) error {
+func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	switch exchange.ResponseMode {
 	case responseModePassthrough:
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			clearWriteDeadline(w)
 			copyResponseHeaders(w.Header(), resp.Header)
+			if _, err := applyResponseTransformers(w.Header(), nil, transformers, candidate); err != nil {
+				return err
+			}
 			w.WriteHeader(resp.StatusCode)
 			if err := copyStreamingResponse(w, resp.Body, observer); err != nil {
 				return proxyResponseWriteError{err: err}
@@ -679,25 +682,48 @@ func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response,
 		}
 		observer.ObserveJSON(payload)
 		copyResponseHeaders(w.Header(), resp.Header)
+		payload, err = transformPassthroughResponseBody(payload, w.Header(), transformers, candidate)
+		if err != nil {
+			return err
+		}
 		w.WriteHeader(resp.StatusCode)
 		if _, err = w.Write(payload); err != nil {
 			return proxyResponseWriteError{err: err}
 		}
 		return nil
 	case responseModeAnthropicJSON:
-		return writeAnthropicJSON(w, resp, observer, publicAlias)
+		return writeAnthropicJSON(w, resp, observer, publicAlias, transformers, candidate)
 	case responseModeAnthropicSSE:
-		return writeAnthropicSSE(w, resp, observer, publicAlias)
+		return writeAnthropicSSE(w, resp, observer, publicAlias, transformers, candidate)
 	case responseModeGeminiJSON:
-		return writeGeminiJSON(w, resp, observer, publicAlias)
+		return writeGeminiJSON(w, resp, observer, publicAlias, transformers, candidate)
 	case responseModeGeminiSSE:
-		return writeGeminiSSE(w, resp, observer, publicAlias)
+		return writeGeminiSSE(w, resp, observer, publicAlias, transformers, candidate)
 	default:
 		return fmt.Errorf("unsupported response mode %q", exchange.ResponseMode)
 	}
 }
 
-func writeAnthropicJSON(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string) error {
+func transformPassthroughResponseBody(payload []byte, headers http.Header, transformers []model.RouteTransformer, candidate resolvedCandidate) ([]byte, error) {
+	if len(filterTransformers(transformers, model.TransformerPhaseResponse)) == 0 {
+		return payload, nil
+	}
+	if !hasBodyTransformers(transformers, model.TransformerPhaseResponse) {
+		_, err := applyResponseTransformers(headers, nil, transformers, candidate)
+		return payload, err
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return nil, err
+	}
+	nextBody, err := applyResponseTransformers(headers, body, transformers, candidate)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(nextBody)
+}
+
+func writeAnthropicJSON(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	payload, err := readLimitedResponseBody(resp.Body, maxTransformedResponseBodyBytes)
 	if err != nil {
 		return err
@@ -721,6 +747,10 @@ func writeAnthropicJSON(w http.ResponseWriter, resp *http.Response, observer *Us
 			"output_tokens": usage.OutputTokens,
 		},
 	}
+	body, err = applyResponseTransformers(w.Header(), body, transformers, candidate)
+	if err != nil {
+		return err
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(body); err != nil {
@@ -729,11 +759,14 @@ func writeAnthropicJSON(w http.ResponseWriter, resp *http.Response, observer *Us
 	return nil
 }
 
-func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string) error {
+func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	clearWriteDeadline(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	if _, err := applyResponseTransformers(w.Header(), nil, transformers, candidate); err != nil {
+		return err
+	}
 	w.WriteHeader(http.StatusOK)
 
 	reader := bufio.NewReader(resp.Body)
@@ -742,6 +775,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 	messageStarted := false
 	contentStarted := false
 	finishReason := "end_turn"
+	sawPayload := false
 
 	flush := func() {
 		if flusher != nil {
@@ -769,6 +803,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 					break
 				}
 			} else {
+				sawPayload = true
 				var upstream openAIChatResponse
 				if err := json.Unmarshal([]byte(payload), &upstream); err != nil {
 					return proxyResponseWriteError{err: err}
@@ -830,20 +865,8 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 	}
 
 	if !messageStarted {
-		if err := writeSSEEvent(w, "message_start", map[string]any{
-			"type": "message_start",
-			"message": map[string]any{
-				"id":            messageID,
-				"type":          "message",
-				"role":          "assistant",
-				"model":         publicAlias,
-				"content":       []any{},
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
-			},
-		}); err != nil {
-			return proxyResponseWriteError{err: err}
+		if !sawPayload {
+			return proxyResponseWriteError{err: errors.New("upstream stream ended before first response event")}
 		}
 	}
 	if contentStarted {
@@ -874,7 +897,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 	return nil
 }
 
-func writeGeminiJSON(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string) error {
+func writeGeminiJSON(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	payload, err := readLimitedResponseBody(resp.Body, maxTransformedResponseBodyBytes)
 	if err != nil {
 		return err
@@ -898,6 +921,10 @@ func writeGeminiJSON(w http.ResponseWriter, resp *http.Response, observer *Usage
 		"usageMetadata": usageSummaryMap(observer.Summary()),
 		"modelVersion":  publicAlias,
 	}
+	body, err = applyResponseTransformers(w.Header(), body, transformers, candidate)
+	if err != nil {
+		return err
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(body); err != nil {
@@ -906,11 +933,14 @@ func writeGeminiJSON(w http.ResponseWriter, resp *http.Response, observer *Usage
 	return nil
 }
 
-func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string) error {
+func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	clearWriteDeadline(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	if _, err := applyResponseTransformers(w.Header(), nil, transformers, candidate); err != nil {
+		return err
+	}
 	w.WriteHeader(http.StatusOK)
 
 	reader := bufio.NewReader(resp.Body)

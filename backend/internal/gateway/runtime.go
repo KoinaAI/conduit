@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -26,6 +27,7 @@ type endpointRuntimeState struct {
 	LastLatencyMS       int64
 	ConsecutiveFailures int
 	OpenUntil           time.Time
+	HalfOpenInFlight    int
 	LastStatusCode      int
 	LastError           string
 	LastCheckedAt       time.Time
@@ -126,9 +128,17 @@ func (r *runtimeState) endpointLatency(candidate resolvedCandidate) int64 {
 }
 
 func (r *runtimeState) endpointOpen(candidate resolvedCandidate, now time.Time) bool {
+	if store, ok := r.stickyStore.(endpointRuntimeStore); ok && store != nil {
+		open, err := store.EndpointOpen(candidate, now)
+		if err == nil {
+			return open
+		}
+		slog.Warn("endpoint runtime cache read failed", "provider_id", candidate.provider.ID, "endpoint_id", candidate.endpoint.ID, "error", err)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.endpointState(endpointRuntimeKey(candidate)).OpenUntil.After(now)
+	return r.endpointOpenLocked(candidate, now)
 }
 
 func (r *runtimeState) credentialCoolingDown(candidate resolvedCandidate, now time.Time) bool {
@@ -138,12 +148,57 @@ func (r *runtimeState) credentialCoolingDown(candidate resolvedCandidate, now ti
 	return state.PermanentlyDisabled || state.DisabledUntil.After(now)
 }
 
-func (r *runtimeState) reportSuccess(candidate resolvedCandidate, latency time.Duration) {
+func (r *runtimeState) acquireEndpoint(candidate resolvedCandidate, now time.Time) (bool, error) {
+	if store, ok := r.stickyStore.(endpointRuntimeStore); ok && store != nil {
+		halfOpen, err := store.AcquireEndpoint(candidate, now)
+		if err == nil || errors.Is(err, errEndpointCircuitOpen) {
+			return halfOpen, err
+		}
+		slog.Warn("endpoint runtime cache acquire failed", "provider_id", candidate.provider.ID, "endpoint_id", candidate.endpoint.ID, "error", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !candidate.provider.CircuitBreaker.IsEnabled() {
+		return false, nil
+	}
+
+	endpoint := r.endpointState(endpointRuntimeKey(candidate))
+	if endpoint.OpenUntil.After(now) {
+		return false, errEndpointCircuitOpen
+	}
+
+	threshold := candidate.provider.CircuitBreaker.FailureThreshold
+	if threshold <= 0 || endpoint.ConsecutiveFailures < threshold {
+		return false, nil
+	}
+
+	limit := candidate.provider.CircuitBreaker.HalfOpenMaxRequests
+	if limit <= 0 {
+		limit = 1
+	}
+	if endpoint.HalfOpenInFlight >= limit {
+		return false, errEndpointCircuitOpen
+	}
+	endpoint.HalfOpenInFlight++
+	return true, nil
+}
+
+func (r *runtimeState) reportSuccess(candidate resolvedCandidate, latency time.Duration, halfOpen bool) {
 	now := time.Now().UTC()
 	var stickyWrite stickyWrite
+	if store, ok := r.stickyStore.(endpointRuntimeStore); ok && store != nil {
+		if err := store.ReportEndpointSuccess(candidate, now, halfOpen); err != nil {
+			slog.Warn("endpoint runtime cache success update failed", "provider_id", candidate.provider.ID, "endpoint_id", candidate.endpoint.ID, "error", err)
+		}
+	}
 
 	r.mu.Lock()
 	endpoint := r.endpointState(endpointRuntimeKey(candidate))
+	if halfOpen && endpoint.HalfOpenInFlight > 0 {
+		endpoint.HalfOpenInFlight--
+	}
 	endpoint.LastLatencyMS = latency.Milliseconds()
 	endpoint.ConsecutiveFailures = 0
 	endpoint.OpenUntil = time.Time{}
@@ -207,16 +262,30 @@ func (r *runtimeState) persistStickyWrite(write stickyWrite) {
 	}
 }
 
-func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int, errMessage string, retryAfter time.Duration) {
+func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int, errMessage string, retryAfter time.Duration, halfOpen bool) {
+	now := time.Now().UTC()
+	if store, ok := r.stickyStore.(endpointRuntimeStore); ok && store != nil {
+		if err := store.ReportEndpointFailure(candidate, now, halfOpen); err != nil {
+			slog.Warn("endpoint runtime cache failure update failed", "provider_id", candidate.provider.ID, "endpoint_id", candidate.endpoint.ID, "error", err)
+		}
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	now := time.Now().UTC()
 	endpoint := r.endpointState(endpointRuntimeKey(candidate))
-	endpoint.ConsecutiveFailures++
+	if halfOpen && endpoint.HalfOpenInFlight > 0 {
+		endpoint.HalfOpenInFlight--
+	}
 	endpoint.LastStatusCode = statusCode
 	endpoint.LastError = errMessage
 	endpoint.LastCheckedAt = now
+	if halfOpen && candidate.provider.CircuitBreaker.IsEnabled() {
+		endpoint.ConsecutiveFailures = max(candidate.provider.CircuitBreaker.FailureThreshold, 1)
+		endpoint.OpenUntil = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second)
+	} else {
+		endpoint.ConsecutiveFailures++
+	}
 	if candidate.provider.CircuitBreaker.IsEnabled() && endpoint.ConsecutiveFailures >= candidate.provider.CircuitBreaker.FailureThreshold {
 		endpoint.OpenUntil = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second)
 	}
@@ -304,6 +373,14 @@ func (r *runtimeState) deleteRemoteStickyBinding(key string) {
 }
 
 func (r *runtimeState) acquireGatewayKey(key model.GatewayKey, now time.Time) error {
+	if store, ok := r.stickyStore.(gatewayKeyRuntimeStore); ok && store != nil {
+		err := store.AcquireGatewayKey(key, now)
+		if err == nil || errors.Is(err, errRateLimit) || errors.Is(err, errConcurrencyLimit) || errors.Is(err, errHourlyBudget) || errors.Is(err, errDailyBudget) || errors.Is(err, errWeeklyBudget) || errors.Is(err, errMonthlyBudget) {
+			return err
+		}
+		slog.Warn("gateway key runtime cache acquire failed", "gateway_key_id", key.ID, "error", err)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -346,6 +423,15 @@ func (r *runtimeState) acquireGatewayKey(key model.GatewayKey, now time.Time) er
 }
 
 func (r *runtimeState) releaseGatewayKey(keyID string, costUSD float64) {
+	now := time.Now().UTC()
+	if store, ok := r.stickyStore.(gatewayKeyRuntimeStore); ok && store != nil {
+		if err := store.ReleaseGatewayKey(keyID, costUSD, now); err != nil {
+			slog.Warn("gateway key runtime cache release failed", "gateway_key_id", keyID, "error", err)
+		} else {
+			return
+		}
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -357,8 +443,8 @@ func (r *runtimeState) releaseGatewayKey(keyID string, costUSD float64) {
 		window.InFlight--
 	}
 	if costUSD > 0 {
-		window.SpendEvents = append(pruneGatewaySpendEvents(window.SpendEvents, time.Now().UTC()), gatewaySpendEvent{
-			At:      time.Now().UTC(),
+		window.SpendEvents = append(pruneGatewaySpendEvents(window.SpendEvents, now), gatewaySpendEvent{
+			At:      now,
 			CostUSD: costUSD,
 		})
 	}
@@ -405,6 +491,13 @@ func (r *runtimeState) gatewayAuthSourceLocked(source string, now time.Time) boo
 	if source == "" {
 		return false
 	}
+	if store, ok := r.stickyStore.(gatewayAuthRuntimeStore); ok && store != nil {
+		locked, err := store.GatewayAuthSourceLocked(source, now)
+		if err == nil {
+			return locked
+		}
+		slog.Warn("gateway auth runtime cache read failed", "source", source, "error", err)
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -432,6 +525,13 @@ func (r *runtimeState) invalidGatewayLookupCached(lookupHash, candidateFingerpri
 	if lookupHash == "" {
 		return false
 	}
+	if store, ok := r.stickyStore.(gatewayAuthRuntimeStore); ok && store != nil {
+		cached, err := store.InvalidGatewayLookupCached(lookupHash, candidateFingerprint, now)
+		if err == nil {
+			return cached
+		}
+		slog.Warn("gateway invalid lookup cache read failed", "lookup_hash", lookupHash, "error", err)
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -454,6 +554,13 @@ func (r *runtimeState) invalidGatewayLookupCached(lookupHash, candidateFingerpri
 func (r *runtimeState) recordGatewayAuthFailure(source, lookupHash, candidateFingerprint string, now time.Time) {
 	source = normalizeGatewayAuthSource(source)
 	lookupHash = strings.TrimSpace(lookupHash)
+	if store, ok := r.stickyStore.(gatewayAuthRuntimeStore); ok && store != nil {
+		if err := store.RecordGatewayAuthFailure(source, lookupHash, candidateFingerprint, now); err == nil {
+			return
+		} else {
+			slog.Warn("gateway auth runtime cache write failed", "source", source, "lookup_hash", lookupHash, "error", err)
+		}
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -494,6 +601,13 @@ func (r *runtimeState) recordGatewayAuthFailure(source, lookupHash, candidateFin
 func (r *runtimeState) clearGatewayAuthFailures(source, lookupHash string) {
 	source = normalizeGatewayAuthSource(source)
 	lookupHash = strings.TrimSpace(lookupHash)
+	if store, ok := r.stickyStore.(gatewayAuthRuntimeStore); ok && store != nil {
+		if err := store.ClearGatewayAuthFailures(source, lookupHash); err == nil {
+			return
+		} else {
+			slog.Warn("gateway auth runtime cache clear failed", "source", source, "lookup_hash", lookupHash, "error", err)
+		}
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -530,6 +644,13 @@ func (r *runtimeState) nextRoundRobinOffset(key string, size int) int {
 	if size <= 1 {
 		return 0
 	}
+	if store, ok := r.stickyStore.(roundRobinCounterStore); ok && store != nil {
+		next, err := store.NextRoundRobinValue(key)
+		if err == nil {
+			return int((next - 1) % uint64(size))
+		}
+		slog.Warn("gateway round robin cache read failed", "key", key, "error", err)
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -537,6 +658,25 @@ func (r *runtimeState) nextRoundRobinOffset(key string, size int) int {
 	offset := int(r.roundRobin[key] % uint64(size))
 	r.roundRobin[key]++
 	return offset
+}
+
+func (r *runtimeState) endpointOpenLocked(candidate resolvedCandidate, now time.Time) bool {
+	if !candidate.provider.CircuitBreaker.IsEnabled() {
+		return false
+	}
+	endpoint := r.endpointState(endpointRuntimeKey(candidate))
+	if endpoint.OpenUntil.After(now) {
+		return true
+	}
+	threshold := candidate.provider.CircuitBreaker.FailureThreshold
+	if threshold <= 0 || endpoint.ConsecutiveFailures < threshold {
+		return false
+	}
+	limit := candidate.provider.CircuitBreaker.HalfOpenMaxRequests
+	if limit <= 0 {
+		limit = 1
+	}
+	return endpoint.HalfOpenInFlight >= limit
 }
 
 func endpointRuntimeKey(candidate resolvedCandidate) string {

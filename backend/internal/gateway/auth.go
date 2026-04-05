@@ -15,14 +15,15 @@ import (
 )
 
 var (
-	errUnauthorized     = errors.New("unauthorized")
-	errAuthLocked       = errors.New("too many failed authentication attempts")
-	errRateLimit        = errors.New("gateway key rpm limit exceeded")
-	errConcurrencyLimit = errors.New("gateway key concurrency limit exceeded")
-	errHourlyBudget     = errors.New("gateway key hourly budget exceeded")
-	errDailyBudget      = errors.New("gateway key daily budget exceeded")
-	errWeeklyBudget     = errors.New("gateway key weekly budget exceeded")
-	errMonthlyBudget    = errors.New("gateway key monthly budget exceeded")
+	errUnauthorized        = errors.New("unauthorized")
+	errAuthLocked          = errors.New("too many failed authentication attempts")
+	errEndpointCircuitOpen = errors.New("provider endpoint circuit breaker is open")
+	errRateLimit           = errors.New("gateway key rpm limit exceeded")
+	errConcurrencyLimit    = errors.New("gateway key concurrency limit exceeded")
+	errHourlyBudget        = errors.New("gateway key hourly budget exceeded")
+	errDailyBudget         = errors.New("gateway key daily budget exceeded")
+	errWeeklyBudget        = errors.New("gateway key weekly budget exceeded")
+	errMonthlyBudget       = errors.New("gateway key monthly budget exceeded")
 )
 
 type gatewayAuthContextKey struct{}

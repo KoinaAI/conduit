@@ -373,7 +373,7 @@ func TestRuntimeStickySweepRemovesExpiredEntries(t *testing.T) {
 		},
 		gatewayKeyID: "gk-1",
 		sessionID:    "session-1",
-	}, 10*time.Millisecond)
+	}, 10*time.Millisecond, false)
 
 	if _, ok := runtime.sticky["expired"]; ok {
 		t.Fatalf("expected expired sticky entry to be swept")
@@ -491,7 +491,7 @@ func TestRuntimeReportFailureClampsHugeRetryAfter(t *testing.T) {
 	}
 
 	before := time.Now().UTC()
-	runtime.reportFailure(candidate, http.StatusTooManyRequests, "ratelimited", 24*365*time.Hour)
+	runtime.reportFailure(candidate, http.StatusTooManyRequests, "ratelimited", 24*365*time.Hour, false)
 
 	runtime.mu.Lock()
 	credential := runtime.credentials[credentialRuntimeKey(candidate)]
@@ -501,6 +501,88 @@ func TestRuntimeReportFailureClampsHugeRetryAfter(t *testing.T) {
 	}
 	if credential.DisabledUntil.Sub(before) > maxRetryAfterCooldown+time.Second {
 		t.Fatalf("expected retry-after clamp within %v, got %v", maxRetryAfterCooldown, credential.DisabledUntil.Sub(before))
+	}
+}
+
+func TestRuntimeCircuitBreakerHalfOpenLimitsProbeConcurrency(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	enabled := true
+	candidate := resolvedCandidate{
+		provider: model.Provider{
+			ID: "provider-1",
+			CircuitBreaker: model.CircuitBreakerConfig{
+				Enabled:             &enabled,
+				FailureThreshold:    1,
+				CooldownSeconds:     1,
+				HalfOpenMaxRequests: 1,
+			},
+		},
+		endpoint:   model.ProviderEndpoint{ID: "endpoint-1"},
+		credential: model.ProviderCredential{ID: "credential-1", APIKey: "credential-key"},
+	}
+
+	runtime.reportFailure(candidate, http.StatusBadGateway, "boom", 0, false)
+	if !runtime.endpointOpen(candidate, time.Now().UTC()) {
+		t.Fatal("expected endpoint to open after threshold failure")
+	}
+
+	probeAt := time.Now().UTC().Add(2 * time.Second)
+	if runtime.endpointOpen(candidate, probeAt) {
+		t.Fatal("expected cooldown expiry to allow a half-open probe")
+	}
+
+	halfOpen, err := runtime.acquireEndpoint(candidate, probeAt)
+	if err != nil {
+		t.Fatalf("acquire half-open probe: %v", err)
+	}
+	if !halfOpen {
+		t.Fatal("expected acquire to mark the probe as half-open")
+	}
+	if !runtime.endpointOpen(candidate, probeAt) {
+		t.Fatal("expected half-open slot exhaustion to block additional probes")
+	}
+	if _, err := runtime.acquireEndpoint(candidate, probeAt); err != errEndpointCircuitOpen {
+		t.Fatalf("expected second probe to be blocked, got %v", err)
+	}
+
+	runtime.reportSuccess(candidate, 5*time.Millisecond, halfOpen)
+	if runtime.endpointOpen(candidate, probeAt) {
+		t.Fatal("expected successful half-open probe to close the circuit")
+	}
+}
+
+func TestRuntimeCircuitBreakerHalfOpenFailureReopensCircuit(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	enabled := true
+	candidate := resolvedCandidate{
+		provider: model.Provider{
+			ID: "provider-1",
+			CircuitBreaker: model.CircuitBreakerConfig{
+				Enabled:             &enabled,
+				FailureThreshold:    1,
+				CooldownSeconds:     60,
+				HalfOpenMaxRequests: 1,
+			},
+		},
+		endpoint:   model.ProviderEndpoint{ID: "endpoint-1"},
+		credential: model.ProviderCredential{ID: "credential-1", APIKey: "credential-key"},
+	}
+
+	runtime.reportFailure(candidate, http.StatusBadGateway, "boom", 0, false)
+
+	probeAt := time.Now().UTC().Add(61 * time.Second)
+	halfOpen, err := runtime.acquireEndpoint(candidate, probeAt)
+	if err != nil {
+		t.Fatalf("acquire half-open probe: %v", err)
+	}
+	runtime.reportFailure(candidate, http.StatusBadGateway, "boom again", 0, halfOpen)
+
+	if !runtime.endpointOpen(candidate, time.Now().UTC()) {
+		t.Fatal("expected failed half-open probe to reopen the circuit")
 	}
 }
 

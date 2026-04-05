@@ -339,6 +339,42 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			candidate.sessionID = parsedRequest.sessionID
 
 			attemptStarted := time.Now().UTC()
+			halfOpenProbe, err := s.runtime.acquireEndpoint(candidate, attemptStarted)
+			if err != nil {
+				attemptSpan.RecordError(err)
+				attemptSpan.SetStatus(codes.Error, err.Error())
+				attemptSpan.End()
+				lastErr = err
+				hasNext := index < len(candidates)-1
+				attempts = append(attempts, model.RequestAttemptRecord{
+					RequestID:     record.ID,
+					Sequence:      index + 1,
+					ProviderID:    candidate.provider.ID,
+					ProviderName:  candidate.provider.Name,
+					EndpointID:    candidate.endpoint.ID,
+					EndpointURL:   candidate.endpoint.BaseURL,
+					CredentialID:  candidate.credential.ID,
+					UpstreamModel: exchange.UpstreamModel,
+					StatusCode:    http.StatusServiceUnavailable,
+					Retryable:     true,
+					Decision:      nextDecision(true, hasNext),
+					StartedAt:     attemptStarted,
+					DurationMS:    0,
+					Error:         err.Error(),
+				})
+				appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, nextDecision(true, hasNext), true, http.StatusServiceUnavailable, 0, err)
+				if hasNext {
+					logger.Warn("gateway candidate skipped by circuit breaker",
+						"provider_id", candidate.provider.ID,
+						"endpoint_id", candidate.endpoint.ID,
+						"credential_id", candidate.credential.ID,
+						"attempt", index+1,
+						"error", err,
+					)
+					continue
+				}
+				break
+			}
 			resp, err := s.doProxyRequest(attemptCtx, candidate, exchange, r.Method, r.Header, parsedRequest.rawQuery)
 			if err != nil {
 				attemptSpan.RecordError(err)
@@ -361,7 +397,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 					DurationMS:    time.Since(attemptStarted).Milliseconds(),
 					Error:         err.Error(),
 				})
-				s.runtime.reportFailure(candidate, 0, err.Error(), 0)
+				s.runtime.reportFailure(candidate, 0, err.Error(), 0, halfOpenProbe)
 				if index < len(candidates)-1 {
 					backoff := retryBackoffDelay(0, index+1)
 					appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "switch_provider", true, 0, backoff, err)
@@ -407,7 +443,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 					DurationMS:    time.Since(attemptStarted).Milliseconds(),
 					Error:         strings.TrimSpace(string(body)),
 				})
-				s.runtime.reportFailure(candidate, resp.StatusCode, strings.TrimSpace(string(body)), retryAfter)
+				s.runtime.reportFailure(candidate, resp.StatusCode, strings.TrimSpace(string(body)), retryAfter, halfOpenProbe)
 				if retryable && index < len(candidates)-1 {
 					backoff := retryBackoffDelay(resp.StatusCode, index+1)
 					appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "switch_provider", retryable, resp.StatusCode, backoff, lastErr)
@@ -470,7 +506,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 					DurationMS:    time.Since(attemptStarted).Milliseconds(),
 					Error:         writeErr.Error(),
 				})
-				s.runtime.reportFailure(candidate, 0, writeErr.Error(), 0)
+				s.runtime.reportFailure(candidate, 0, writeErr.Error(), 0, halfOpenProbe)
 				if retryable && hasNext {
 					backoff := retryBackoffDelay(0, index+1)
 					appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "switch_provider", true, http.StatusBadGateway, backoff, writeErr)
@@ -519,7 +555,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 				StartedAt:     attemptStarted,
 				DurationMS:    time.Since(attemptStarted).Milliseconds(),
 			})
-			s.runtime.reportSuccess(candidate, time.Since(attemptStarted))
+			s.runtime.reportSuccess(candidate, time.Since(attemptStarted), halfOpenProbe)
 			if responseTurnState != "" && responseTurnState != parsedRequest.sessionID {
 				s.runtime.bindStickyCandidate(candidate, responseTurnState, time.Now().UTC())
 			}

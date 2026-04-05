@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +16,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/app"
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 const testGatewaySecret = "test-gateway-secret"
@@ -128,8 +128,6 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 			ID:                      "openai",
 			Name:                    "openai-main",
 			Kind:                    model.ProviderKindOpenAICompatible,
-			BaseURL:                 openAIServer.URL + "/v1",
-			APIKey:                  "openai-key",
 			Enabled:                 true,
 			Weight:                  1,
 			TimeoutSeconds:          30,
@@ -139,30 +137,56 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 				model.ProtocolOpenAIResponses,
 				model.ProtocolOpenAIRealtime,
 			},
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-openai",
+				BaseURL: openAIServer.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-openai",
+				APIKey:  "openai-key",
+				Enabled: true,
+			}},
 		},
 		{
 			ID:                      "anthropic",
 			Name:                    "anthropic-main",
 			Kind:                    model.ProviderKindAnthropic,
-			BaseURL:                 anthropicServer.URL,
-			APIKey:                  "anthropic-key",
 			Enabled:                 true,
 			Weight:                  1,
 			TimeoutSeconds:          30,
 			DefaultMarkupMultiplier: 1.1,
 			Capabilities:            []model.Protocol{model.ProtocolAnthropic},
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-anthropic",
+				BaseURL: anthropicServer.URL,
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-anthropic",
+				APIKey:  "anthropic-key",
+				Enabled: true,
+			}},
 		},
 		{
 			ID:                      "gemini",
 			Name:                    "gemini-main",
 			Kind:                    model.ProviderKindGemini,
-			BaseURL:                 geminiServer.URL,
-			APIKey:                  "gemini-key",
 			Enabled:                 true,
 			Weight:                  1,
 			TimeoutSeconds:          30,
 			DefaultMarkupMultiplier: 1.0,
 			Capabilities:            []model.Protocol{model.ProtocolGeminiStream, model.ProtocolGeminiGenerate},
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-gemini",
+				BaseURL: geminiServer.URL,
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-gemini",
+				APIKey:  "gemini-key",
+				Enabled: true,
+			}},
 		},
 	}
 	state.ModelRoutes = []model.ModelRoute{
@@ -339,8 +363,8 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("admin state reflects history", func(t *testing.T) {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, gatewayServer.URL+"/api/admin/state", nil)
+	t.Run("admin request history reflects routing trace", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, gatewayServer.URL+"/api/admin/request-history", nil)
 		if err != nil {
 			t.Fatalf("new request: %v", err)
 		}
@@ -350,15 +374,15 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 			t.Fatalf("admin request failed: %v", err)
 		}
 		defer res.Body.Close()
-		var saved model.State
+		var saved []model.RequestRecord
 		if err := json.NewDecoder(res.Body).Decode(&saved); err != nil {
-			t.Fatalf("decode state: %v", err)
+			t.Fatalf("decode history: %v", err)
 		}
-		if len(saved.RequestHistory) < 4 {
-			t.Fatalf("expected request history to be populated, got %d", len(saved.RequestHistory))
+		if len(saved) < 4 {
+			t.Fatalf("expected request history to be populated, got %d", len(saved))
 		}
-		if saved.RequestHistory[len(saved.RequestHistory)-1].RoutingDecision == nil {
-			t.Fatalf("expected request history to include routing decision trace, got %+v", saved.RequestHistory[len(saved.RequestHistory)-1])
+		if saved[len(saved)-1].RoutingDecision == nil {
+			t.Fatalf("expected request history to include routing decision trace, got %+v", saved[len(saved)-1])
 		}
 	})
 }
@@ -385,13 +409,21 @@ func TestGatewayFallsBackToRouteAliasWhenUpstreamModelIsBlank(t *testing.T) {
 			ID:                      "openai",
 			Name:                    "openai-main",
 			Kind:                    model.ProviderKindOpenAICompatible,
-			BaseURL:                 openAIServer.URL + "/v1",
-			APIKey:                  "openai-key",
 			Enabled:                 true,
 			Weight:                  1,
 			TimeoutSeconds:          30,
 			DefaultMarkupMultiplier: 1,
 			Capabilities:            []model.Protocol{model.ProtocolOpenAIChat},
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-openai",
+				BaseURL: openAIServer.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-openai",
+				APIKey:  "openai-key",
+				Enabled: true,
+			}},
 		},
 	}
 	state.ModelRoutes = []model.ModelRoute{
@@ -456,21 +488,37 @@ func TestResponsesCodexTurnStatePinsSubsequentRequests(t *testing.T) {
 			ID:             "provider-one",
 			Name:           "provider-one",
 			Kind:           model.ProviderKindOpenAICompatible,
-			BaseURL:        serverOne.URL + "/v1",
-			APIKey:         "provider-one-key",
 			Enabled:        true,
 			Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
 			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-one",
+				BaseURL: serverOne.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-one",
+				APIKey:  "provider-one-key",
+				Enabled: true,
+			}},
 		},
 		{
 			ID:             "provider-two",
 			Name:           "provider-two",
 			Kind:           model.ProviderKindOpenAICompatible,
-			BaseURL:        serverTwo.URL + "/v1",
-			APIKey:         "provider-two-key",
 			Enabled:        true,
 			Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
 			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-two",
+				BaseURL: serverTwo.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-two",
+				APIKey:  "provider-two-key",
+				Enabled: true,
+			}},
 		},
 	}
 	state.ModelRoutes = []model.ModelRoute{{
@@ -587,23 +635,39 @@ func TestGatewayRetriesTransformFailuresBeforeWritingResponse(t *testing.T) {
 			ID:             "provider-1",
 			Name:           "First",
 			Kind:           model.ProviderKindOpenAICompatible,
-			BaseURL:        firstServer.URL + "/v1",
-			APIKey:         "first-key",
 			Enabled:        true,
 			MaxAttempts:    1,
 			Capabilities:   []model.Protocol{model.ProtocolAnthropic},
 			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-first",
+				BaseURL: firstServer.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-first",
+				APIKey:  "first-key",
+				Enabled: true,
+			}},
 		},
 		{
 			ID:             "provider-2",
 			Name:           "Second",
 			Kind:           model.ProviderKindOpenAICompatible,
-			BaseURL:        secondServer.URL + "/v1",
-			APIKey:         "second-key",
 			Enabled:        true,
 			MaxAttempts:    1,
 			Capabilities:   []model.Protocol{model.ProtocolAnthropic},
 			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-second",
+				BaseURL: secondServer.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-second",
+				APIKey:  "second-key",
+				Enabled: true,
+			}},
 		},
 	}
 	state.ModelRoutes = []model.ModelRoute{{
@@ -652,13 +716,21 @@ func TestGatewayFallsBackToEstimatedUsageWhenUpstreamOmitsUsage(t *testing.T) {
 		ID:                      "openai",
 		Name:                    "openai-main",
 		Kind:                    model.ProviderKindOpenAICompatible,
-		BaseURL:                 openAIServer.URL + "/v1",
-		APIKey:                  "openai-key",
 		Enabled:                 true,
 		Weight:                  1,
 		TimeoutSeconds:          30,
 		DefaultMarkupMultiplier: 1,
 		Capabilities:            []model.Protocol{model.ProtocolOpenAIChat},
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-openai",
+			BaseURL: openAIServer.URL + "/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-openai",
+			APIKey:  "openai-key",
+			Enabled: true,
+		}},
 	}}
 	state.ModelRoutes = []model.ModelRoute{{
 		Alias:            "gpt-5.4",
@@ -712,11 +784,19 @@ func TestGatewayAppliesRouteTransformers(t *testing.T) {
 		ID:             "openai",
 		Name:           "OpenAI",
 		Kind:           model.ProviderKindOpenAICompatible,
-		BaseURL:        upstream.URL + "/v1",
-		APIKey:         "openai-key",
 		Enabled:        true,
 		Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
 		TimeoutSeconds: 30,
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-openai",
+			BaseURL: upstream.URL + "/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-openai",
+			APIKey:  "openai-key",
+			Enabled: true,
+		}},
 	}}
 	state.ModelRoutes = []model.ModelRoute{{
 		Alias: "gpt-5.4",
@@ -848,11 +928,19 @@ func TestResponsesPrependMessageTransformerTargetsInputPayload(t *testing.T) {
 		ID:             "openai",
 		Name:           "OpenAI",
 		Kind:           model.ProviderKindOpenAICompatible,
-		BaseURL:        upstream.URL + "/v1",
-		APIKey:         "openai-key",
 		Enabled:        true,
 		Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
 		TimeoutSeconds: 30,
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-openai",
+			BaseURL: upstream.URL + "/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-openai",
+			APIKey:  "openai-key",
+			Enabled: true,
+		}},
 	}}
 	state.ModelRoutes = []model.ModelRoute{{
 		Alias: "gpt-5.4",
@@ -923,11 +1011,19 @@ func TestGatewayAppliesResponseBodyTransformersToStreamingPassthrough(t *testing
 		ID:             "openai",
 		Name:           "OpenAI",
 		Kind:           model.ProviderKindOpenAICompatible,
-		BaseURL:        upstream.URL + "/v1",
-		APIKey:         "openai-key",
 		Enabled:        true,
 		Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
 		TimeoutSeconds: 30,
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-openai",
+			BaseURL: upstream.URL + "/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-openai",
+			APIKey:  "openai-key",
+			Enabled: true,
+		}},
 	}}
 	state.ModelRoutes = []model.ModelRoute{{
 		Alias: "gpt-5.4",
@@ -981,12 +1077,15 @@ func startGatewayServer(t *testing.T, state model.State) *httptest.Server {
 
 	tempDir := t.TempDir()
 	statePath := filepath.Join(tempDir, "state.json")
-	data, err := json.Marshal(state)
+	fileStore, err := store.Open(statePath)
 	if err != nil {
-		t.Fatalf("marshal state: %v", err)
+		t.Fatalf("open store: %v", err)
 	}
-	if err := os.WriteFile(statePath, data, 0o600); err != nil {
-		t.Fatalf("write state: %v", err)
+	if _, err := fileStore.Replace(state); err != nil {
+		t.Fatalf("replace state: %v", err)
+	}
+	if err := fileStore.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
 	}
 
 	cfg := config.Config{

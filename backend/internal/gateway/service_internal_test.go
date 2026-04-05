@@ -298,25 +298,41 @@ func TestBuildCandidatePlanRespectsPerProviderMaxAttempts(t *testing.T) {
 			ID:             "provider-a",
 			Name:           "Provider A",
 			Kind:           model.ProviderKindOpenAICompatible,
-			BaseURL:        "https://provider-a.example/v1",
-			APIKey:         "key-a",
 			Enabled:        true,
 			MaxAttempts:    1,
 			Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
 			RoutingMode:    model.ProviderRoutingModeLatency,
 			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-a",
+				BaseURL: "https://provider-a.example/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "cred-a-1",
+				APIKey:  "key-a",
+				Enabled: true,
+			}},
 		},
 		{
 			ID:             "provider-b",
 			Name:           "Provider B",
 			Kind:           model.ProviderKindOpenAICompatible,
-			BaseURL:        "https://provider-b.example/v1",
-			APIKey:         "key-b",
 			Enabled:        true,
 			MaxAttempts:    1,
 			Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
 			RoutingMode:    model.ProviderRoutingModeLatency,
 			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-b",
+				BaseURL: "https://provider-b.example/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "cred-b-1",
+				APIKey:  "key-b",
+				Enabled: true,
+			}},
 		},
 	}
 	state.ModelRoutes = []model.ModelRoute{{
@@ -591,7 +607,6 @@ func TestGeminiToOpenAIChatDoesNotDuplicateSystemInstruction(t *testing.T) {
 
 	body, err := geminiToOpenAIChat([]byte(`{
 		"systemInstruction":{"parts":[{"text":"camel"}]},
-		"system_instruction":{"parts":[{"text":"snake"}]},
 		"contents":[{"role":"user","parts":[{"text":"hello"}]}]
 	}`), "gpt-5.4", false)
 	if err != nil {

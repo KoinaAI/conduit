@@ -427,8 +427,6 @@ func TestBuildCandidatePlanRejectsUnknownScenario(t *testing.T) {
 		ID:           "provider-primary",
 		Name:         "Primary",
 		Kind:         model.ProviderKindOpenAICompatible,
-		BaseURL:      "https://primary.example/v1",
-		APIKey:       "key-primary",
 		Enabled:      true,
 		Capabilities: []model.Protocol{model.ProtocolOpenAIChat},
 		Endpoints: []model.ProviderEndpoint{{

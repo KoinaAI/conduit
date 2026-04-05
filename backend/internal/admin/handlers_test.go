@@ -360,48 +360,18 @@ func TestUpdatePricingAliasesPersistsValidatedRules(t *testing.T) {
 	}
 }
 
-func TestGetProviderUsageReturnsRollingUsage(t *testing.T) {
+func TestGetProviderUsageRequiresGatewayRuntime(t *testing.T) {
 	t.Parallel()
 
-	now := time.Now().UTC()
-	fileStore := openTestStore(t, model.State{
-		Version: "2026-04-01",
-		RequestHistory: []model.RequestRecord{
-			{
-				ID:           "req-1",
-				AccountID:    "provider-1",
-				ProviderName: "OpenAI",
-				StatusCode:   200,
-				StartedAt:    now.Add(-30 * time.Minute),
-				Billing:      model.BillingSummary{FinalCost: 1.25},
-			},
-			{
-				ID:           "req-2",
-				AccountID:    "provider-1",
-				ProviderName: "OpenAI",
-				StatusCode:   502,
-				StartedAt:    now.Add(-2 * 24 * time.Hour),
-				Billing:      model.BillingSummary{FinalCost: 0.75},
-			},
-		},
-	})
+	fileStore := openTestStore(t, model.DefaultState())
 	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/admin/runtime/provider-usage?limit=10", nil)
 	recorder := httptest.NewRecorder()
 	handlers.GetProviderUsage(recorder, req)
 
-	if recorder.Code != http.StatusOK {
+	if recorder.Code != http.StatusNotImplemented {
 		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
-	}
-	var payload struct {
-		Items []store.ProviderUsageRow `json:"items"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode provider usage: %v", err)
-	}
-	if len(payload.Items) != 1 || payload.Items[0].MonthlyCostUSD != 2.0 || payload.Items[0].MonthlyErrors != 1 {
-		t.Fatalf("unexpected provider usage payload: %+v", payload.Items)
 	}
 }
 

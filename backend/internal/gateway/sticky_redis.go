@@ -87,6 +87,70 @@ func (s *redisStickyStore) DeleteStickyBinding(key string) error {
 	return s.client.Del(ctx, s.key(key)).Err()
 }
 
+func (s *redisStickyStore) SaveRuntimeSession(key string, session LiveSessionStatus) error {
+	ttl := time.Until(session.ExpiresAt)
+	if ttl <= 0 {
+		return nil
+	}
+	payload, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Set(ctx, s.runtimeSessionKey(key), payload, ttl).Err()
+}
+
+func (s *redisStickyStore) DeleteRuntimeSession(key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Del(ctx, s.runtimeSessionKey(key)).Err()
+}
+
+func (s *redisStickyStore) ListRuntimeSessions(now time.Time) ([]runtimeSessionRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	pattern := s.runtimeSessionPrefix() + "*"
+	cursor := uint64(0)
+	records := make([]runtimeSessionRecord, 0, 16)
+	for {
+		keys, next, err := s.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, redisKey := range keys {
+			payload, err := s.client.Get(ctx, redisKey).Bytes()
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			var session LiveSessionStatus
+			if err := json.Unmarshal(payload, &session); err != nil {
+				_ = s.client.Del(ctx, redisKey).Err()
+				continue
+			}
+			if !session.ExpiresAt.After(now) {
+				_ = s.client.Del(ctx, redisKey).Err()
+				continue
+			}
+
+			records = append(records, runtimeSessionRecord{
+				Key:     strings.TrimPrefix(redisKey, s.runtimeSessionPrefix()),
+				Session: session,
+			})
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return records, nil
+}
+
 func (s *redisStickyStore) ListStickyBindings(now time.Time) ([]stickyBindingRecord, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
@@ -376,23 +440,21 @@ func (s *redisStickyStore) AcquireProvider(provider model.Provider, now time.Tim
 		}
 	}
 
-	if provider.MaxConcurrency > 0 {
-		inflightKey := s.providerInFlightKey(provider.ID)
-		count, err := s.client.Incr(ctx, inflightKey).Result()
-		if err != nil {
-			if rateKey != "" {
-				_, _ = s.client.Decr(ctx, rateKey).Result()
-			}
-			return err
+	inflightKey := s.providerInFlightKey(provider.ID)
+	count, err := s.client.Incr(ctx, inflightKey).Result()
+	if err != nil {
+		if rateKey != "" {
+			_, _ = s.client.Decr(ctx, rateKey).Result()
 		}
-		_ = s.client.Expire(ctx, inflightKey, time.Hour).Err()
-		if count > int64(provider.MaxConcurrency) {
-			_, _ = s.client.Decr(ctx, inflightKey).Result()
-			if rateKey != "" {
-				_, _ = s.client.Decr(ctx, rateKey).Result()
-			}
-			return errProviderConcurrencyLimit
+		return err
+	}
+	_ = s.client.Expire(ctx, inflightKey, time.Hour).Err()
+	if provider.MaxConcurrency > 0 && count > int64(provider.MaxConcurrency) {
+		_, _ = s.client.Decr(ctx, inflightKey).Result()
+		if rateKey != "" {
+			_, _ = s.client.Decr(ctx, rateKey).Result()
 		}
+		return errProviderConcurrencyLimit
 	}
 
 	return nil
@@ -420,6 +482,74 @@ func (s *redisStickyStore) ReleaseProvider(providerID string, costUSD float64, n
 	}
 	_ = s.client.Expire(ctx, s.providerSpendKey(providerID), 31*24*time.Hour).Err()
 	return nil
+}
+
+func (s *redisStickyStore) LoadProviderRuntime(provider model.Provider, now time.Time) (ProviderRuntimeStatus, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	minuteRequests, err := s.client.Get(ctx, s.providerRateKey(provider.ID, now)).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return ProviderRuntimeStatus{}, false, err
+	}
+	inFlight, err := s.client.Get(ctx, s.providerInFlightKey(provider.ID)).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return ProviderRuntimeStatus{}, false, err
+	}
+
+	spendKey := s.providerSpendKey(provider.ID)
+	cutoff := strconv.FormatInt(now.Add(-30*24*time.Hour).UTC().UnixMilli(), 10)
+	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", cutoff).Err(); err != nil {
+		return ProviderRuntimeStatus{}, false, err
+	}
+	entries, err := s.client.ZRangeByScoreWithScores(ctx, spendKey, &redis.ZRangeBy{
+		Min: cutoff,
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return ProviderRuntimeStatus{}, false, err
+	}
+
+	var hourlyCost, dailyCost, weeklyCost, monthlyCost float64
+	for _, entry := range entries {
+		recordedAt := time.UnixMilli(int64(entry.Score)).UTC()
+		cost, ok := parseGatewaySpendMember(entry.Member)
+		if !ok {
+			continue
+		}
+		age := now.Sub(recordedAt)
+		if age <= time.Hour {
+			hourlyCost += cost
+		}
+		if age <= 24*time.Hour {
+			dailyCost += cost
+		}
+		if age <= 7*24*time.Hour {
+			weeklyCost += cost
+		}
+		if age <= 30*24*time.Hour {
+			monthlyCost += cost
+		}
+	}
+
+	status := ProviderRuntimeStatus{
+		ProviderID:            provider.ID,
+		ProviderName:          provider.Name,
+		RateLimitRPM:          provider.RateLimitRPM,
+		MaxConcurrency:        provider.MaxConcurrency,
+		HourlyBudgetUSD:       provider.HourlyBudgetUSD,
+		DailyBudgetUSD:        provider.DailyBudgetUSD,
+		WeeklyBudgetUSD:       provider.WeeklyBudgetUSD,
+		MonthlyBudgetUSD:      provider.MonthlyBudgetUSD,
+		CurrentMinuteRequests: minuteRequests,
+		InFlight:              inFlight,
+		HourlyCostUSD:         hourlyCost,
+		DailyCostUSD:          dailyCost,
+		WeeklyCostUSD:         weeklyCost,
+		MonthlyCostUSD:        monthlyCost,
+		MinuteBucketStartedAt: now.UTC().Truncate(time.Minute),
+	}
+	return status, providerRuntimeActive(status), nil
 }
 
 func (s *redisStickyStore) GatewayAuthSourceLocked(source string, _ time.Time) (bool, error) {
@@ -494,6 +624,18 @@ func (s *redisStickyStore) stickyPrefix() string {
 		prefix = "conduit"
 	}
 	return prefix + ":sticky:"
+}
+
+func (s *redisStickyStore) runtimeSessionKey(key string) string {
+	return s.runtimeSessionPrefix() + strings.TrimSpace(key)
+}
+
+func (s *redisStickyStore) runtimeSessionPrefix() string {
+	prefix := strings.TrimSpace(s.prefix)
+	if prefix == "" {
+		prefix = "conduit"
+	}
+	return prefix + ":session:"
 }
 
 func (s *redisStickyStore) roundRobinKey(key string) string {

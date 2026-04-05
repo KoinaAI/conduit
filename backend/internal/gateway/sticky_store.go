@@ -17,6 +17,11 @@ type stickyBindingRecord struct {
 	Binding stickyBinding
 }
 
+type runtimeSessionRecord struct {
+	Key     string
+	Session LiveSessionStatus
+}
+
 type stickyBindingListingStore interface {
 	ListStickyBindings(now time.Time) ([]stickyBindingRecord, error)
 }
@@ -33,6 +38,13 @@ type gatewayKeyRuntimeStore interface {
 type providerRuntimeStore interface {
 	AcquireProvider(provider model.Provider, now time.Time) error
 	ReleaseProvider(providerID string, costUSD float64, now time.Time) error
+	LoadProviderRuntime(provider model.Provider, now time.Time) (ProviderRuntimeStatus, bool, error)
+}
+
+type sessionRuntimeStore interface {
+	SaveRuntimeSession(key string, session LiveSessionStatus) error
+	DeleteRuntimeSession(key string) error
+	ListRuntimeSessions(now time.Time) ([]runtimeSessionRecord, error)
 }
 
 type gatewayAuthRuntimeStore interface {

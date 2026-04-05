@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -394,6 +395,305 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 			t.Fatalf("expected request history to include routing decision trace, got %+v", payload.Items)
 		}
 	})
+}
+
+func TestAdminRuntimeSessionsReturnsLiveGatewaySessions(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseUpstream := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		<-releaseUpstream
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_live","usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	state := model.DefaultState()
+	state.PricingProfiles = []model.PricingProfile{{
+		ID:               "standard",
+		Name:             "standard",
+		Currency:         "USD",
+		InputPerMillion:  1,
+		OutputPerMillion: 2,
+	}}
+	state.Providers = []model.Provider{{
+		ID:             "openai",
+		Name:           "openai-main",
+		Kind:           model.ProviderKindOpenAICompatible,
+		Enabled:        true,
+		Weight:         1,
+		TimeoutSeconds: 30,
+		Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-openai",
+			BaseURL: upstream.URL + "/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-openai",
+			APIKey:  "openai-key",
+			Enabled: true,
+		}},
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias:            "gpt-5.4",
+		PricingProfileID: "standard",
+		Targets: []model.RouteTarget{{
+			ID:            "target-openai",
+			AccountID:     "openai",
+			UpstreamModel: "gpt-5.4-upstream",
+			Weight:        1,
+			Enabled:       true,
+		}},
+	}}
+
+	server := startGatewayServer(t, state)
+	defer server.Close()
+
+	requestDone := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{
+			"model":"gpt-5.4",
+			"messages":[{"role":"user","content":"hello"}],
+			"session_id":"session-live"
+		}`))
+		if err != nil {
+			requestDone <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", testGatewaySecret)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			requestDone <- err
+			return
+		}
+		defer res.Body.Close()
+		_, _ = io.Copy(io.Discard, res.Body)
+		if res.StatusCode != http.StatusOK {
+			requestDone <- context.DeadlineExceeded
+			return
+		}
+		requestDone <- nil
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream request to start")
+	}
+
+	var activePayload struct {
+		Items []map[string]any `json:"items"`
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	found := false
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL+"/api/admin/runtime/sessions?limit=10&active_within_minutes=15", nil)
+		if err != nil {
+			t.Fatalf("new admin request: %v", err)
+		}
+		req.Header.Set("X-Admin-Token", "admin-token")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("admin request failed: %v", err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected admin status: %d body=%s", res.StatusCode, string(body))
+		}
+		activePayload = struct {
+			Items []map[string]any `json:"items"`
+		}{}
+		if err := json.Unmarshal(body, &activePayload); err != nil {
+			t.Fatalf("decode admin payload: %v", err)
+		}
+		if len(activePayload.Items) == 1 &&
+			activePayload.Items[0]["session_id"] == "session-live" &&
+			activePayload.Items[0]["transport"] == "http" &&
+			activePayload.Items[0]["provider_id"] == "openai" {
+			found = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !found {
+		t.Fatalf("expected live runtime session while request is blocked, got %+v", activePayload.Items)
+	}
+
+	close(releaseUpstream)
+	if err := <-requestDone; err != nil {
+		t.Fatalf("gateway request failed: %v", err)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL+"/api/admin/runtime/sessions?limit=10&active_within_minutes=15", nil)
+		if err != nil {
+			t.Fatalf("new admin request: %v", err)
+		}
+		req.Header.Set("X-Admin-Token", "admin-token")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("admin request failed: %v", err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected admin status: %d body=%s", res.StatusCode, string(body))
+		}
+		activePayload = struct {
+			Items []map[string]any `json:"items"`
+		}{}
+		if err := json.Unmarshal(body, &activePayload); err != nil {
+			t.Fatalf("decode admin payload: %v", err)
+		}
+		if len(activePayload.Items) == 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("expected live runtime session to disappear after request completion, got %+v", activePayload.Items)
+}
+
+func TestAdminRuntimeProviderUsageReturnsLiveWindows(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseUpstream := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		<-releaseUpstream
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_live","usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	state := model.DefaultState()
+	state.PricingProfiles = []model.PricingProfile{{
+		ID:               "standard",
+		Name:             "standard",
+		Currency:         "USD",
+		InputPerMillion:  1,
+		OutputPerMillion: 2,
+	}}
+	state.Providers = []model.Provider{{
+		ID:             "openai",
+		Name:           "openai-main",
+		Kind:           model.ProviderKindOpenAICompatible,
+		Enabled:        true,
+		Weight:         1,
+		TimeoutSeconds: 30,
+		Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-openai",
+			BaseURL: upstream.URL + "/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-openai",
+			APIKey:  "openai-key",
+			Enabled: true,
+		}},
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias:            "gpt-5.4",
+		PricingProfileID: "standard",
+		Targets: []model.RouteTarget{{
+			ID:            "target-openai",
+			AccountID:     "openai",
+			UpstreamModel: "gpt-5.4-upstream",
+			Weight:        1,
+			Enabled:       true,
+		}},
+	}}
+
+	server := startGatewayServer(t, state)
+	defer server.Close()
+
+	requestDone := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{
+			"model":"gpt-5.4",
+			"messages":[{"role":"user","content":"hello"}],
+			"session_id":"provider-usage"
+		}`))
+		if err != nil {
+			requestDone <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", testGatewaySecret)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			requestDone <- err
+			return
+		}
+		defer res.Body.Close()
+		_, _ = io.Copy(io.Discard, res.Body)
+		if res.StatusCode != http.StatusOK {
+			requestDone <- context.DeadlineExceeded
+			return
+		}
+		requestDone <- nil
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream request to start")
+	}
+
+	var usagePayload struct {
+		Items []map[string]any `json:"items"`
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	found := false
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL+"/api/admin/runtime/provider-usage?limit=10", nil)
+		if err != nil {
+			t.Fatalf("new admin request: %v", err)
+		}
+		req.Header.Set("X-Admin-Token", "admin-token")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("admin request failed: %v", err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected admin status: %d body=%s", res.StatusCode, string(body))
+		}
+		usagePayload = struct {
+			Items []map[string]any `json:"items"`
+		}{}
+		if err := json.Unmarshal(body, &usagePayload); err != nil {
+			t.Fatalf("decode provider usage payload: %v", err)
+		}
+		if len(usagePayload.Items) == 1 &&
+			usagePayload.Items[0]["provider_id"] == "openai" &&
+			usagePayload.Items[0]["in_flight"] == float64(1) &&
+			usagePayload.Items[0]["current_minute_requests"] == float64(1) {
+			found = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !found {
+		t.Fatalf("expected live provider runtime usage while request is blocked, got %+v", usagePayload.Items)
+	}
+
+	close(releaseUpstream)
+	if err := <-requestDone; err != nil {
+		t.Fatalf("gateway request failed: %v", err)
+	}
 }
 
 func TestGatewayFallsBackToRouteAliasWhenUpstreamModelIsBlank(t *testing.T) {

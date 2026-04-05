@@ -83,6 +83,7 @@ type runtimeState struct {
 	endpoints             map[string]*endpointRuntimeState
 	credentials           map[string]*credentialRuntimeState
 	sticky                map[string]stickyBinding
+	sessions              map[string]LiveSessionStatus
 	stickyStore           stickyBindingStore
 	stickyWrites          int
 	providerWindows       map[string]*gatewayKeyWindow
@@ -121,6 +122,43 @@ type StickyBindingStatus struct {
 	ExpiresAt    time.Time `json:"expires_at"`
 }
 
+type LiveSessionStatus struct {
+	RequestID    string         `json:"request_id"`
+	SessionID    string         `json:"session_id"`
+	GatewayKeyID string         `json:"gateway_key_id,omitempty"`
+	ProviderID   string         `json:"provider_id,omitempty"`
+	ProviderName string         `json:"provider_name,omitempty"`
+	EndpointID   string         `json:"endpoint_id,omitempty"`
+	CredentialID string         `json:"credential_id,omitempty"`
+	RouteAlias   string         `json:"route_alias,omitempty"`
+	Scenario     string         `json:"scenario,omitempty"`
+	Protocol     model.Protocol `json:"protocol"`
+	Transport    string         `json:"transport"`
+	Path         string         `json:"path,omitempty"`
+	Stream       bool           `json:"stream,omitempty"`
+	StartedAt    time.Time      `json:"started_at"`
+	LastSeenAt   time.Time      `json:"last_seen_at"`
+	ExpiresAt    time.Time      `json:"expires_at"`
+}
+
+type ProviderRuntimeStatus struct {
+	ProviderID            string    `json:"provider_id"`
+	ProviderName          string    `json:"provider_name"`
+	RateLimitRPM          int       `json:"rate_limit_rpm,omitempty"`
+	MaxConcurrency        int       `json:"max_concurrency,omitempty"`
+	HourlyBudgetUSD       float64   `json:"hourly_budget_usd,omitempty"`
+	DailyBudgetUSD        float64   `json:"daily_budget_usd,omitempty"`
+	WeeklyBudgetUSD       float64   `json:"weekly_budget_usd,omitempty"`
+	MonthlyBudgetUSD      float64   `json:"monthly_budget_usd,omitempty"`
+	CurrentMinuteRequests int       `json:"current_minute_requests"`
+	InFlight              int       `json:"in_flight"`
+	HourlyCostUSD         float64   `json:"hourly_cost_usd"`
+	DailyCostUSD          float64   `json:"daily_cost_usd"`
+	WeeklyCostUSD         float64   `json:"weekly_cost_usd"`
+	MonthlyCostUSD        float64   `json:"monthly_cost_usd"`
+	MinuteBucketStartedAt time.Time `json:"minute_bucket_started_at,omitempty"`
+}
+
 func newRuntimeState(stickyStore ...stickyBindingStore) *runtimeState {
 	var currentStickyStore stickyBindingStore
 	if len(stickyStore) > 0 {
@@ -130,6 +168,7 @@ func newRuntimeState(stickyStore ...stickyBindingStore) *runtimeState {
 		endpoints:             map[string]*endpointRuntimeState{},
 		credentials:           map[string]*credentialRuntimeState{},
 		sticky:                map[string]stickyBinding{},
+		sessions:              map[string]LiveSessionStatus{},
 		stickyStore:           currentStickyStore,
 		providerWindows:       map[string]*gatewayKeyWindow{},
 		keyWindows:            map[string]*gatewayKeyWindow{},
@@ -137,6 +176,124 @@ func newRuntimeState(stickyStore ...stickyBindingStore) *runtimeState {
 		invalidGatewayLookups: map[string]invalidGatewayLookupState{},
 		authFailures:          map[string]*gatewayAuthFailureState{},
 	}
+}
+
+func (r *runtimeState) ProviderUsage(state model.RoutingState, now time.Time, limit int) []ProviderRuntimeStatus {
+	now = now.UTC()
+	if limit <= 0 {
+		limit = 200
+	}
+	items := make([]ProviderRuntimeStatus, 0, len(state.Providers))
+	for _, provider := range state.Providers {
+		var (
+			status ProviderRuntimeStatus
+			active bool
+			loaded bool
+		)
+		if store, ok := r.stickyStore.(providerRuntimeStore); ok && store != nil {
+			remote, remoteActive, err := store.LoadProviderRuntime(provider, now)
+			if err != nil {
+				slog.Warn("provider runtime list failed", "provider_id", provider.ID, "error", err)
+			} else {
+				status = remote
+				active = remoteActive
+				loaded = true
+			}
+		}
+		if !loaded {
+			status, active = r.localProviderUsage(provider, now)
+		}
+		if !active {
+			continue
+		}
+		items = append(items, status)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].InFlight != items[j].InFlight {
+			return items[i].InFlight > items[j].InFlight
+		}
+		if items[i].CurrentMinuteRequests != items[j].CurrentMinuteRequests {
+			return items[i].CurrentMinuteRequests > items[j].CurrentMinuteRequests
+		}
+		if items[i].MonthlyCostUSD != items[j].MonthlyCostUSD {
+			return items[i].MonthlyCostUSD > items[j].MonthlyCostUSD
+		}
+		if items[i].ProviderName != items[j].ProviderName {
+			return items[i].ProviderName < items[j].ProviderName
+		}
+		return items[i].ProviderID < items[j].ProviderID
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items
+}
+
+func (r *runtimeState) localProviderUsage(provider model.Provider, now time.Time) (ProviderRuntimeStatus, bool) {
+	r.mu.Lock()
+	window := r.providerWindows[provider.ID]
+	if window == nil {
+		r.mu.Unlock()
+		return ProviderRuntimeStatus{}, false
+	}
+	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
+	hourlyCost, dailyCost, weeklyCost, monthlyCost := gatewaySpendTotals(window.SpendEvents, now)
+	status := ProviderRuntimeStatus{
+		ProviderID:            provider.ID,
+		ProviderName:          provider.Name,
+		RateLimitRPM:          provider.RateLimitRPM,
+		MaxConcurrency:        provider.MaxConcurrency,
+		HourlyBudgetUSD:       provider.HourlyBudgetUSD,
+		DailyBudgetUSD:        provider.DailyBudgetUSD,
+		WeeklyBudgetUSD:       provider.WeeklyBudgetUSD,
+		MonthlyBudgetUSD:      provider.MonthlyBudgetUSD,
+		CurrentMinuteRequests: window.RequestCount,
+		InFlight:              window.InFlight,
+		HourlyCostUSD:         hourlyCost,
+		DailyCostUSD:          dailyCost,
+		WeeklyCostUSD:         weeklyCost,
+		MonthlyCostUSD:        monthlyCost,
+		MinuteBucketStartedAt: window.MinuteBucket,
+	}
+	r.mu.Unlock()
+	return status, providerRuntimeActive(status)
+}
+
+func providerRuntimeActive(status ProviderRuntimeStatus) bool {
+	return status.CurrentMinuteRequests > 0 ||
+		status.InFlight > 0 ||
+		status.HourlyCostUSD > 0 ||
+		status.DailyCostUSD > 0 ||
+		status.WeeklyCostUSD > 0 ||
+		status.MonthlyCostUSD > 0
+}
+
+func (r *runtimeState) ActiveSessions(now time.Time, activeWithin time.Duration, limit int) []LiveSessionStatus {
+	now = now.UTC()
+	if activeWithin <= 0 {
+		activeWithin = 15 * time.Minute
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	cutoff := now.Add(-activeWithin)
+	if store, ok := r.stickyStore.(sessionRuntimeStore); ok && store != nil {
+		records, err := store.ListRuntimeSessions(now)
+		if err != nil {
+			slog.Warn("gateway live session list failed", "error", err)
+		} else {
+			return filterLiveSessions(runtimeSessionStatuses(records), cutoff, limit)
+		}
+	}
+
+	r.mu.Lock()
+	r.sweepExpiredSessionsLocked(now)
+	items := make([]LiveSessionStatus, 0, len(r.sessions))
+	for _, session := range r.sessions {
+		items = append(items, session)
+	}
+	r.mu.Unlock()
+	return filterLiveSessions(items, cutoff, limit)
 }
 
 func (r *runtimeState) StickyBindings(now time.Time) []StickyBindingStatus {
@@ -188,6 +345,40 @@ func stickyBindingStatusesFromRecords(records []stickyBindingRecord) []StickyBin
 		return items[i].SessionID < items[j].SessionID
 	})
 	return items
+}
+
+func runtimeSessionStatuses(records []runtimeSessionRecord) []LiveSessionStatus {
+	items := make([]LiveSessionStatus, 0, len(records))
+	for _, record := range records {
+		items = append(items, record.Session)
+	}
+	return items
+}
+
+func filterLiveSessions(items []LiveSessionStatus, cutoff time.Time, limit int) []LiveSessionStatus {
+	filtered := make([]LiveSessionStatus, 0, len(items))
+	for _, item := range items {
+		if item.RequestID == "" || item.SessionID == "" {
+			continue
+		}
+		if item.LastSeenAt.Before(cutoff) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		if !filtered[i].LastSeenAt.Equal(filtered[j].LastSeenAt) {
+			return filtered[i].LastSeenAt.After(filtered[j].LastSeenAt)
+		}
+		if !filtered[i].StartedAt.Equal(filtered[j].StartedAt) {
+			return filtered[i].StartedAt.After(filtered[j].StartedAt)
+		}
+		return filtered[i].RequestID < filtered[j].RequestID
+	})
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+	return filtered
 }
 
 func (r *runtimeState) ResetStickyBindings(gatewayKeyID, routeAlias, scenario, sessionID string, now time.Time) int {
@@ -682,10 +873,95 @@ func (r *runtimeState) stickyBindingFor(gatewayKeyID, alias, sessionID string, n
 	return stickyBinding{}, false
 }
 
+func (r *runtimeState) startSession(session LiveSessionStatus, ttl time.Duration) string {
+	session.RequestID = strings.TrimSpace(session.RequestID)
+	session.SessionID = strings.TrimSpace(session.SessionID)
+	if session.RequestID == "" || session.SessionID == "" {
+		return ""
+	}
+	now := time.Now().UTC()
+	if session.StartedAt.IsZero() {
+		session.StartedAt = now
+	}
+	if session.LastSeenAt.IsZero() {
+		session.LastSeenAt = session.StartedAt
+	}
+	if ttl <= 0 {
+		ttl = 2 * time.Minute
+	}
+	session.ExpiresAt = session.LastSeenAt.Add(ttl)
+
+	r.mu.Lock()
+	r.sweepExpiredSessionsLocked(now)
+	r.sessions[session.RequestID] = session
+	r.mu.Unlock()
+
+	if store, ok := r.stickyStore.(sessionRuntimeStore); ok && store != nil {
+		if err := store.SaveRuntimeSession(session.RequestID, session); err != nil {
+			slog.Warn("gateway live session write failed", "request_id", session.RequestID, "error", err)
+		}
+	}
+	return session.RequestID
+}
+
+func (r *runtimeState) touchSession(requestID string, now time.Time, ttl time.Duration) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return
+	}
+	if ttl <= 0 {
+		ttl = 2 * time.Minute
+	}
+	now = now.UTC()
+
+	r.mu.Lock()
+	r.sweepExpiredSessionsLocked(now)
+	session, ok := r.sessions[requestID]
+	if ok {
+		session.LastSeenAt = now
+		session.ExpiresAt = now.Add(ttl)
+		r.sessions[requestID] = session
+	}
+	r.mu.Unlock()
+
+	if !ok {
+		return
+	}
+	if store, ok := r.stickyStore.(sessionRuntimeStore); ok && store != nil {
+		if err := store.SaveRuntimeSession(requestID, session); err != nil {
+			slog.Warn("gateway live session touch failed", "request_id", requestID, "error", err)
+		}
+	}
+}
+
+func (r *runtimeState) endSession(requestID string) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return
+	}
+	r.mu.Lock()
+	delete(r.sessions, requestID)
+	r.mu.Unlock()
+
+	if store, ok := r.stickyStore.(sessionRuntimeStore); ok && store != nil {
+		if err := store.DeleteRuntimeSession(requestID); err != nil {
+			slog.Warn("gateway live session delete failed", "request_id", requestID, "error", err)
+		}
+	}
+}
+
 func (r *runtimeState) sweepExpiredStickyLocked(now time.Time) {
 	for key, binding := range r.sticky {
 		if !binding.ExpiresAt.After(now) {
 			delete(r.sticky, key)
+		}
+	}
+}
+
+func (r *runtimeState) sweepExpiredSessionsLocked(now time.Time) {
+	for key, session := range r.sessions {
+		if !session.ExpiresAt.After(now) {
+			delete(r.sessions, key)
 		}
 	}
 }

@@ -908,6 +908,10 @@ func (h *Handlers) GetRequestAttempts(w http.ResponseWriter, r *http.Request) {
 
 // ListActiveSessions serves GET /api/admin/runtime/sessions.
 func (h *Handlers) ListActiveSessions(w http.ResponseWriter, r *http.Request) {
+	if h.gateway == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
+		return
+	}
 	limit, err := readPositiveIntQuery(r, "limit", 50, 200)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -918,11 +922,7 @@ func (h *Handlers) ListActiveSessions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	items, err := h.store.ActiveSessions(time.Now().UTC(), time.Duration(activeWithinMinutes)*time.Minute, limit)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
+	items := h.gateway.ActiveSessions(time.Duration(activeWithinMinutes)*time.Minute, limit)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"active_within_minutes": activeWithinMinutes,
 		"items":                 items,
@@ -960,16 +960,16 @@ func (h *Handlers) ResetStickyBindings(w http.ResponseWriter, r *http.Request) {
 
 // GetProviderUsage serves GET /api/admin/runtime/provider-usage.
 func (h *Handlers) GetProviderUsage(w http.ResponseWriter, r *http.Request) {
+	if h.gateway == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
+		return
+	}
 	limit, err := readPositiveIntQuery(r, "limit", 200, 500)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	items, err := h.store.ProviderUsage(time.Now().UTC(), limit)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
+	items := h.gateway.ProviderUsage(limit)
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
@@ -1304,7 +1304,7 @@ func buildOpenAPISpec() map[string]any {
 				"get": map[string]any{"summary": "Get recorded upstream attempts for one request"},
 			},
 			"/api/admin/runtime/sessions": map[string]any{
-				"get": map[string]any{"summary": "List active sessions derived from recent request history"},
+				"get": map[string]any{"summary": "List live runtime sessions currently tracked by the gateway"},
 			},
 			"/api/admin/runtime/sticky-bindings": map[string]any{
 				"get": map[string]any{"summary": "List live sticky routing bindings"},
@@ -1313,7 +1313,7 @@ func buildOpenAPISpec() map[string]any {
 				"post": map[string]any{"summary": "Reset live sticky routing bindings"},
 			},
 			"/api/admin/runtime/provider-usage": map[string]any{
-				"get": map[string]any{"summary": "Summarize rolling provider usage windows"},
+				"get": map[string]any{"summary": "List live provider runtime windows currently tracked by the gateway"},
 			},
 			"/api/admin/runtime/circuits": map[string]any{
 				"get": map[string]any{"summary": "List passive circuit states for provider endpoints"},

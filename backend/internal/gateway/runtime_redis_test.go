@@ -50,6 +50,43 @@ func TestRedisStickyBindingsAreSharedAcrossRuntimeInstances(t *testing.T) {
 	}
 }
 
+func TestRedisLiveSessionsAreSharedAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	first := newRuntimeState(store)
+	second := newRuntimeState(store)
+	now := time.Now().UTC()
+
+	requestID := first.startSession(LiveSessionStatus{
+		RequestID:    "req-1",
+		SessionID:    "session-1",
+		GatewayKeyID: "gk-1",
+		ProviderID:   "provider-1",
+		ProviderName: "Provider One",
+		RouteAlias:   "gpt-5.4",
+		Protocol:     model.ProtocolOpenAIChat,
+		Transport:    "http",
+		StartedAt:    now,
+		LastSeenAt:   now,
+	}, 2*time.Minute)
+
+	items := second.ActiveSessions(now, 15*time.Minute, 10)
+	if len(items) != 1 || items[0].RequestID != requestID || items[0].SessionID != "session-1" {
+		t.Fatalf("expected shared live session, got %+v", items)
+	}
+
+	first.endSession(requestID)
+	if items = second.ActiveSessions(now, 15*time.Minute, 10); len(items) != 0 {
+		t.Fatalf("expected shared live session to be cleared, got %+v", items)
+	}
+}
+
 func TestRedisStickyBindingsCanBeListedAndResetAcrossRuntimeInstances(t *testing.T) {
 	t.Parallel()
 
@@ -181,6 +218,40 @@ func TestRedisProviderWindowsAreSharedAcrossRuntimeInstances(t *testing.T) {
 
 	if err := runtimeB.acquireProvider(provider, now); err != errProviderHourlyBudget {
 		t.Fatalf("expected shared provider hourly budget limit, got %v", err)
+	}
+}
+
+func TestRedisProviderUsageListingReflectsSharedRuntimeWindows(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	now := time.Now().UTC()
+	provider := model.Provider{
+		ID:           "provider-1",
+		Name:         "Provider One",
+		RateLimitRPM: 5,
+	}
+	state := model.RoutingState{Providers: []model.Provider{provider}}
+
+	if err := runtimeA.acquireProvider(provider, now); err != nil {
+		t.Fatalf("acquire provider: %v", err)
+	}
+	items := runtimeB.ProviderUsage(state, now, 10)
+	if len(items) != 1 || items[0].InFlight != 1 || items[0].CurrentMinuteRequests != 1 {
+		t.Fatalf("expected shared provider usage during inflight request, got %+v", items)
+	}
+
+	runtimeA.releaseProvider(provider.ID, 1.5)
+	items = runtimeB.ProviderUsage(state, now, 10)
+	if len(items) != 1 || items[0].InFlight != 0 || items[0].HourlyCostUSD != 1.5 {
+		t.Fatalf("expected shared provider usage after release, got %+v", items)
 	}
 }
 

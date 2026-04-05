@@ -92,7 +92,9 @@ const (
 )
 
 const (
-	headerCodexTurnState = "X-Codex-Turn-State"
+	headerCodexTurnState     = "X-Codex-Turn-State"
+	defaultRuntimeSessionTTL = 2 * time.Minute
+	runtimeSessionHeartbeat  = 30 * time.Second
 )
 
 const (
@@ -188,6 +190,40 @@ func (s *Service) Close() error {
 		return stickyStore.Close()
 	}
 	return nil
+}
+
+func (s *Service) trackRuntimeSession(session LiveSessionStatus) func() {
+	key := s.runtime.startSession(session, defaultRuntimeSessionTTL)
+	if key == "" {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	interval := runtimeSessionHeartbeat
+	if defaultRuntimeSessionTTL/2 < interval {
+		interval = defaultRuntimeSessionTTL / 2
+	}
+	if interval <= 0 {
+		interval = runtimeSessionHeartbeat
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.runtime.touchSession(key, time.Now().UTC(), defaultRuntimeSessionTTL)
+			case <-stop:
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			s.runtime.endSession(key)
+		})
+	}
 }
 
 // HandleModels serves GET /v1/models and filters aliases by the authenticated
@@ -296,6 +332,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 		if record.ClientSessionID == "" && responseTurnState != "" {
 			record.ClientSessionID = responseTurnState
 		}
+		liveSessionID := record.ClientSessionID
 		record.RoutingDecision = newRoutingDecision(route, appliedScenario, gatewayKey.ID, parsedRequest.sessionID, candidates, s.runtime, started)
 		logger := slog.With(
 			"request_id", record.ID,
@@ -414,8 +451,26 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 				}
 				break
 			}
+			closeLiveSession := s.trackRuntimeSession(LiveSessionStatus{
+				RequestID:    record.ID,
+				SessionID:    liveSessionID,
+				GatewayKeyID: gatewayKey.ID,
+				ProviderID:   candidate.provider.ID,
+				ProviderName: candidate.provider.Name,
+				EndpointID:   candidate.endpoint.ID,
+				CredentialID: candidate.credential.ID,
+				RouteAlias:   parsedRequest.routeAlias,
+				Scenario:     appliedScenario,
+				Protocol:     protocol,
+				Transport:    "http",
+				Path:         r.URL.Path,
+				Stream:       parsedRequest.stream,
+				StartedAt:    attemptStarted,
+				LastSeenAt:   attemptStarted,
+			})
 			resp, err := s.doProxyRequest(attemptCtx, candidate, exchange, r.Method, r.Header, parsedRequest.rawQuery)
 			if err != nil {
+				closeLiveSession()
 				s.runtime.releaseProvider(candidate.provider.ID, 0)
 				attemptSpan.RecordError(err)
 				attemptSpan.SetStatus(codes.Error, err.Error())
@@ -457,6 +512,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			}
 
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				closeLiveSession()
 				s.runtime.releaseProvider(candidate.provider.ID, 0)
 				attemptSpan.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
@@ -523,6 +579,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			}
 			writeErr := s.writeProxyResponse(w, resp, observer, exchange, parsedRequest.routeAlias, candidate.route.Transformers, candidate)
 			_ = resp.Body.Close()
+			closeLiveSession()
 			if writeErr != nil {
 				s.runtime.releaseProvider(candidate.provider.ID, 0)
 				attemptSpan.RecordError(writeErr)
@@ -785,6 +842,24 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		Stream:          true,
 	}
 	record.RoutingDecision = newRoutingDecision(route, appliedScenario, gatewayKey.ID, sessionID, candidates, s.runtime, started)
+	closeLiveSession := s.trackRuntimeSession(LiveSessionStatus{
+		RequestID:    record.ID,
+		SessionID:    sessionID,
+		GatewayKeyID: gatewayKey.ID,
+		ProviderID:   candidate.provider.ID,
+		ProviderName: candidate.provider.Name,
+		EndpointID:   candidate.endpoint.ID,
+		CredentialID: candidate.credential.ID,
+		RouteAlias:   routeAlias,
+		Scenario:     appliedScenario,
+		Protocol:     model.ProtocolOpenAIRealtime,
+		Transport:    "realtime",
+		Path:         r.URL.Path,
+		Stream:       true,
+		StartedAt:    started,
+		LastSeenAt:   started,
+	})
+	defer closeLiveSession()
 	logger := slog.With(
 		"request_id", record.ID,
 		"protocol", model.ProtocolOpenAIRealtime,
@@ -1042,6 +1117,22 @@ func (s *Service) StickyBindings() []StickyBindingStatus {
 		return nil
 	}
 	return s.runtime.StickyBindings(time.Now().UTC())
+}
+
+// ActiveSessions returns the current live runtime sessions.
+func (s *Service) ActiveSessions(activeWithin time.Duration, limit int) []LiveSessionStatus {
+	if s == nil || s.runtime == nil {
+		return nil
+	}
+	return s.runtime.ActiveSessions(time.Now().UTC(), activeWithin, limit)
+}
+
+// ProviderUsage returns the current live provider runtime windows.
+func (s *Service) ProviderUsage(limit int) []ProviderRuntimeStatus {
+	if s == nil || s.runtime == nil || s.store == nil {
+		return nil
+	}
+	return s.runtime.ProviderUsage(s.store.RoutingSnapshot(), time.Now().UTC(), limit)
 }
 
 // ResetCircuits clears passive circuit state for matching endpoints. Empty

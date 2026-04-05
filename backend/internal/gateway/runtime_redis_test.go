@@ -1,0 +1,193 @@
+package gateway
+
+import (
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+
+	"github.com/KoinaAI/conduit/backend/internal/config"
+	"github.com/KoinaAI/conduit/backend/internal/model"
+)
+
+func TestRedisStickyBindingsAreSharedAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	first := newRuntimeState(store)
+	second := newRuntimeState(store)
+	now := time.Now().UTC()
+	candidate := resolvedCandidate{
+		provider: model.Provider{
+			ID:                      "provider-1",
+			StickySessionTTLSeconds: 300,
+		},
+		route: model.ModelRoute{
+			Alias: "gpt-5.4",
+		},
+		endpoint: model.ProviderEndpoint{
+			ID: "endpoint-1",
+		},
+		credential: model.ProviderCredential{
+			ID: "credential-1",
+		},
+		gatewayKeyID: "gateway-key-1",
+	}
+
+	first.bindStickyCandidate(candidate, "session-1", now)
+
+	binding, ok := second.stickyBindingFor("gateway-key-1", stickyRouteKey("gpt-5.4", ""), "session-1", now)
+	if !ok {
+		t.Fatal("expected sticky binding to be loaded from redis-backed cache")
+	}
+	if binding.ProviderID != "provider-1" || binding.EndpointID != "endpoint-1" || binding.CredentialID != "credential-1" {
+		t.Fatalf("unexpected sticky binding: %+v", binding)
+	}
+}
+
+func TestRedisRoundRobinOffsetsAreSharedAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+
+	if got := runtimeA.nextRoundRobinOffset("route\x00band", 3); got != 0 {
+		t.Fatalf("expected first shared round-robin offset 0, got %d", got)
+	}
+	if got := runtimeB.nextRoundRobinOffset("route\x00band", 3); got != 1 {
+		t.Fatalf("expected second shared round-robin offset 1, got %d", got)
+	}
+	if got := runtimeA.nextRoundRobinOffset("route\x00band", 3); got != 2 {
+		t.Fatalf("expected third shared round-robin offset 2, got %d", got)
+	}
+}
+
+func TestRedisGatewayKeyWindowsAreSharedAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	now := time.Now().UTC()
+	key := model.GatewayKey{
+		ID:              "gk-1",
+		RateLimitRPM:    2,
+		MaxConcurrency:  1,
+		HourlyBudgetUSD: 1,
+	}
+
+	if err := runtimeA.acquireGatewayKey(key, now); err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	if err := runtimeB.acquireGatewayKey(key, now); err != errConcurrencyLimit {
+		t.Fatalf("expected shared concurrency limit, got %v", err)
+	}
+	runtimeA.releaseGatewayKey(key.ID, 1)
+
+	if err := runtimeB.acquireGatewayKey(key, now); err != errHourlyBudget {
+		t.Fatalf("expected shared hourly budget limit, got %v", err)
+	}
+}
+
+func TestRedisGatewayAuthStateIsSharedAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	now := time.Now().UTC()
+	source := "203.0.113.10"
+	lookupHash := "lookup-hash"
+	fingerprint := "candidate-fingerprint"
+
+	for attempt := 0; attempt < defaultAuthFailureLimit; attempt++ {
+		runtimeA.recordGatewayAuthFailure(source, lookupHash, fingerprint, now)
+	}
+	if !runtimeB.gatewayAuthSourceLocked(source, now) {
+		t.Fatal("expected shared auth lockout state")
+	}
+	if !runtimeB.invalidGatewayLookupCached(lookupHash, fingerprint, now) {
+		t.Fatal("expected shared invalid lookup cache")
+	}
+
+	runtimeB.clearGatewayAuthFailures(source, lookupHash)
+	if runtimeA.gatewayAuthSourceLocked(source, now) {
+		t.Fatal("expected shared auth lockout to clear")
+	}
+	if runtimeA.invalidGatewayLookupCached(lookupHash, fingerprint, now) {
+		t.Fatal("expected shared invalid lookup cache to clear")
+	}
+}
+
+func TestRedisCircuitBreakerHalfOpenStateIsSharedAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	enabled := true
+	candidate := resolvedCandidate{
+		provider: model.Provider{
+			ID: "provider-1",
+			CircuitBreaker: model.CircuitBreakerConfig{
+				Enabled:             &enabled,
+				FailureThreshold:    1,
+				CooldownSeconds:     1,
+				HalfOpenMaxRequests: 1,
+			},
+		},
+		endpoint:   model.ProviderEndpoint{ID: "endpoint-1"},
+		credential: model.ProviderCredential{ID: "credential-1", APIKey: "provider-key"},
+	}
+
+	runtimeA.reportFailure(candidate, 500, "boom", 0, false)
+	if !runtimeB.endpointOpen(candidate, time.Now().UTC()) {
+		t.Fatal("expected shared circuit breaker to open")
+	}
+
+	probeAt := time.Now().UTC().Add(2 * time.Second)
+	halfOpen, err := runtimeA.acquireEndpoint(candidate, probeAt)
+	if err != nil {
+		t.Fatalf("acquire shared half-open probe: %v", err)
+	}
+	if !halfOpen {
+		t.Fatal("expected shared probe acquisition to enter half-open mode")
+	}
+	if !runtimeB.endpointOpen(candidate, probeAt) {
+		t.Fatal("expected shared half-open slot exhaustion to block peers")
+	}
+	if _, err := runtimeB.acquireEndpoint(candidate, probeAt); err != errEndpointCircuitOpen {
+		t.Fatalf("expected peer half-open acquire to fail, got %v", err)
+	}
+
+	runtimeA.reportSuccess(candidate, 5*time.Millisecond, halfOpen)
+	if runtimeB.endpointOpen(candidate, probeAt) {
+		t.Fatal("expected successful shared half-open probe to close the circuit")
+	}
+}

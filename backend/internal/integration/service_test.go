@@ -177,6 +177,83 @@ func TestApplySyncResultPreservesCheckinMetadata(t *testing.T) {
 	}
 }
 
+func TestApplySyncResultSyncsManagedPricingProfiles(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(WithAllowPrivateBaseURLForTests())
+	state := model.DefaultState()
+	state.Integrations = []model.Integration{{
+		ID:                      "integration-1",
+		Name:                    "NewAPI",
+		Kind:                    model.IntegrationKindNewAPI,
+		BaseURL:                 "https://relay.example",
+		AccessKey:               "token",
+		Enabled:                 true,
+		AutoCreateRoutes:        true,
+		AutoSyncPricingProfiles: true,
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias:            "manual-only",
+		PricingProfileID: "manual-profile",
+		Targets: []model.RouteTarget{{
+			ID:               "target-manual",
+			AccountID:        "provider-manual",
+			UpstreamModel:    "manual-only",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+	}}
+
+	result := SyncResult{
+		Snapshot: model.IntegrationSnapshot{
+			ModelNames: []string{"gpt-5.4", "manual-only"},
+			Prices: map[string]model.IntegrationPricing{
+				"gpt-5.4": {
+					InputPerMillion:  2.5,
+					OutputPerMillion: 10,
+					Currency:         "USD",
+				},
+				"manual-only": {
+					InputPerMillion:  1,
+					OutputPerMillion: 2,
+					Currency:         "USD",
+				},
+			},
+		},
+		FinishedAt: time.Date(2026, time.April, 5, 8, 0, 0, 0, time.UTC),
+	}
+
+	if _, err := service.ApplySyncResult(&state, "integration-1", result); err != nil {
+		t.Fatalf("apply sync result: %v", err)
+	}
+
+	profileID := managedPricingProfileID("integration-1", "gpt-5.4")
+	profile, ok := state.FindPricingProfile(profileID)
+	if !ok {
+		t.Fatalf("expected managed pricing profile %q to be created", profileID)
+	}
+	if profile.InputPerMillion != 2.5 || profile.OutputPerMillion != 10 {
+		t.Fatalf("unexpected managed pricing profile: %+v", profile)
+	}
+
+	route, ok := state.FindRoute("gpt-5.4")
+	if !ok {
+		t.Fatal("expected auto-created route for gpt-5.4")
+	}
+	if route.PricingProfileID != profileID {
+		t.Fatalf("expected route pricing profile to be assigned, got %q", route.PricingProfileID)
+	}
+
+	manualRoute, ok := state.FindRoute("manual-only")
+	if !ok {
+		t.Fatal("expected existing manual route to remain")
+	}
+	if manualRoute.PricingProfileID != "manual-profile" {
+		t.Fatalf("expected manual pricing profile to be preserved, got %q", manualRoute.PricingProfileID)
+	}
+}
+
 func TestClientForResolvedReusesPinnedClient(t *testing.T) {
 	t.Parallel()
 
@@ -677,7 +754,7 @@ func TestResolveBaseURLPinsResolvedAddress(t *testing.T) {
 		return []net.IP{net.ParseIP("203.0.113.10")}, nil
 	}
 
-	resolved, err := service.resolveBaseURL("https://relay.example/api")
+	resolved, err := service.resolveBaseURL(context.Background(), "https://relay.example/api")
 	if err != nil {
 		t.Fatalf("resolve base url: %v", err)
 	}

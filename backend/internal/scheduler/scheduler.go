@@ -2,23 +2,25 @@ package scheduler
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/admin"
 )
 
 type Service struct {
-	admin         *admin.Handlers
-	stop          chan struct{}
-	probeInterval time.Duration
+	admin           *admin.Handlers
+	stop            chan struct{}
+	probeInterval   time.Duration
+	pricingInterval time.Duration
 }
 
-func New(admin *admin.Handlers, probeInterval time.Duration) *Service {
+func New(admin *admin.Handlers, probeInterval, pricingInterval time.Duration) *Service {
 	return &Service{
-		admin:         admin,
-		stop:          make(chan struct{}),
-		probeInterval: probeInterval,
+		admin:           admin,
+		stop:            make(chan struct{}),
+		probeInterval:   probeInterval,
+		pricingInterval: pricingInterval,
 	}
 }
 
@@ -32,6 +34,14 @@ func (s *Service) Start(ctx context.Context) {
 		probeTicker = time.NewTicker(s.probeInterval)
 		probeCh = probeTicker.C
 		defer probeTicker.Stop()
+	}
+
+	var pricingTicker *time.Ticker
+	var pricingCh <-chan time.Time
+	if s.pricingInterval > 0 {
+		pricingTicker = time.NewTicker(s.pricingInterval)
+		pricingCh = pricingTicker.C
+		defer pricingTicker.Stop()
 	}
 
 	for {
@@ -48,6 +58,10 @@ func (s *Service) Start(ctx context.Context) {
 			runSafely("probes", func() {
 				s.admin.RunProbes(ctx)
 			})
+		case <-pricingCh:
+			runSafely("pricing_sync", func() {
+				s.admin.RunPricingSync(ctx)
+			})
 		}
 	}
 }
@@ -57,14 +71,14 @@ func (s *Service) Stop() {
 	case <-s.stop:
 	default:
 		close(s.stop)
-		log.Print("scheduler stopped")
+		slog.Info("scheduler stopped")
 	}
 }
 
 func runSafely(name string, fn func()) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			log.Printf("scheduler %s task panicked: %v", name, recovered)
+			slog.Error("scheduler task panicked", "task", name, "panic", recovered)
 		}
 	}()
 	fn()

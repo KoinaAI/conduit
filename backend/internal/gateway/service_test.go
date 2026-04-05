@@ -50,6 +50,7 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 			openAIRequests <- observedRequest{
 				Path:          r.URL.Path,
 				Authorization: r.Header.Get("Authorization"),
+				Query:         r.URL.RawQuery,
 				Body:          string(body),
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -168,6 +169,9 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		{
 			Alias:            "gpt-5.4",
 			PricingProfileID: "standard",
+			Scenarios: []model.RouteScenario{{
+				Name: "background",
+			}},
 			Targets: []model.RouteTarget{
 				{ID: "t1", AccountID: "openai", UpstreamModel: "up-openai", Weight: 1, Enabled: true, MarkupMultiplier: 1.5},
 			},
@@ -199,6 +203,15 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		if res.StatusCode != http.StatusOK {
 			t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
 		}
+		if res.Header.Get("X-Conduit-Provider") != "openai" {
+			t.Fatalf("expected conduit provider header, got %+v", res.Header)
+		}
+		if res.Header.Get("X-Conduit-Route") != "gpt-5.4" {
+			t.Fatalf("expected conduit route header, got %+v", res.Header)
+		}
+		if credentialHeader := res.Header.Get("X-Conduit-Credential"); credentialHeader != "" {
+			t.Fatalf("did not expect credential header to be exposed, got %q", credentialHeader)
+		}
 
 		seen := <-openAIRequests
 		if seen.Authorization != "Bearer openai-key" {
@@ -211,7 +224,7 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 
 	t.Run("openai responses sse", func(t *testing.T) {
 		payload := `{"model":"gpt-5.4","input":"hello","stream":true}`
-		res, body := postJSON(t, gatewayServer.URL+"/v1/responses", payload)
+		res, body := postJSON(t, gatewayServer.URL+"/v1/responses?include=usage&trace=1", payload)
 		defer res.Body.Close()
 
 		if !strings.Contains(body, "response.completed") {
@@ -226,6 +239,9 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		seen := <-openAIRequests
 		if seen.Path != "/v1/responses" {
 			t.Fatalf("unexpected observed path: %s", seen.Path)
+		}
+		if seen.Query != "include=usage&trace=1" {
+			t.Fatalf("expected responses query to be preserved, got %q", seen.Query)
 		}
 	})
 
@@ -273,10 +289,10 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 	})
 
 	t.Run("realtime websocket", func(t *testing.T) {
-		wsURL := "ws" + strings.TrimPrefix(gatewayServer.URL, "http") + "/v1/realtime?model=gpt-5.4"
+		wsURL := "ws" + strings.TrimPrefix(gatewayServer.URL, "http") + "/v1/realtime?model=gpt-5.4&session_id=realtime-session&routing_scenario=background"
 		headers := http.Header{}
 		headers.Set("X-API-Key", testGatewaySecret)
-		conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
+		conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
 		if err != nil {
 			t.Fatalf("dial realtime: %v", err)
 		}
@@ -289,10 +305,25 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		if event["type"] != "response.completed" {
 			t.Fatalf("unexpected realtime event: %+v", event)
 		}
+		if resp == nil {
+			t.Fatal("expected realtime upgrade response metadata")
+		}
+		if got := resp.Header.Get("X-Conduit-Session-Id"); got != "realtime-session" {
+			t.Fatalf("expected realtime session header, got %q", got)
+		}
+		if got := resp.Header.Get("X-Conduit-Scenario"); got != "background" {
+			t.Fatalf("expected realtime scenario header, got %q", got)
+		}
 
 		seen := <-openAIRequests
 		if !strings.Contains(seen.Query, "model=up-openai") {
 			t.Fatalf("expected rewritten realtime query: %s", seen.Query)
+		}
+		if !strings.Contains(seen.Query, "session_id=realtime-session") {
+			t.Fatalf("expected realtime session query to be preserved, got %s", seen.Query)
+		}
+		if !strings.Contains(seen.Query, "routing_scenario=background") {
+			t.Fatalf("expected realtime scenario query to be preserved, got %s", seen.Query)
 		}
 	})
 
@@ -325,6 +356,9 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		}
 		if len(saved.RequestHistory) < 4 {
 			t.Fatalf("expected request history to be populated, got %d", len(saved.RequestHistory))
+		}
+		if saved.RequestHistory[len(saved.RequestHistory)-1].RoutingDecision == nil {
+			t.Fatalf("expected request history to include routing decision trace, got %+v", saved.RequestHistory[len(saved.RequestHistory)-1])
 		}
 	})
 }
@@ -382,6 +416,128 @@ func TestGatewayFallsBackToRouteAliasWhenUpstreamModelIsBlank(t *testing.T) {
 	seen := <-requests
 	if !strings.Contains(seen.Body, `"model":"gpt-5.4"`) {
 		t.Fatalf("expected route alias fallback when upstream model is blank, got %s", seen.Body)
+	}
+}
+
+func TestResponsesCodexTurnStatePinsSubsequentRequests(t *testing.T) {
+	t.Parallel()
+
+	providerOneRequests := make(chan observedRequest, 2)
+	providerTwoRequests := make(chan observedRequest, 2)
+
+	newResponsesServer := func(requests chan observedRequest) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			requests <- observedRequest{
+				Path:          r.URL.Path,
+				Authorization: r.Header.Get("Authorization"),
+				Body:          string(body),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_1","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+		}))
+	}
+
+	serverOne := newResponsesServer(providerOneRequests)
+	defer serverOne.Close()
+	serverTwo := newResponsesServer(providerTwoRequests)
+	defer serverTwo.Close()
+
+	state := model.DefaultState()
+	state.PricingProfiles = []model.PricingProfile{{
+		ID:               "standard",
+		Name:             "standard",
+		Currency:         "USD",
+		InputPerMillion:  1,
+		OutputPerMillion: 1,
+	}}
+	state.Providers = []model.Provider{
+		{
+			ID:             "provider-one",
+			Name:           "provider-one",
+			Kind:           model.ProviderKindOpenAICompatible,
+			BaseURL:        serverOne.URL + "/v1",
+			APIKey:         "provider-one-key",
+			Enabled:        true,
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
+			TimeoutSeconds: 30,
+		},
+		{
+			ID:             "provider-two",
+			Name:           "provider-two",
+			Kind:           model.ProviderKindOpenAICompatible,
+			BaseURL:        serverTwo.URL + "/v1",
+			APIKey:         "provider-two-key",
+			Enabled:        true,
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
+			TimeoutSeconds: 30,
+		},
+	}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias:            "gpt-5.4",
+		Strategy:         model.RouteStrategyRoundRobin,
+		PricingProfileID: "standard",
+		Targets: []model.RouteTarget{
+			{ID: "target-1", AccountID: "provider-one", UpstreamModel: "up-one", Weight: 1, Enabled: true, MarkupMultiplier: 1},
+			{ID: "target-2", AccountID: "provider-two", UpstreamModel: "up-two", Weight: 1, Enabled: true, MarkupMultiplier: 1},
+		},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	doRequest := func(turnState string) *http.Response {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, gatewayServer.URL+"/v1/responses", bytes.NewBufferString(`{"model":"gpt-5.4","input":"hello"}`))
+		if err != nil {
+			t.Fatalf("new responses request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", testGatewaySecret)
+		if turnState != "" {
+			req.Header.Set("X-Codex-Turn-State", turnState)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("responses request failed: %v", err)
+		}
+		return res
+	}
+
+	first := doRequest("")
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(first.Body)
+		t.Fatalf("unexpected first status: %d body=%s", first.StatusCode, string(body))
+	}
+	turnState := first.Header.Get("X-Codex-Turn-State")
+	if turnState == "" {
+		t.Fatal("expected gateway to issue a Codex turn-state header")
+	}
+
+	var firstSeen observedRequest
+	select {
+	case firstSeen = <-providerOneRequests:
+	case firstSeen = <-providerTwoRequests:
+	}
+	firstProviderAuth := firstSeen.Authorization
+
+	second := doRequest(turnState)
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(second.Body)
+		t.Fatalf("unexpected second status: %d body=%s", second.StatusCode, string(body))
+	}
+	if got := second.Header.Get("X-Codex-Turn-State"); got != turnState {
+		t.Fatalf("expected gateway to echo Codex turn-state, got %q want %q", got, turnState)
+	}
+
+	var secondSeen observedRequest
+	select {
+	case secondSeen = <-providerOneRequests:
+	case secondSeen = <-providerTwoRequests:
+	}
+	if secondSeen.Authorization != firstProviderAuth {
+		t.Fatalf("expected second request to stay pinned to %q, got %q", firstProviderAuth, secondSeen.Authorization)
 	}
 }
 
@@ -472,6 +628,351 @@ func TestGatewayRetriesTransformFailuresBeforeWritingResponse(t *testing.T) {
 	}
 	if firstCalls != 1 {
 		t.Fatalf("expected first candidate to be attempted exactly once, got %d", firstCalls)
+	}
+}
+
+func TestGatewayFallsBackToEstimatedUsageWhenUpstreamOmitsUsage(t *testing.T) {
+	t.Parallel()
+
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","choices":[{"message":{"content":"这是一个没有 usage 字段的回答"}}]}`))
+	}))
+	defer openAIServer.Close()
+
+	state := model.DefaultState()
+	state.PricingProfiles = []model.PricingProfile{{
+		ID:               "standard",
+		Name:             "standard",
+		Currency:         "USD",
+		InputPerMillion:  1,
+		OutputPerMillion: 2,
+	}}
+	state.Providers = []model.Provider{{
+		ID:                      "openai",
+		Name:                    "openai-main",
+		Kind:                    model.ProviderKindOpenAICompatible,
+		BaseURL:                 openAIServer.URL + "/v1",
+		APIKey:                  "openai-key",
+		Enabled:                 true,
+		Weight:                  1,
+		TimeoutSeconds:          30,
+		DefaultMarkupMultiplier: 1,
+		Capabilities:            []model.Protocol{model.ProtocolOpenAIChat},
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias:            "gpt-5.4",
+		PricingProfileID: "standard",
+		Targets: []model.RouteTarget{{
+			ID:               "t1",
+			AccountID:        "openai",
+			UpstreamModel:    "up-openai",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	res, body := postJSON(t, gatewayServer.URL+"/v1/chat/completions", `{"model":"gpt-5.4","messages":[{"role":"user","content":"请总结一下这段文字"}]}`)
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
+	}
+	if res.Trailer.Get("X-Gateway-Total-Tokens") == "0" || res.Trailer.Get("X-Gateway-Total-Tokens") == "" {
+		t.Fatalf("expected estimated usage trailer, got %+v", res.Trailer)
+	}
+	if res.Trailer.Get("X-Gateway-Billing-Final") == "0.000000" || res.Trailer.Get("X-Gateway-Billing-Final") == "" {
+		t.Fatalf("expected non-zero estimated billing trailer, got %+v", res.Trailer)
+	}
+}
+
+func TestGatewayAppliesRouteTransformers(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan observedRequest, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- observedRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			Body:          string(body),
+			Query:         r.Header.Get("X-Route-Tag"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_3","usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13},"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	state := model.DefaultState()
+	state.Providers = []model.Provider{{
+		ID:             "openai",
+		Name:           "OpenAI",
+		Kind:           model.ProviderKindOpenAICompatible,
+		BaseURL:        upstream.URL + "/v1",
+		APIKey:         "openai-key",
+		Enabled:        true,
+		Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+		TimeoutSeconds: 30,
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{{
+			ID:               "target-1",
+			AccountID:        "openai",
+			UpstreamModel:    "gpt-5.4-fast",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+		Transformers: []model.RouteTransformer{
+			{
+				Name:   "route-tag",
+				Phase:  model.TransformerPhaseRequest,
+				Type:   model.TransformerTypeSetHeader,
+				Target: "X-Route-Tag",
+				Value:  "${route_alias}:${provider_id}",
+			},
+			{
+				Name:  "prepend-system",
+				Phase: model.TransformerPhaseRequest,
+				Type:  model.TransformerTypePrependMessage,
+				Value: map[string]any{
+					"role":    "system",
+					"content": "route=${route_alias} upstream=${upstream_model}",
+				},
+			},
+			{
+				Name:   "inject-metadata",
+				Phase:  model.TransformerPhaseRequest,
+				Type:   model.TransformerTypeSetJSON,
+				Target: "metadata.route",
+				Value:  "${route_alias}",
+			},
+			{
+				Name:   "response-header",
+				Phase:  model.TransformerPhaseResponse,
+				Type:   model.TransformerTypeSetHeader,
+				Target: "X-Transformed-Route",
+				Value:  "${route_alias}",
+			},
+			{
+				Name:   "drop-usage",
+				Phase:  model.TransformerPhaseResponse,
+				Type:   model.TransformerTypeDeleteJSON,
+				Target: "usage",
+			},
+			{
+				Name:   "response-metadata",
+				Phase:  model.TransformerPhaseResponse,
+				Type:   model.TransformerTypeSetJSON,
+				Target: "metadata.gateway_route",
+				Value:  "${route_alias}",
+			},
+		},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	res, body := postJSON(t, gatewayServer.URL+"/v1/chat/completions", `{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`)
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
+	}
+	if got := res.Header.Get("X-Transformed-Route"); got != "gpt-5.4" {
+		t.Fatalf("expected response header transformer to run, got %q", got)
+	}
+	var responsePayload map[string]any
+	if err := json.Unmarshal([]byte(body), &responsePayload); err != nil {
+		t.Fatalf("decode response payload: %v body=%s", err, body)
+	}
+	if _, ok := responsePayload["usage"]; ok {
+		t.Fatalf("expected response usage block to be removed by transformer, got %s", body)
+	}
+	metadata, _ := responsePayload["metadata"].(map[string]any)
+	if got := metadata["gateway_route"]; got != "gpt-5.4" {
+		t.Fatalf("expected response metadata transformer to run, got %+v", responsePayload)
+	}
+	if res.Trailer.Get("X-Gateway-Total-Tokens") != "13" {
+		t.Fatalf("expected usage trailers to preserve original usage accounting, got %+v", res.Trailer)
+	}
+
+	seen := <-requests
+	if got := seen.Query; got != "gpt-5.4:openai" {
+		t.Fatalf("expected request header transformer to run, got %q", got)
+	}
+	var upstreamPayload map[string]any
+	if err := json.Unmarshal([]byte(seen.Body), &upstreamPayload); err != nil {
+		t.Fatalf("decode upstream payload: %v body=%s", err, seen.Body)
+	}
+	upstreamMetadata, _ := upstreamPayload["metadata"].(map[string]any)
+	if got := upstreamMetadata["route"]; got != "gpt-5.4" {
+		t.Fatalf("expected request json transformer to inject metadata, got %+v", upstreamPayload)
+	}
+	messages, _ := upstreamPayload["messages"].([]any)
+	if len(messages) == 0 {
+		t.Fatalf("expected prepend_message transformer to inject a system message, got %+v", upstreamPayload)
+	}
+	firstMessage, _ := messages[0].(map[string]any)
+	if got := firstMessage["role"]; got != "system" {
+		t.Fatalf("expected first upstream message to be a system message, got %+v", firstMessage)
+	}
+	if got := firstMessage["content"]; got != "route=gpt-5.4 upstream=gpt-5.4-fast" {
+		t.Fatalf("unexpected prepended system content: %+v", firstMessage)
+	}
+}
+
+func TestResponsesPrependMessageTransformerTargetsInputPayload(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan observedRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- observedRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			Body:          string(body),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}`))
+	}))
+	defer upstream.Close()
+
+	state := model.DefaultState()
+	state.Providers = []model.Provider{{
+		ID:             "openai",
+		Name:           "OpenAI",
+		Kind:           model.ProviderKindOpenAICompatible,
+		BaseURL:        upstream.URL + "/v1",
+		APIKey:         "openai-key",
+		Enabled:        true,
+		Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
+		TimeoutSeconds: 30,
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{{
+			ID:               "target-1",
+			AccountID:        "openai",
+			UpstreamModel:    "gpt-5.4-fast",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+		Transformers: []model.RouteTransformer{{
+			Name:  "prepend-system",
+			Phase: model.TransformerPhaseRequest,
+			Type:  model.TransformerTypePrependMessage,
+			Value: map[string]any{
+				"role":    "system",
+				"content": "route=${route_alias} upstream=${upstream_model}",
+			},
+		}},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	res, body := postJSON(t, gatewayServer.URL+"/v1/responses", `{"model":"gpt-5.4","input":"hello"}`)
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
+	}
+
+	seen := <-requests
+	var upstreamPayload map[string]any
+	if err := json.Unmarshal([]byte(seen.Body), &upstreamPayload); err != nil {
+		t.Fatalf("decode upstream payload: %v body=%s", err, seen.Body)
+	}
+	input, ok := upstreamPayload["input"].([]any)
+	if !ok || len(input) != 2 {
+		t.Fatalf("expected responses payload input array with prepended item, got %+v", upstreamPayload)
+	}
+	firstMessage, _ := input[0].(map[string]any)
+	if got := firstMessage["role"]; got != "system" {
+		t.Fatalf("expected first responses input item to be system, got %+v", firstMessage)
+	}
+	content, _ := firstMessage["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("expected one content block in prepended responses item, got %+v", firstMessage)
+	}
+	textBlock, _ := content[0].(map[string]any)
+	if got := textBlock["text"]; got != "route=gpt-5.4 upstream=gpt-5.4-fast" {
+		t.Fatalf("unexpected prepended responses content: %+v", firstMessage)
+	}
+}
+
+func TestGatewayAppliesResponseBodyTransformersToStreamingPassthrough(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	state := model.DefaultState()
+	state.Providers = []model.Provider{{
+		ID:             "openai",
+		Name:           "OpenAI",
+		Kind:           model.ProviderKindOpenAICompatible,
+		BaseURL:        upstream.URL + "/v1",
+		APIKey:         "openai-key",
+		Enabled:        true,
+		Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+		TimeoutSeconds: 30,
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{{
+			ID:               "target-1",
+			AccountID:        "openai",
+			UpstreamModel:    "gpt-5.4-fast",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+		Transformers: []model.RouteTransformer{
+			{
+				Name:   "drop-usage",
+				Phase:  model.TransformerPhaseResponse,
+				Type:   model.TransformerTypeDeleteJSON,
+				Target: "usage",
+			},
+			{
+				Name:   "response-metadata",
+				Phase:  model.TransformerPhaseResponse,
+				Type:   model.TransformerTypeSetJSON,
+				Target: "metadata.gateway_route",
+				Value:  "${route_alias}",
+			},
+		},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	res, body := postJSON(t, gatewayServer.URL+"/v1/chat/completions", `{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
+	}
+	if strings.Contains(body, `"usage"`) {
+		t.Fatalf("expected streaming response transformer to remove usage blocks, got %s", body)
+	}
+	if !strings.Contains(body, `"metadata":{"gateway_route":"gpt-5.4"}`) {
+		t.Fatalf("expected streaming response transformer to inject metadata, got %s", body)
+	}
+	if res.Trailer.Get("X-Gateway-Total-Tokens") != "5" {
+		t.Fatalf("expected usage trailers to preserve upstream accounting, got %+v", res.Trailer)
 	}
 }
 

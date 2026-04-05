@@ -2,8 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os/signal"
 	"strings"
@@ -25,13 +26,14 @@ type App struct {
 	admin     *admin.Handlers
 	gateway   *gateway.Service
 	scheduler *scheduler.Service
+	startedAt time.Time
 }
 
 func New(cfg config.Config) (*App, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	store, err := store.Open(cfg.StatePath)
+	store, err := store.Open(cfg.StoreLocator(), store.WithRequestHistoryLimit(cfg.RequestHistory))
 	if err != nil {
 		return nil, err
 	}
@@ -44,21 +46,23 @@ func New(cfg config.Config) (*App, error) {
 	adminHandlers := admin.New(cfg, store, integrationService, gatewayService)
 
 	return &App{
-		cfg:       cfg,
-		store:     store,
-		admin:     adminHandlers,
-		gateway:   gatewayService,
-		scheduler: scheduler.New(adminHandlers, time.Duration(cfg.ProbeIntervalSeconds)*time.Second),
+		cfg:     cfg,
+		store:   store,
+		admin:   adminHandlers,
+		gateway: gatewayService,
+		scheduler: scheduler.New(
+			adminHandlers,
+			time.Duration(cfg.ProbeIntervalSeconds)*time.Second,
+			pricingSyncInterval(cfg),
+		),
+		startedAt: time.Now().UTC(),
 	}, nil
 }
 
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	mux.HandleFunc("GET /healthz", a.Healthz)
 
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("GET /api/admin/state", a.admin.GetState)
@@ -90,9 +94,15 @@ func (a *App) Handler() http.Handler {
 	adminMux.HandleFunc("DELETE /api/admin/gateway-keys/{id}", a.admin.DeleteGatewayKey)
 	adminMux.HandleFunc("GET /api/admin/request-history", a.admin.ListRequestHistory)
 	adminMux.HandleFunc("GET /api/admin/request-history/{id}/attempts", a.admin.GetRequestAttempts)
+	adminMux.HandleFunc("GET /api/admin/stats/summary", a.admin.GetStatsSummary)
+	adminMux.HandleFunc("GET /api/admin/stats/by-key", a.admin.GetStatsByGatewayKey)
+	adminMux.HandleFunc("GET /api/admin/stats/by-provider", a.admin.GetStatsByProvider)
+	adminMux.HandleFunc("GET /api/admin/stats/by-model", a.admin.GetStatsByModel)
 	adminMux.HandleFunc("GET /api/admin/meta", a.admin.GetMeta)
 	adminMux.HandleFunc("GET /api/admin/openapi.json", a.admin.OpenAPI)
+	adminMux.HandleFunc("POST /api/admin/maintenance/checkins", a.admin.CheckinAllIntegrations)
 	adminMux.HandleFunc("POST /api/admin/maintenance/probes", a.admin.ProbeAllProviders)
+	adminMux.HandleFunc("POST /api/admin/maintenance/pricing-sync", a.admin.SyncPricingCatalog)
 	mux.Handle("/api/admin/", withCORS(
 		a.admin.Middleware(adminMux),
 		a.cfg,
@@ -106,7 +116,7 @@ func (a *App) Handler() http.Handler {
 		methodHandler(http.MethodGet, http.HandlerFunc(a.gateway.HandleModels)),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"GET, OPTIONS",
 		false,
 	))
@@ -114,7 +124,7 @@ func (a *App) Handler() http.Handler {
 		methodHandler(http.MethodPost, http.HandlerFunc(a.gateway.ProxyHTTP(model.ProtocolOpenAIChat))),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"POST, OPTIONS",
 		false,
 	))
@@ -122,7 +132,7 @@ func (a *App) Handler() http.Handler {
 		methodHandler(http.MethodPost, http.HandlerFunc(a.gateway.ProxyHTTP(model.ProtocolOpenAIResponses))),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"POST, OPTIONS",
 		false,
 	))
@@ -130,7 +140,7 @@ func (a *App) Handler() http.Handler {
 		methodHandler(http.MethodPost, http.HandlerFunc(a.gateway.ProxyHTTP(model.ProtocolAnthropic))),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"POST, OPTIONS",
 		false,
 	))
@@ -152,7 +162,7 @@ func (a *App) Handler() http.Handler {
 		}),
 		a.cfg,
 		a.cfg.GatewayAllowedOrigins,
-		"Authorization, Content-Type, X-API-Key",
+		gatewayAllowedHeaders(),
 		"POST, OPTIONS",
 		false,
 	))
@@ -161,7 +171,7 @@ func (a *App) Handler() http.Handler {
 			methodHandler(http.MethodGet, http.HandlerFunc(a.gateway.ProxyRealtime)),
 			a.cfg,
 			a.cfg.RealtimeAllowedOrigins,
-			"Authorization, Content-Type, X-API-Key",
+			gatewayAllowedHeaders(),
 			"GET, OPTIONS",
 			false,
 		))
@@ -170,15 +180,78 @@ func (a *App) Handler() http.Handler {
 	return mux
 }
 
+// Healthz reports process uptime plus database connectivity for external probes.
+func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
+	status := http.StatusOK
+	dbStatus := "ok"
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.store.Ping(ctx); err != nil {
+		status = http.StatusServiceUnavailable
+		dbStatus = err.Error()
+	}
+	now := time.Now().UTC()
+	counts := a.store.HealthCounts(now)
+	healthStatus := "ok"
+	if status != http.StatusOK {
+		healthStatus = "degraded"
+	}
+	writeJSON(w, status, map[string]any{
+		"status":         healthStatus,
+		"server_time":    now,
+		"uptime_seconds": int64(now.Sub(a.startedAt).Seconds()),
+		"db_status":      dbStatus,
+		"db_backend":     a.store.Backend(),
+		"counts": map[string]any{
+			"providers":             counts.Providers,
+			"routes":                counts.Routes,
+			"gateway_keys_total":    counts.GatewayKeysTotal,
+			"gateway_keys_active":   counts.GatewayKeysActive,
+			"integrations":          counts.Integrations,
+			"pricing_profiles":      counts.PricingProfiles,
+			"request_history_items": counts.RequestHistoryItems,
+		},
+	})
+}
+
 func (a *App) StartBackground(ctx context.Context) {
 	go a.scheduler.Start(ctx)
+	if strings.TrimSpace(a.cfg.BackupDirectory) != "" && a.cfg.BackupIntervalSeconds > 0 && a.store.SupportsBackup() {
+		go a.runBackupLoop(ctx)
+	}
 }
 
 func (a *App) Close() error {
 	if a == nil {
 		return nil
 	}
-	return a.store.Close()
+	var errs []error
+	if a.gateway != nil {
+		errs = append(errs, a.gateway.Close())
+	}
+	if a.store != nil {
+		errs = append(errs, a.store.Close())
+	}
+	return errors.Join(errs...)
+}
+
+func (a *App) runBackupLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(a.cfg.BackupIntervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			backupPath, err := a.store.Backup(a.cfg.BackupDirectory, a.cfg.BackupRetention)
+			if err != nil {
+				slog.Error("gateway backup failed", "error", err, "backup_dir", a.cfg.BackupDirectory)
+				continue
+			}
+			slog.Info("gateway backup completed", "path", backupPath)
+		}
+	}
 }
 
 func newHTTPServer(addr string, handler http.Handler) *http.Server {
@@ -191,6 +264,32 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
+func pricingSyncInterval(cfg config.Config) time.Duration {
+	if !cfg.PricingSyncEnabled || cfg.PricingSyncIntervalSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(cfg.PricingSyncIntervalSeconds) * time.Second
+}
+
+func gatewayAllowedHeaders() string {
+	return strings.Join([]string{
+		"Authorization",
+		"Content-Type",
+		"X-API-Key",
+		"X-Session-ID",
+		"Session-ID",
+		"X-Routing-Scenario",
+		"Routing-Scenario",
+		"X-Codex-Turn-State",
+		"X-Codex-Turn-Metadata",
+		"X-Codex-Parent-Thread-Id",
+		"X-Codex-Window-Id",
+		"X-OpenAI-Subagent",
+		"OpenAI-Beta",
+		"X-ResponsesAPI-Include-Timing-Metrics",
+	}, ", ")
+}
+
 func Run(cfg config.Config) error {
 	app, err := New(cfg)
 	if err != nil {
@@ -198,7 +297,7 @@ func Run(cfg config.Config) error {
 	}
 	defer func() {
 		if closeErr := app.Close(); closeErr != nil {
-			log.Printf("gateway store close failed: %v", closeErr)
+			slog.Error("gateway store close failed", "error", closeErr)
 		}
 	}()
 
@@ -208,7 +307,7 @@ func Run(cfg config.Config) error {
 	app.StartBackground(ctx)
 
 	server := newHTTPServer(cfg.BindAddress, app.Handler())
-	log.Printf("gateway listening on %s", cfg.BindAddress)
+	slog.Info("gateway listening", "bind_address", cfg.BindAddress)
 	errCh := make(chan error, 1)
 	go func() {
 		if serveErr := server.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
@@ -222,6 +321,7 @@ func Run(cfg config.Config) error {
 		return serveErr
 	case <-ctx.Done():
 	}
+	slog.Info("gateway shutdown requested")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -256,6 +356,12 @@ func withCORS(next http.Handler, cfg config.Config, allowedOrigins []string, all
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func originAllowed(cfg config.Config, allowedOrigins []string, origin string) bool {
@@ -338,15 +444,20 @@ func ensureBootstrapGatewayKey(cfg config.Config, stateStore *store.FileStore) e
 	if secret == "" {
 		return nil
 	}
+	if err := model.ValidateGatewaySecretStrength(secret); err != nil {
+		return err
+	}
 	lookupHash := model.GatewaySecretLookupHash(secret, cfg.SecretLookupPepper())
 
 	snapshot := stateStore.Snapshot()
+	matchedKeyID := ""
 	for _, key := range snapshot.GatewayKeys {
 		if model.VerifyGatewaySecret(key.SecretHash, secret) {
+			matchedKeyID = key.ID
 			if key.SecretLookupHash != lookupHash {
 				_, err := stateStore.Update(func(state *model.State) error {
 					for index := range state.GatewayKeys {
-						if state.GatewayKeys[index].ID == key.ID {
+						if state.GatewayKeys[index].ID == matchedKeyID {
 							state.GatewayKeys[index].SecretLookupHash = lookupHash
 							state.GatewayKeys[index].UpdatedAt = time.Now().UTC()
 							return nil
@@ -369,7 +480,7 @@ func ensureBootstrapGatewayKey(cfg config.Config, stateStore *store.FileStore) e
 	now := time.Now().UTC()
 	_, err = stateStore.Update(func(state *model.State) error {
 		for _, key := range state.GatewayKeys {
-			if model.VerifyGatewaySecret(key.SecretHash, secret) {
+			if key.ID == matchedKeyID || key.SecretLookupHash == lookupHash {
 				return nil
 			}
 		}

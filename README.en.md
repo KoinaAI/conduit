@@ -38,8 +38,11 @@ Conduit currently supports:
 
 - alias-based route mapping
 - multiple upstream targets per alias
+- ordered route transformer pipelines for upstream-request and downstream-response header/JSON rewrites
+- scenario routing, Codex turn-state stickiness, and optional Redis-backed sticky sessions
 - usage extraction from JSON, SSE, and WebSocket responses
 - local cost calculation through pricing profiles
+- public pricing-catalog sync in addition to relay-managed pricing sync
 - request history and per-request attempt tracking
 
 ### Control plane
@@ -59,11 +62,19 @@ Conduit currently supports:
 - separate management credentials and request credentials
 - sync workflows
 - scheduled check-in maintenance
+- scheduled public pricing catalog sync
+
+### CLI tooling
+
+- bundled `conduit-cli`
+- health checks, stats queries, gateway-key creation, and shell environment export helpers
 
 ## Repository layout
 
 - `backend/`
   Go backend source code and unit tests.
+- `backend/cmd/conduit-cli/`
+  Helper CLI for personal deployment workflows.
 - `Dockerfile`
   Backend container image entrypoint.
 - `.github/workflows/`
@@ -97,7 +108,7 @@ Conduit is easiest to think of as three layers:
 2. Control plane
    Manages providers, routes, pricing profiles, integrations, and gateway keys.
 3. Persistence and background jobs
-   Stores runtime state in SQLite and runs scheduled sync, check-in, and probe tasks.
+   Stores runtime state in SQLite or PostgreSQL and runs scheduled sync, check-in, and probe tasks.
 
 Key entry points:
 
@@ -204,12 +215,28 @@ Primary variables for direct container deployment:
   Backend bind address, default `:8080`.
 - `GATEWAY_STATE_PATH`
   SQLite database path.
+- `GATEWAY_DATABASE_URL`
+  Optional PostgreSQL DSN. When set, it takes precedence over `GATEWAY_STATE_PATH`.
 - `GATEWAY_ENABLE_REALTIME`
   Enables or disables realtime support.
 - `GATEWAY_REQUEST_HISTORY`
   Maximum retained request-history entries.
 - `GATEWAY_PROBE_INTERVAL_SECONDS`
   Provider probe interval in seconds.
+- `GATEWAY_PRICING_SYNC_ENABLED`
+  Enables scheduled public pricing-catalog sync.
+- `GATEWAY_PRICING_CATALOG_URL`
+  Public pricing catalog URL. Defaults to `https://models.dev/api.json`.
+- `GATEWAY_PRICING_SYNC_INTERVAL_SECONDS`
+  Pricing-catalog sync interval in seconds.
+- `GATEWAY_REDIS_ADDR`
+  Optional Redis address for cross-instance sticky-session sharing.
+- `GATEWAY_REDIS_PASSWORD`
+  Optional Redis password.
+- `GATEWAY_REDIS_DB`
+  Redis logical DB index.
+- `GATEWAY_REDIS_KEY_PREFIX`
+  Redis key prefix.
 
 ### Direct server runtime guidance
 
@@ -231,11 +258,11 @@ If you expose Conduit publicly, place it behind Nginx, Caddy, or Traefik and fol
 
 ### Storage guidance
 
-Conduit currently uses SQLite for persistence. Recommended practices:
+Conduit supports both SQLite and PostgreSQL:
 
-- store the database on durable storage
-- take regular backups
-- snapshot the database before upgrades
+- for personal single-node deployments, SQLite remains the default and simplest option
+- use `GATEWAY_DATABASE_URL` when you want to plug Conduit into an existing PostgreSQL environment
+- if you stay on SQLite, keep the database on durable storage and snapshot it before upgrades
 - do not rely on container layers for long-term state
 
 ## How to use it

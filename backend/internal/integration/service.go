@@ -285,8 +285,6 @@ func buildProviderFromIntegration(integration model.Integration) model.Provider 
 		ID:                      providerID,
 		Name:                    integration.Name,
 		Kind:                    model.ProviderKindOpenAICompatible,
-		BaseURL:                 integration.BaseURL,
-		APIKey:                  apiKey,
 		Enabled:                 integration.Enabled,
 		Weight:                  1,
 		TimeoutSeconds:          180,

@@ -1678,10 +1678,8 @@ func extractClientSessionID(headers http.Header, body []byte) string {
 	if value := extractCodexTurnState(headers); value != "" {
 		return value
 	}
-	for _, headerName := range []string{"X-Session-ID", "Session-ID"} {
-		if value := strings.TrimSpace(headers.Get(headerName)); value != "" {
-			return value
-		}
+	if value := strings.TrimSpace(headers.Get("X-Session-ID")); value != "" {
+		return value
 	}
 	if len(body) == 0 {
 		return ""
@@ -1690,21 +1688,8 @@ func extractClientSessionID(headers http.Header, body []byte) string {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return ""
 	}
-	for _, key := range []string{"session_id", "conversation_id", "thread_id", "chat_id", "prompt_cache_key", "previous_response_id"} {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	if metadata, ok := payload["metadata"].(map[string]any); ok {
-		if value, ok := metadata["session_id"].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-		if userID, ok := metadata["user_id"].(string); ok {
-			const marker = "_session_"
-			if index := strings.Index(userID, marker); index >= 0 {
-				return strings.TrimSpace(userID[index+len(marker):])
-			}
-		}
+	if value, ok := payload["session_id"].(string); ok && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
 	}
 	return ""
 }
@@ -1713,24 +1698,18 @@ func extractRealtimeSessionID(r *http.Request) string {
 	if value := extractCodexTurnState(r.Header); value != "" {
 		return value
 	}
-	for _, headerName := range []string{"X-Session-ID", "Session-ID"} {
-		if value := strings.TrimSpace(r.Header.Get(headerName)); value != "" {
-			return value
-		}
+	if value := strings.TrimSpace(r.Header.Get("X-Session-ID")); value != "" {
+		return value
 	}
-	for _, key := range []string{"session_id", "conversation_id", "thread_id", "chat_id", "prompt_cache_key", "previous_response_id"} {
-		if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
-			return value
-		}
+	if value := strings.TrimSpace(r.URL.Query().Get("session_id")); value != "" {
+		return value
 	}
 	return ""
 }
 
 func extractRoutingScenario(headers http.Header, body []byte) string {
-	for _, headerName := range []string{"X-Routing-Scenario", "Routing-Scenario"} {
-		if value := strings.TrimSpace(headers.Get(headerName)); value != "" {
-			return value
-		}
+	if value := strings.TrimSpace(headers.Get("X-Routing-Scenario")); value != "" {
+		return value
 	}
 	if len(body) == 0 {
 		return ""
@@ -1739,40 +1718,25 @@ func extractRoutingScenario(headers http.Header, body []byte) string {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return ""
 	}
-	for _, key := range []string{"routing_scenario", "scenario"} {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	if metadata, ok := payload["metadata"].(map[string]any); ok {
-		for _, key := range []string{"routing_scenario", "scenario"} {
-			if value, ok := metadata[key].(string); ok && strings.TrimSpace(value) != "" {
-				return strings.TrimSpace(value)
-			}
-		}
+	if value, ok := payload["routing_scenario"].(string); ok && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
 	}
 	return ""
 }
 
 func extractRealtimeScenario(r *http.Request) string {
-	for _, headerName := range []string{"X-Routing-Scenario", "Routing-Scenario"} {
-		if value := strings.TrimSpace(r.Header.Get(headerName)); value != "" {
-			return value
-		}
+	if value := strings.TrimSpace(r.Header.Get("X-Routing-Scenario")); value != "" {
+		return value
 	}
-	for _, key := range []string{"routing_scenario", "scenario"} {
-		if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
-			return value
-		}
+	if value := strings.TrimSpace(r.URL.Query().Get("routing_scenario")); value != "" {
+		return value
 	}
 	return ""
 }
 
 func extractCodexTurnState(headers http.Header) string {
-	for _, headerName := range []string{headerCodexTurnState, "Codex-Turn-State"} {
-		if value := strings.TrimSpace(headers.Get(headerName)); value != "" {
-			return value
-		}
+	if value := strings.TrimSpace(headers.Get(headerCodexTurnState)); value != "" {
+		return value
 	}
 	return ""
 }

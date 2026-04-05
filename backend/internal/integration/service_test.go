@@ -106,8 +106,8 @@ func TestServiceSyncStateNewAPI(t *testing.T) {
 	if len(state.Providers) != 1 {
 		t.Fatalf("expected linked provider to be created")
 	}
-	if state.Providers[0].APIKey != "relay-token" {
-		t.Fatalf("expected relay api key to be used for provider traffic, got %q", state.Providers[0].APIKey)
+	if len(state.Providers[0].Credentials) != 1 || state.Providers[0].Credentials[0].APIKey != "relay-token" {
+		t.Fatalf("expected relay api key to be used for provider traffic, got %+v", state.Providers[0].Credentials)
 	}
 	if state.Providers[0].DefaultMarkupMultiplier != 1 {
 		t.Fatalf("expected integration provider multiplier to stay neutral, got %v", state.Providers[0].DefaultMarkupMultiplier)
@@ -458,7 +458,7 @@ func TestServiceSyncStateOneHub(t *testing.T) {
 	if snapshot.SupportsCheckin {
 		t.Fatalf("onehub should be marked as not supporting checkin by default")
 	}
-	if len(state.Providers) != 1 || state.Providers[0].APIKey != "onehub-token" {
+	if len(state.Providers) != 1 || len(state.Providers[0].Credentials) != 1 || state.Providers[0].Credentials[0].APIKey != "onehub-token" {
 		t.Fatalf("expected access key to remain the provider key when relay key is empty")
 	}
 	if len(state.ModelRoutes) != 2 {

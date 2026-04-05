@@ -100,11 +100,7 @@ const (
 	TransformerTypePrependMessage TransformerType = "prepend_message"
 )
 
-// State is the persisted configuration snapshot exposed to the admin console.
-//
-// It intentionally keeps the original top-level shape so the current frontend
-// can continue to load and save a compatibility snapshot while the backend
-// grows richer internal behavior.
+// State is the persisted configuration snapshot exposed to the admin API.
 type State struct {
 	Version         string           `json:"version"`
 	Providers       []Provider       `json:"providers"`
@@ -124,16 +120,11 @@ type RoutingState struct {
 	GatewayKeys     []GatewayKey
 }
 
-// Provider defines one upstream provider inventory item. Compatibility fields
-// `base_url` and `api_key` are mirrored from the first endpoint/credential so
-// the existing frontend remains functional until it is refactored.
+// Provider defines one upstream provider inventory item.
 type Provider struct {
 	ID                      string               `json:"id"`
 	Name                    string               `json:"name"`
 	Kind                    ProviderKind         `json:"kind"`
-	BaseURL                 string               `json:"base_url"`
-	APIKey                  string               `json:"api_key"`
-	APIKeyPreview           string               `json:"api_key_preview,omitempty"`
 	ProxyURL                string               `json:"proxy_url,omitempty"`
 	Enabled                 bool                 `json:"enabled"`
 	Weight                  int                  `json:"weight"`
@@ -415,7 +406,7 @@ func DefaultState() State {
 	}
 }
 
-// Normalize fills defaults and backfills compatibility fields.
+// Normalize fills defaults.
 func (s *State) Normalize() {
 	if s.Version == "" {
 		s.Version = "2026-04-01"
@@ -493,27 +484,6 @@ func (s *State) Normalize() {
 			p.CircuitBreaker.Enabled = boolPointer(true)
 		}
 
-		if len(p.Endpoints) == 0 && strings.TrimSpace(p.BaseURL) != "" {
-			p.Endpoints = []ProviderEndpoint{{
-				ID:       NewID("endpoint"),
-				Label:    "default",
-				BaseURL:  strings.TrimSpace(p.BaseURL),
-				Enabled:  true,
-				Weight:   1,
-				Priority: 0,
-				Headers:  map[string]string{},
-			}}
-		}
-		if len(p.Credentials) == 0 && strings.TrimSpace(p.APIKey) != "" {
-			p.Credentials = []ProviderCredential{{
-				ID:      NewID("cred"),
-				Label:   "default",
-				APIKey:  strings.TrimSpace(p.APIKey),
-				Enabled: true,
-				Weight:  1,
-				Headers: map[string]string{},
-			}}
-		}
 		for endpointIndex := range p.Endpoints {
 			endpoint := &p.Endpoints[endpointIndex]
 			if endpoint.ID == "" {
@@ -540,9 +510,6 @@ func (s *State) Normalize() {
 			}
 			credential.APIKey = strings.TrimSpace(credential.APIKey)
 		}
-
-		p.BaseURL = firstEnabledEndpointURL(*p)
-		p.APIKey = firstEnabledCredentialKey(*p)
 	}
 
 	for i := range s.ModelRoutes {
@@ -650,24 +617,6 @@ func (s *State) Normalize() {
 	}
 }
 
-func firstEnabledEndpointURL(provider Provider) string {
-	for _, endpoint := range provider.Endpoints {
-		if endpoint.Enabled && strings.TrimSpace(endpoint.BaseURL) != "" {
-			return strings.TrimSpace(endpoint.BaseURL)
-		}
-	}
-	return strings.TrimSpace(provider.BaseURL)
-}
-
-func firstEnabledCredentialKey(provider Provider) string {
-	for _, credential := range provider.Credentials {
-		if credential.Enabled && strings.TrimSpace(credential.APIKey) != "" {
-			return strings.TrimSpace(credential.APIKey)
-		}
-	}
-	return strings.TrimSpace(provider.APIKey)
-}
-
 // Supports reports whether the provider can be used for the protocol on the
 // public gateway surface.
 func (p Provider) Supports(protocol Protocol) bool {
@@ -708,7 +657,7 @@ func (k GatewayKey) IsExpired(now time.Time) bool {
 // Canonical returns the normalized strategy value or the empty string when unsupported.
 func (s RouteStrategy) Canonical() RouteStrategy {
 	switch strings.ToLower(strings.TrimSpace(string(s))) {
-	case string(RouteStrategyPriorityWeight), "weighted":
+	case string(RouteStrategyPriorityWeight):
 		return RouteStrategyPriorityWeight
 	case "":
 		return ""

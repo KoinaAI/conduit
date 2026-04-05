@@ -73,23 +73,9 @@ func GatewaySecretLookupHash(secret, pepper string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if strings.TrimSpace(pepper) == "" {
-		return LegacyGatewaySecretLookupHash(trimmed)
-	}
 	mac := hmac.New(sha256.New, []byte(strings.TrimSpace(pepper)))
 	_, _ = mac.Write([]byte(trimmed))
 	return hex.EncodeToString(mac.Sum(nil))
-}
-
-// LegacyGatewaySecretLookupHash preserves the original unhasalted SHA-256
-// lookup digest for backwards-compatible key matching during upgrades.
-func LegacyGatewaySecretLookupHash(secret string) string {
-	trimmed := strings.TrimSpace(secret)
-	if trimmed == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(trimmed))
-	return hex.EncodeToString(sum[:])
 }
 
 // SecretPreview formats a short non-sensitive preview for the admin console.

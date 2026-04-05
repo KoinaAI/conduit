@@ -77,32 +77,6 @@ func (h *Handlers) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// GetState serves the compatibility snapshot used by the current frontend.
-func (h *Handlers) GetState(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.store.Snapshot())
-}
-
-// PutState replaces the compatibility snapshot while preserving advanced fields
-// that the current frontend does not yet understand.
-func (h *Handlers) PutState(w http.ResponseWriter, r *http.Request) {
-	var next model.State
-	if err := decodeJSONBody(w, r, &next); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	saved, err := h.updateState(func(state *model.State) error {
-		mergeCompatibilityState(state, &next)
-		*state = next
-		state.Normalize()
-		return nil
-	})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, saved)
-}
-
 // GetMeta serves lightweight control-plane metadata.
 func (h *Handlers) GetMeta(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -274,13 +248,16 @@ func (h *Handlers) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	if err := validateProviderPayload(payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	if payload.ID == "" {
 		payload.ID = model.NewID("provider")
 	}
 	payload.CreatedAt = time.Now().UTC()
 	payload.UpdatedAt = payload.CreatedAt
 	saved, err := h.updateState(func(state *model.State) error {
-		payload = preserveProviderSecrets(model.Provider{}, payload)
 		state.Providers = append([]model.Provider{payload}, state.Providers...)
 		return nil
 	})
@@ -314,13 +291,16 @@ func (h *Handlers) UpdateProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	if err := validateProviderPayload(payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	payload.ID = id
 	saved, err := h.updateState(func(state *model.State) error {
 		for index := range state.Providers {
 			if state.Providers[index].ID != id {
 				continue
 			}
-			payload = preserveProviderSecrets(state.Providers[index], payload)
 			payload.CreatedAt = state.Providers[index].CreatedAt
 			payload.UpdatedAt = time.Now().UTC()
 			state.Providers[index] = payload
@@ -419,9 +399,6 @@ func (h *Handlers) UpdateRoute(w http.ResponseWriter, r *http.Request) {
 		for index := range state.ModelRoutes {
 			if !strings.EqualFold(state.ModelRoutes[index].Alias, alias) {
 				continue
-			}
-			if len(payload.Scenarios) == 0 {
-				payload.Scenarios = state.ModelRoutes[index].Scenarios
 			}
 			state.ModelRoutes[index] = payload
 			return nil
@@ -558,7 +535,6 @@ func (h *Handlers) CreateIntegration(w http.ResponseWriter, r *http.Request) {
 	}
 	payload.UpdatedAt = time.Now().UTC()
 	saved, err := h.updateState(func(state *model.State) error {
-		payload = preserveIntegrationSecrets(model.Integration{}, payload)
 		state.Integrations = append([]model.Integration{payload}, state.Integrations...)
 		return nil
 	})
@@ -586,7 +562,6 @@ func (h *Handlers) UpdateIntegration(w http.ResponseWriter, r *http.Request) {
 	saved, err := h.updateState(func(state *model.State) error {
 		for index := range state.Integrations {
 			if state.Integrations[index].ID == id {
-				payload = preserveIntegrationSecrets(state.Integrations[index], payload)
 				payload.UpdatedAt = time.Now().UTC()
 				state.Integrations[index] = payload
 				return nil
@@ -1105,89 +1080,6 @@ func (h *Handlers) updateState(mutate func(*model.State) error) (model.State, er
 	return saved, nil
 }
 
-func mergeCompatibilityState(current, next *model.State) {
-	current.Normalize()
-	if next.Providers == nil {
-		next.Providers = []model.Provider{}
-	}
-	if next.ModelRoutes == nil {
-		next.ModelRoutes = []model.ModelRoute{}
-	}
-	if next.PricingProfiles == nil {
-		next.PricingProfiles = []model.PricingProfile{}
-	}
-	if next.Integrations == nil {
-		next.Integrations = []model.Integration{}
-	}
-	if next.GatewayKeys == nil {
-		next.GatewayKeys = []model.GatewayKey{}
-	}
-
-	if len(next.GatewayKeys) == 0 {
-		next.GatewayKeys = current.GatewayKeys
-	} else {
-		next.GatewayKeys = preserveGatewayKeys(current.GatewayKeys, next.GatewayKeys)
-	}
-	next.RequestHistory = current.RequestHistory
-	for nextProviderIndex := range next.Providers {
-		nextProvider := &next.Providers[nextProviderIndex]
-		currentProvider, ok := current.FindProvider(nextProvider.ID)
-		if !ok {
-			continue
-		}
-		*nextProvider = preserveProviderSecrets(currentProvider, *nextProvider)
-		if len(nextProvider.Endpoints) == 0 {
-			nextProvider.Endpoints = currentProvider.Endpoints
-		}
-		if len(nextProvider.Credentials) == 0 {
-			nextProvider.Credentials = currentProvider.Credentials
-		}
-		if strings.TrimSpace(nextProvider.ProxyURL) == "" {
-			nextProvider.ProxyURL = currentProvider.ProxyURL
-		}
-		if nextProvider.RoutingMode == "" {
-			nextProvider.RoutingMode = currentProvider.RoutingMode
-		}
-		if nextProvider.MaxAttempts <= 0 {
-			nextProvider.MaxAttempts = currentProvider.MaxAttempts
-		}
-		if nextProvider.StickySessionTTLSeconds <= 0 {
-			nextProvider.StickySessionTTLSeconds = currentProvider.StickySessionTTLSeconds
-		}
-		if nextProvider.CircuitBreaker == (model.CircuitBreakerConfig{}) {
-			nextProvider.CircuitBreaker = currentProvider.CircuitBreaker
-		}
-		nextProvider.CreatedAt = currentProvider.CreatedAt
-	}
-	for nextRouteIndex := range next.ModelRoutes {
-		nextRoute := &next.ModelRoutes[nextRouteIndex]
-		currentRoute, ok := current.FindRoute(nextRoute.Alias)
-		if !ok {
-			continue
-		}
-		if canonical := nextRoute.Strategy.Canonical(); canonical != "" {
-			nextRoute.Strategy = canonical
-		} else {
-			nextRoute.Strategy = currentRoute.Strategy
-		}
-		if len(nextRoute.Scenarios) == 0 {
-			nextRoute.Scenarios = currentRoute.Scenarios
-		}
-	}
-	for nextIntegrationIndex := range next.Integrations {
-		nextIntegration := &next.Integrations[nextIntegrationIndex]
-		currentIntegration, ok := current.FindIntegration(nextIntegration.ID)
-		if !ok {
-			continue
-		}
-		*nextIntegration = preserveIntegrationSecrets(currentIntegration, *nextIntegration)
-		if !nextIntegration.AutoSyncPricingProfiles {
-			nextIntegration.AutoSyncPricingProfiles = currentIntegration.AutoSyncPricingProfiles
-		}
-	}
-	next.Normalize()
-}
-
 func buildOpenAPISpec() map[string]any {
 	return map[string]any{
 		"openapi": "3.1.0",
@@ -1197,10 +1089,6 @@ func buildOpenAPISpec() map[string]any {
 			"description": "RESTful administrative surface for providers, routes, pricing, integrations, gateway keys, request history, and maintenance operations.",
 		},
 		"paths": map[string]any{
-			"/api/admin/state": map[string]any{
-				"get": map[string]any{"summary": "Get full admin state snapshot"},
-				"put": map[string]any{"summary": "Replace compatibility state snapshot"},
-			},
 			"/api/admin/meta": map[string]any{
 				"get": map[string]any{"summary": "Get admin metadata"},
 			},
@@ -1359,8 +1247,6 @@ func sanitizeState(state model.State) model.State {
 
 func sanitizeProvider(provider model.Provider) model.Provider {
 	providerCopy := provider
-	providerCopy.APIKeyPreview = model.SecretPreview(providerCopy.APIKey)
-	providerCopy.APIKey = ""
 	providerCopy.Credentials = append([]model.ProviderCredential(nil), provider.Credentials...)
 	for index := range providerCopy.Credentials {
 		providerCopy.Credentials[index].APIKeyPreview = model.SecretPreview(providerCopy.Credentials[index].APIKey)
@@ -1382,89 +1268,6 @@ func sanitizeGatewayKey(key model.GatewayKey) model.GatewayKey {
 	key.SecretHash = ""
 	key.SecretLookupHash = ""
 	return key
-}
-
-func preserveProviderSecrets(current, next model.Provider) model.Provider {
-	if strings.TrimSpace(next.APIKey) == "" {
-		next.APIKey = current.APIKey
-	}
-	if strings.TrimSpace(next.ProxyURL) == "" {
-		next.ProxyURL = current.ProxyURL
-	}
-	if len(next.Endpoints) == 0 {
-		next.Endpoints = current.Endpoints
-	}
-	if len(next.Credentials) == 0 {
-		next.Credentials = current.Credentials
-		return next
-	}
-
-	byID := make(map[string]model.ProviderCredential, len(current.Credentials))
-	for _, credential := range current.Credentials {
-		byID[credential.ID] = credential
-	}
-	for index := range next.Credentials {
-		credential := &next.Credentials[index]
-		currentCredential, ok := byID[credential.ID]
-		if ok && strings.TrimSpace(credential.APIKey) == "" {
-			credential.APIKey = currentCredential.APIKey
-		}
-	}
-	return next
-}
-
-func preserveIntegrationSecrets(current, next model.Integration) model.Integration {
-	if strings.TrimSpace(next.AccessKey) == "" {
-		next.AccessKey = current.AccessKey
-	}
-	if strings.TrimSpace(next.RelayAPIKey) == "" {
-		next.RelayAPIKey = current.RelayAPIKey
-	}
-	return next
-}
-
-func preserveGatewayKeys(current, next []model.GatewayKey) []model.GatewayKey {
-	byID := make(map[string]model.GatewayKey, len(current))
-	for _, key := range current {
-		byID[key.ID] = key
-	}
-	preserved := make([]model.GatewayKey, len(next))
-	for index := range next {
-		key := next[index]
-		currentKey, ok := byID[key.ID]
-		if ok {
-			key = preserveGatewayKeySecrets(currentKey, key)
-		}
-		preserved[index] = key
-	}
-	return preserved
-}
-
-func preserveGatewayKeySecrets(current, next model.GatewayKey) model.GatewayKey {
-	next.SecretHash = current.SecretHash
-	next.SecretLookupHash = current.SecretLookupHash
-	next.SecretPreview = current.SecretPreview
-	if next.ExpiresAt == nil {
-		next.ExpiresAt = cloneTimeValue(current.ExpiresAt)
-	}
-	if next.LastUsedAt == nil {
-		next.LastUsedAt = cloneTimeValue(current.LastUsedAt)
-	}
-	if next.CreatedAt.IsZero() {
-		next.CreatedAt = current.CreatedAt
-	}
-	if next.UpdatedAt.IsZero() {
-		next.UpdatedAt = current.UpdatedAt
-	}
-	return next
-}
-
-func cloneTimeValue(value *time.Time) *time.Time {
-	if value == nil {
-		return nil
-	}
-	cloned := value.UTC()
-	return &cloned
 }
 
 func decodeOptionalStrings(raw json.RawMessage, field string) ([]string, error) {
@@ -1558,6 +1361,26 @@ func validateProviderProxyURL(raw string) error {
 	}
 	if strings.TrimSpace(parsed.Host) == "" {
 		return errors.New("proxy_url host is required")
+	}
+	return nil
+}
+
+func validateProviderPayload(provider model.Provider) error {
+	if len(provider.Endpoints) == 0 {
+		return errors.New("provider must declare at least one endpoint")
+	}
+	if len(provider.Credentials) == 0 {
+		return errors.New("provider must declare at least one credential")
+	}
+	for _, endpoint := range provider.Endpoints {
+		if strings.TrimSpace(endpoint.BaseURL) == "" {
+			return errors.New("provider endpoints must include base_url")
+		}
+	}
+	for _, credential := range provider.Credentials {
+		if strings.TrimSpace(credential.APIKey) == "" {
+			return errors.New("provider credentials must include api_key")
+		}
 	}
 	return nil
 }

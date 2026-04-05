@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -23,7 +22,6 @@ import (
 
 const (
 	configStateKey = "config_state"
-	sqliteHeader   = "SQLite format 3\x00"
 )
 
 type storageBackend string
@@ -61,8 +59,7 @@ type HealthCounts struct {
 	RequestHistoryItems int
 }
 
-// Open initializes the configured persistence backend and imports legacy JSON
-// state when the SQLite path still contains the previous file-store format.
+// Open initializes the configured persistence backend.
 func Open(locator string, options ...OpenOption) (*FileStore, error) {
 	locator = strings.TrimSpace(locator)
 	if locator == "" {
@@ -82,13 +79,8 @@ func Open(locator string, options ...OpenOption) (*FileStore, error) {
 		return nil, err
 	}
 
-	var legacyState *model.State
 	if backend == backendSQLite {
 		if err := os.MkdirAll(filepath.Dir(locator), 0o755); err != nil {
-			return nil, err
-		}
-		legacyState, err = loadLegacyJSON(locator)
-		if err != nil {
 			return nil, err
 		}
 	}
@@ -108,7 +100,7 @@ func Open(locator string, options ...OpenOption) (*FileStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if err := store.load(legacyState); err != nil {
+	if err := store.load(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -265,45 +257,6 @@ func (s *FileStore) HealthCounts(now time.Time) HealthCounts {
 	return counts
 }
 
-func loadLegacyJSON(path string) (*model.State, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, nil
-	}
-	if bytes.HasPrefix(data, []byte(sqliteHeader)) {
-		return nil, nil
-	}
-
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return nil, nil
-	}
-
-	var state model.State
-	if err := json.Unmarshal(trimmed, &state); err != nil {
-		return nil, fmt.Errorf("legacy state import failed: %w", err)
-	}
-	state.Normalize()
-
-	backupPath := path + ".legacy.json"
-	if _, statErr := os.Stat(backupPath); errors.Is(statErr, os.ErrNotExist) {
-		if err := os.WriteFile(backupPath, append(trimmed, '\n'), 0o600); err != nil {
-			return nil, err
-		}
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-
-	return &state, nil
-}
-
 func backupFilename(statePath string, now time.Time) string {
 	return fmt.Sprintf("%s-%s.db", backupPrefix(statePath), now.UTC().Format("20060102T150405.000000000Z"))
 }
@@ -453,7 +406,7 @@ func rebindQuery(query string) string {
 	return builder.String()
 }
 
-func (s *FileStore) load(legacyState *model.State) error {
+func (s *FileStore) load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -463,9 +416,6 @@ func (s *FileStore) load(legacyState *model.State) error {
 	}
 	if existing == nil {
 		initial := model.DefaultState()
-		if legacyState != nil {
-			initial = legacyState.Clone()
-		}
 		initial.Normalize()
 		if err := s.persistStateLocked(initial, true); err != nil {
 			return err

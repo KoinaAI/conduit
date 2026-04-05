@@ -256,6 +256,155 @@ func TestAdminMiddlewareRejectsEmptyConfiguredToken(t *testing.T) {
 	}
 }
 
+func TestRequestHistoryEndpointsSupportPaginationAndDetail(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		RequestHistory: []model.RequestRecord{
+			{
+				ID:              "req-1",
+				RouteAlias:      "gpt-5.4",
+				AccountID:       "provider-1",
+				ProviderName:    "OpenAI",
+				GatewayKeyID:    "gk-1",
+				ClientSessionID: "sess-a",
+				StatusCode:      200,
+				StartedAt:       now.Add(-2 * time.Minute),
+			},
+			{
+				ID:              "req-2",
+				RouteAlias:      "gpt-5.4",
+				AccountID:       "provider-1",
+				ProviderName:    "OpenAI",
+				GatewayKeyID:    "gk-1",
+				ClientSessionID: "sess-b",
+				StatusCode:      502,
+				Error:           "timeout",
+				StartedAt:       now.Add(-1 * time.Minute),
+			},
+		},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/request-history?limit=1&route_alias=gpt-5.4", nil)
+	recorder := httptest.NewRecorder()
+	handlers.ListRequestHistory(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var page struct {
+		Items      []model.RequestRecord `json:"items"`
+		HasMore    bool                  `json:"has_more"`
+		NextCursor string                `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode page: %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "req-2" || !page.HasMore || page.NextCursor == "" {
+		t.Fatalf("unexpected request-history page: %+v", page)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/admin/request-history/req-2", nil)
+	detailReq.SetPathValue("id", "req-2")
+	detailRecorder := httptest.NewRecorder()
+	handlers.GetRequestHistoryRecord(detailRecorder, detailReq)
+
+	if detailRecorder.Code != http.StatusOK {
+		t.Fatalf("unexpected detail status: %d body=%s", detailRecorder.Code, detailRecorder.Body.String())
+	}
+	var record model.RequestRecord
+	if err := json.Unmarshal(detailRecorder.Body.Bytes(), &record); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if record.ID != "req-2" || record.Error != "timeout" {
+		t.Fatalf("unexpected request-history detail: %+v", record)
+	}
+}
+
+func TestUpdatePricingAliasesPersistsValidatedRules(t *testing.T) {
+	t.Parallel()
+
+	state := model.DefaultState()
+	state.PricingProfiles = []model.PricingProfile{{ID: "standard", Name: "Standard"}}
+	fileStore := openTestStore(t, state)
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/pricing-aliases", strings.NewReader(`[
+		{"name":"gpt-5 prefix","match_type":"prefix","pattern":"gpt-5","pricing_profile_id":"standard","enabled":true}
+	]`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.UpdatePricingAliases(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	saved := fileStore.Snapshot()
+	if len(saved.PricingAliases) != 1 || saved.PricingAliases[0].PricingProfileID != "standard" {
+		t.Fatalf("expected pricing alias rule to persist, got %+v", saved.PricingAliases)
+	}
+
+	invalidReq := httptest.NewRequest(http.MethodPut, "/api/admin/pricing-aliases", strings.NewReader(`[
+		{"match_type":"wildcard","pattern":"gpt**","pricing_profile_id":"missing","enabled":true}
+	]`))
+	invalidReq.Header.Set("Content-Type", "application/json")
+	invalidRecorder := httptest.NewRecorder()
+	handlers.UpdatePricingAliases(invalidRecorder, invalidReq)
+
+	if invalidRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid pricing alias payload to be rejected, got %d body=%s", invalidRecorder.Code, invalidRecorder.Body.String())
+	}
+}
+
+func TestGetProviderUsageReturnsRollingUsage(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		RequestHistory: []model.RequestRecord{
+			{
+				ID:           "req-1",
+				AccountID:    "provider-1",
+				ProviderName: "OpenAI",
+				StatusCode:   200,
+				StartedAt:    now.Add(-30 * time.Minute),
+				Billing:      model.BillingSummary{FinalCost: 1.25},
+			},
+			{
+				ID:           "req-2",
+				AccountID:    "provider-1",
+				ProviderName: "OpenAI",
+				StatusCode:   502,
+				StartedAt:    now.Add(-2 * 24 * time.Hour),
+				Billing:      model.BillingSummary{FinalCost: 0.75},
+			},
+		},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/runtime/provider-usage?limit=10", nil)
+	recorder := httptest.NewRecorder()
+	handlers.GetProviderUsage(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Items []store.ProviderUsageRow `json:"items"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode provider usage: %v", err)
+	}
+	if len(payload.Items) != 1 || payload.Items[0].MonthlyCostUSD != 2.0 || payload.Items[0].MonthlyErrors != 1 {
+		t.Fatalf("unexpected provider usage payload: %+v", payload.Items)
+	}
+}
+
 func TestRunPricingSyncPersistsManagedCatalogProfiles(t *testing.T) {
 	t.Parallel()
 
@@ -1221,8 +1370,14 @@ func TestBuildOpenAPISpecCoversAdminRoutes(t *testing.T) {
 		"/api/admin/integrations/{id}/checkin",
 		"/api/admin/gateway-keys",
 		"/api/admin/gateway-keys/{id}",
+		"/api/admin/pricing-aliases",
 		"/api/admin/request-history",
+		"/api/admin/request-history/{id}",
 		"/api/admin/request-history/{id}/attempts",
+		"/api/admin/runtime/sessions",
+		"/api/admin/runtime/provider-usage",
+		"/api/admin/runtime/circuits",
+		"/api/admin/runtime/circuits/reset",
 		"/api/admin/stats/summary",
 		"/api/admin/stats/by-key",
 		"/api/admin/stats/by-provider",

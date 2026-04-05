@@ -215,6 +215,33 @@ func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, no
 	return redis.TxFailedErr
 }
 
+func (s *redisStickyStore) LoadEndpointState(candidate resolvedCandidate) (endpointRuntimeState, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	state, err := s.loadEndpointCircuitState(ctx, s.endpointCircuitKey(candidate))
+	if err != nil {
+		return endpointRuntimeState{}, false, err
+	}
+	if state.Failures == 0 && state.OpenUntilUnixMS == 0 && state.HalfOpenInFlight == 0 {
+		return endpointRuntimeState{}, false, nil
+	}
+	runtimeState := endpointRuntimeState{
+		ConsecutiveFailures: state.Failures,
+		HalfOpenInFlight:    state.HalfOpenInFlight,
+	}
+	if state.OpenUntilUnixMS > 0 {
+		runtimeState.OpenUntil = time.UnixMilli(state.OpenUntilUnixMS).UTC()
+	}
+	return runtimeState, true, nil
+}
+
+func (s *redisStickyStore) ResetEndpoint(candidate resolvedCandidate) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Del(ctx, s.endpointCircuitKey(candidate)).Err()
+}
+
 func (s *redisStickyStore) AcquireGatewayKey(key model.GatewayKey, now time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()

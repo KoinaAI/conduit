@@ -374,15 +374,24 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 			t.Fatalf("admin request failed: %v", err)
 		}
 		defer res.Body.Close()
-		var saved []model.RequestRecord
-		if err := json.NewDecoder(res.Body).Decode(&saved); err != nil {
+		var payload struct {
+			Items []model.RequestRecord `json:"items"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
 			t.Fatalf("decode history: %v", err)
 		}
-		if len(saved) < 4 {
-			t.Fatalf("expected request history to be populated, got %d", len(saved))
+		if len(payload.Items) < 4 {
+			t.Fatalf("expected request history to be populated, got %d", len(payload.Items))
 		}
-		if saved[len(saved)-1].RoutingDecision == nil {
-			t.Fatalf("expected request history to include routing decision trace, got %+v", saved[len(saved)-1])
+		foundRoutingDecision := false
+		for _, item := range payload.Items {
+			if item.RoutingDecision != nil {
+				foundRoutingDecision = true
+				break
+			}
+		}
+		if !foundRoutingDecision {
+			t.Fatalf("expected request history to include routing decision trace, got %+v", payload.Items)
 		}
 	})
 }

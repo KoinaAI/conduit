@@ -520,6 +520,111 @@ func TestRuntimeReportFailureClampsHugeRetryAfter(t *testing.T) {
 	}
 }
 
+func TestBuildCandidatePlanResolvesPricingAliasRules(t *testing.T) {
+	t.Parallel()
+
+	fileStore, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	state := model.DefaultState()
+	state.Providers = []model.Provider{{
+		ID:                      "provider-1",
+		Name:                    "Provider 1",
+		Kind:                    model.ProviderKindOpenAICompatible,
+		Enabled:                 true,
+		DefaultMarkupMultiplier: 1,
+		Capabilities:            []model.Protocol{model.ProtocolOpenAIChat},
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-1",
+			BaseURL: "https://provider.example/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-1",
+			APIKey:  "provider-key",
+			Enabled: true,
+		}},
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4-fast",
+		Targets: []model.RouteTarget{{
+			ID:               "target-1",
+			AccountID:        "provider-1",
+			UpstreamModel:    "openai/gpt-5.4-fast",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+	}}
+	state.PricingProfiles = []model.PricingProfile{{ID: "pricing-gpt5", Name: "GPT-5"}}
+	state.PricingAliases = []model.PricingAliasRule{{
+		Name:             "gpt5-prefix",
+		MatchType:        model.PricingAliasMatchPrefix,
+		Pattern:          "gpt-5",
+		PricingProfileID: "pricing-gpt5",
+		Enabled:          true,
+	}}
+	if _, err := fileStore.Replace(state); err != nil {
+		t.Fatalf("replace state: %v", err)
+	}
+
+	service := NewService(config.Config{}, fileStore)
+	candidates, _, profile, _, err := service.buildCandidatePlan(fileStore.RoutingSnapshot(), "gpt-5.4-fast", model.ProtocolOpenAIChat, "gk-1", "", "")
+	if err != nil {
+		t.Fatalf("build candidate plan: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("expected one candidate, got %+v", candidates)
+	}
+	if candidates[0].pricing.ID != "pricing-gpt5" || profile.ID != "pricing-gpt5" {
+		t.Fatalf("expected pricing alias rule to resolve pricing-gpt5, got candidate=%+v profile=%+v", candidates[0].pricing, profile)
+	}
+}
+
+func TestServiceCircuitStatusesAndReset(t *testing.T) {
+	t.Parallel()
+
+	service := newProbeTestService(t, model.ProviderKindOpenAICompatible, "https://provider.example")
+	snapshot := service.store.RoutingSnapshot()
+	provider := snapshot.Providers[0]
+	provider.CircuitBreaker = model.CircuitBreakerConfig{
+		Enabled:             testBoolPointer(true),
+		FailureThreshold:    2,
+		CooldownSeconds:     60,
+		HalfOpenMaxRequests: 1,
+	}
+	candidate := resolvedCandidate{
+		provider:   provider,
+		endpoint:   provider.Endpoints[0],
+		credential: provider.Credentials[0],
+	}
+
+	service.runtime.reportFailure(candidate, http.StatusBadGateway, "upstream failed", 0, false)
+	service.runtime.reportFailure(candidate, http.StatusBadGateway, "upstream failed", 0, false)
+
+	items := service.CircuitStatuses()
+	if len(items) != 1 {
+		t.Fatalf("expected one circuit row, got %+v", items)
+	}
+	if items[0].State != "open" || items[0].ConsecutiveFailures < 2 {
+		t.Fatalf("expected open circuit status, got %+v", items[0])
+	}
+
+	if reset := service.ResetCircuits(provider.ID, provider.Endpoints[0].ID); reset != 1 {
+		t.Fatalf("expected one reset endpoint, got %d", reset)
+	}
+	items = service.CircuitStatuses()
+	if len(items) != 1 || items[0].State != "closed" || items[0].ConsecutiveFailures != 0 {
+		t.Fatalf("expected reset to close the circuit, got %+v", items)
+	}
+}
+
+func testBoolPointer(value bool) *bool {
+	v := value
+	return &v
+}
+
 func TestRuntimeCircuitBreakerHalfOpenLimitsProbeConcurrency(t *testing.T) {
 	t.Parallel()
 

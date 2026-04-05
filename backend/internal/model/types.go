@@ -100,16 +100,25 @@ const (
 	TransformerTypePrependMessage TransformerType = "prepend_message"
 )
 
+type PricingAliasMatchType string
+
+const (
+	PricingAliasMatchExact    PricingAliasMatchType = "exact"
+	PricingAliasMatchPrefix   PricingAliasMatchType = "prefix"
+	PricingAliasMatchWildcard PricingAliasMatchType = "wildcard"
+)
+
 // State is the persisted configuration snapshot exposed to the admin API.
 type State struct {
-	Version         string           `json:"version"`
-	Providers       []Provider       `json:"providers"`
-	ModelRoutes     []ModelRoute     `json:"model_routes"`
-	PricingProfiles []PricingProfile `json:"pricing_profiles"`
-	Integrations    []Integration    `json:"integrations"`
-	GatewayKeys     []GatewayKey     `json:"gateway_keys"`
-	RequestHistory  []RequestRecord  `json:"request_history"`
-	UpdatedAt       time.Time        `json:"updated_at"`
+	Version         string             `json:"version"`
+	Providers       []Provider         `json:"providers"`
+	ModelRoutes     []ModelRoute       `json:"model_routes"`
+	PricingProfiles []PricingProfile   `json:"pricing_profiles"`
+	PricingAliases  []PricingAliasRule `json:"pricing_aliases"`
+	Integrations    []Integration      `json:"integrations"`
+	GatewayKeys     []GatewayKey       `json:"gateway_keys"`
+	RequestHistory  []RequestRecord    `json:"request_history"`
+	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
 // RoutingState is the read-only subset needed on the hot path.
@@ -117,6 +126,7 @@ type RoutingState struct {
 	Providers       []Provider
 	ModelRoutes     []ModelRoute
 	PricingProfiles []PricingProfile
+	PricingAliases  []PricingAliasRule
 	GatewayKeys     []GatewayKey
 }
 
@@ -229,6 +239,16 @@ type PricingProfile struct {
 	CachedInputPerMillion float64 `json:"cached_input_per_million"`
 	ReasoningPerMillion   float64 `json:"reasoning_per_million"`
 	RequestFlat           float64 `json:"request_flat"`
+}
+
+// PricingAliasRule maps one route alias or upstream model pattern to an
+// existing pricing profile.
+type PricingAliasRule struct {
+	Name             string                `json:"name,omitempty"`
+	MatchType        PricingAliasMatchType `json:"match_type"`
+	Pattern          string                `json:"pattern"`
+	PricingProfileID string                `json:"pricing_profile_id"`
+	Enabled          bool                  `json:"enabled"`
 }
 
 // Integration tracks a managed upstream relay account.
@@ -399,6 +419,7 @@ func DefaultState() State {
 		Providers:       []Provider{},
 		ModelRoutes:     []ModelRoute{},
 		PricingProfiles: []PricingProfile{},
+		PricingAliases:  []PricingAliasRule{},
 		Integrations:    []Integration{},
 		GatewayKeys:     []GatewayKey{},
 		RequestHistory:  []RequestRecord{},
@@ -419,6 +440,9 @@ func (s *State) Normalize() {
 	}
 	if s.PricingProfiles == nil {
 		s.PricingProfiles = []PricingProfile{}
+	}
+	if s.PricingAliases == nil {
+		s.PricingAliases = []PricingAliasRule{}
 	}
 	if s.Integrations == nil {
 		s.Integrations = []Integration{}
@@ -510,6 +534,13 @@ func (s *State) Normalize() {
 			}
 			credential.APIKey = strings.TrimSpace(credential.APIKey)
 		}
+	}
+	for i := range s.PricingAliases {
+		rule := &s.PricingAliases[i]
+		rule.Name = strings.TrimSpace(rule.Name)
+		rule.Pattern = strings.TrimSpace(rule.Pattern)
+		rule.PricingProfileID = strings.TrimSpace(rule.PricingProfileID)
+		rule.MatchType = rule.MatchType.Canonical()
 	}
 
 	for i := range s.ModelRoutes {
@@ -702,6 +733,19 @@ func (t TransformerType) Canonical() TransformerType {
 	}
 }
 
+func (t PricingAliasMatchType) Canonical() PricingAliasMatchType {
+	switch strings.ToLower(strings.TrimSpace(string(t))) {
+	case string(PricingAliasMatchExact):
+		return PricingAliasMatchExact
+	case string(PricingAliasMatchPrefix):
+		return PricingAliasMatchPrefix
+	case string(PricingAliasMatchWildcard):
+		return PricingAliasMatchWildcard
+	default:
+		return ""
+	}
+}
+
 // FindProvider returns one provider by ID.
 func (s State) FindProvider(id string) (Provider, bool) {
 	for _, provider := range s.Providers {
@@ -732,6 +776,16 @@ func (s State) FindPricingProfile(id string) (PricingProfile, bool) {
 	return PricingProfile{}, false
 }
 
+// ResolvePricingProfile chooses the effective pricing profile for one request.
+func (s State) ResolvePricingProfile(explicitID, routeAlias, upstreamModel string) (PricingProfile, bool) {
+	if explicitID = strings.TrimSpace(explicitID); explicitID != "" {
+		if profile, ok := s.FindPricingProfile(explicitID); ok {
+			return profile, true
+		}
+	}
+	return resolvePricingProfileByAlias(s.PricingProfiles, s.PricingAliases, routeAlias, upstreamModel)
+}
+
 // FindIntegration returns one integration by ID.
 func (s State) FindIntegration(id string) (Integration, bool) {
 	for _, integration := range s.Integrations {
@@ -758,6 +812,7 @@ func (s State) RoutingSnapshot() RoutingState {
 		Providers:       make([]Provider, len(s.Providers)),
 		ModelRoutes:     make([]ModelRoute, len(s.ModelRoutes)),
 		PricingProfiles: slices.Clone(s.PricingProfiles),
+		PricingAliases:  slices.Clone(s.PricingAliases),
 		GatewayKeys:     make([]GatewayKey, len(s.GatewayKeys)),
 	}
 	for i, provider := range s.Providers {
@@ -802,6 +857,16 @@ func (s RoutingState) FindPricingProfile(id string) (PricingProfile, bool) {
 	return PricingProfile{}, false
 }
 
+// ResolvePricingProfile chooses the effective pricing profile for one request.
+func (s RoutingState) ResolvePricingProfile(explicitID, routeAlias, upstreamModel string) (PricingProfile, bool) {
+	if explicitID = strings.TrimSpace(explicitID); explicitID != "" {
+		if profile, ok := s.FindPricingProfile(explicitID); ok {
+			return profile, true
+		}
+	}
+	return resolvePricingProfileByAlias(s.PricingProfiles, s.PricingAliases, routeAlias, upstreamModel)
+}
+
 // FindGatewayKeyByHash returns one gateway key by its secret hash.
 func (s RoutingState) FindGatewayKeyByHash(secretHash string) (GatewayKey, bool) {
 	for _, key := range s.GatewayKeys {
@@ -819,6 +884,7 @@ func (s State) Clone() State {
 	cloned.Providers = routing.Providers
 	cloned.ModelRoutes = routing.ModelRoutes
 	cloned.PricingProfiles = routing.PricingProfiles
+	cloned.PricingAliases = slices.Clone(s.PricingAliases)
 	cloned.GatewayKeys = make([]GatewayKey, len(s.GatewayKeys))
 	for i, key := range s.GatewayKeys {
 		cloned.GatewayKeys[i] = key.clone()
@@ -955,6 +1021,68 @@ func (s IntegrationSnapshot) clone() IntegrationSnapshot {
 	s.ModelNames = slices.Clone(s.ModelNames)
 	s.Prices = maps.Clone(s.Prices)
 	return s
+}
+
+func resolvePricingProfileByAlias(profiles []PricingProfile, rules []PricingAliasRule, routeAlias, upstreamModel string) (PricingProfile, bool) {
+	candidates := []string{strings.TrimSpace(routeAlias), strings.TrimSpace(upstreamModel)}
+	for _, rule := range rules {
+		if !rule.Enabled {
+			continue
+		}
+		if rule.MatchType.Canonical() == "" || strings.TrimSpace(rule.Pattern) == "" || strings.TrimSpace(rule.PricingProfileID) == "" {
+			continue
+		}
+		for _, candidate := range candidates {
+			if candidate == "" || !pricingAliasMatches(rule, candidate) {
+				continue
+			}
+			for _, profile := range profiles {
+				if profile.ID == rule.PricingProfileID {
+					return profile, true
+				}
+			}
+		}
+	}
+	return PricingProfile{}, false
+}
+
+func pricingAliasMatches(rule PricingAliasRule, value string) bool {
+	pattern := strings.TrimSpace(rule.Pattern)
+	value = strings.TrimSpace(value)
+	if pattern == "" || value == "" {
+		return false
+	}
+	switch rule.MatchType.Canonical() {
+	case PricingAliasMatchExact:
+		return strings.EqualFold(pattern, value)
+	case PricingAliasMatchPrefix:
+		return strings.HasPrefix(strings.ToLower(value), strings.ToLower(pattern))
+	case PricingAliasMatchWildcard:
+		return wildcardMatch(pattern, value)
+	default:
+		return false
+	}
+}
+
+func wildcardMatch(pattern, value string) bool {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	value = strings.ToLower(strings.TrimSpace(value))
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == value
+	}
+	if len(parts) > 2 {
+		return false
+	}
+	left := parts[0]
+	right := parts[1]
+	if left != "" && !strings.HasPrefix(value, left) {
+		return false
+	}
+	if right != "" && !strings.HasSuffix(value, right) {
+		return false
+	}
+	return len(value) >= len(left)+len(right)
 }
 
 // IsEnabled reports whether the circuit breaker should actively trip.

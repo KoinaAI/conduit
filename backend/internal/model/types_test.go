@@ -225,3 +225,35 @@ func TestStateCloneDoesNotNormalizeMissingIdentifiers(t *testing.T) {
 		t.Fatalf("expected clone to preserve missing credential id, got %q", cloned.Providers[0].Credentials[0].ID)
 	}
 }
+
+func TestResolvePricingProfileFallsBackToAliasRules(t *testing.T) {
+	t.Parallel()
+
+	state := DefaultState()
+	state.PricingProfiles = []PricingProfile{
+		{ID: "standard", Name: "Standard"},
+		{ID: "catalog-gpt-5", Name: "Catalog GPT-5"},
+	}
+	state.PricingAliases = []PricingAliasRule{
+		{
+			Name:             "prefix-match",
+			MatchType:        PricingAliasMatchPrefix,
+			Pattern:          "gpt-5",
+			PricingProfileID: "catalog-gpt-5",
+			Enabled:          true,
+		},
+	}
+
+	profile, ok := state.ResolvePricingProfile("", "gpt-5.4-fast", "openai/gpt-5.4-fast")
+	if !ok {
+		t.Fatal("expected pricing alias rule to resolve a profile")
+	}
+	if profile.ID != "catalog-gpt-5" {
+		t.Fatalf("expected alias rule to resolve catalog-gpt-5, got %+v", profile)
+	}
+
+	explicit, ok := state.ResolvePricingProfile("standard", "gpt-5.4-fast", "openai/gpt-5.4-fast")
+	if !ok || explicit.ID != "standard" {
+		t.Fatalf("expected explicit route pricing profile to win, got %+v ok=%v", explicit, ok)
+	}
+}

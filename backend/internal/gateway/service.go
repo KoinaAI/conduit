@@ -269,7 +269,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 		}()
 
 		_, planSpan := gatewayTracer.Start(ctx, "gateway.route_plan")
-		candidates, route, pricing, appliedScenario, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, gatewayKey.ID, parsedRequest.sessionID, parsedRequest.scenario)
+		candidates, route, _, appliedScenario, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, gatewayKey.ID, parsedRequest.sessionID, parsedRequest.scenario)
 		planSpan.SetAttributes(attribute.Int("gateway.candidate_count", len(candidates)))
 		if appliedScenario != "" {
 			planSpan.SetAttributes(attribute.String("gateway.scenario", appliedScenario))
@@ -530,7 +530,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 
 			record.DurationMS = time.Since(started).Milliseconds()
 			record.Usage = observer.Summary()
-			record.Billing = billing.Calculate(pricing, record.Usage, candidate.multiplier, pricing.Name)
+			record.Billing = billing.Calculate(candidate.pricing, record.Usage, candidate.multiplier, candidate.pricing.Name)
 			finalCost = record.Billing.FinalCost
 			attemptSpan.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 			attemptSpan.End()
@@ -646,7 +646,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	_, planSpan := gatewayTracer.Start(ctx, "gateway.route_plan")
-	candidates, route, pricing, appliedScenario, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, gatewayKey.ID, sessionID, scenario)
+	candidates, route, _, appliedScenario, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, gatewayKey.ID, sessionID, scenario)
 	planSpan.SetAttributes(attribute.Int("gateway.candidate_count", len(candidates)))
 	if appliedScenario != "" {
 		planSpan.SetAttributes(attribute.String("gateway.scenario", appliedScenario))
@@ -758,7 +758,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	}
 	record.DurationMS = time.Since(started).Milliseconds()
 	record.Usage = observer.Summary()
-	record.Billing = billing.Calculate(pricing, record.Usage, candidate.multiplier, pricing.Name)
+	record.Billing = billing.Calculate(candidate.pricing, record.Usage, candidate.multiplier, candidate.pricing.Name)
 	finalCost = record.Billing.FinalCost
 	requestSpan.SetAttributes(
 		attribute.String("gateway.provider_id", candidate.provider.ID),
@@ -975,6 +975,24 @@ func (s *Service) appendRecord(record model.RequestRecord, attempts []model.Requ
 	_ = s.store.AppendRequestRecord(record, attempts, s.cfg.RequestHistory)
 }
 
+// CircuitStatuses returns the current passive circuit state for every
+// configured provider endpoint.
+func (s *Service) CircuitStatuses() []EndpointCircuitStatus {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.runtime.CircuitStatuses(s.store.RoutingSnapshot(), time.Now().UTC())
+}
+
+// ResetCircuits clears passive circuit state for matching endpoints. Empty
+// provider and endpoint filters reset every configured endpoint.
+func (s *Service) ResetCircuits(providerID, endpointID string) int {
+	if s == nil || s.store == nil {
+		return 0
+	}
+	return s.runtime.ResetCircuits(s.store.RoutingSnapshot(), providerID, endpointID)
+}
+
 // RunProbes actively checks configured endpoints so the admin plane can inspect
 // reachability, auth failures, and current passive-circuit status.
 func (s *Service) RunProbes(ctx context.Context) map[string]any {
@@ -1063,15 +1081,6 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 	if err != nil {
 		return nil, model.ModelRoute{}, model.PricingProfile{}, "", err
 	}
-	profile, ok := state.FindPricingProfile(route.PricingProfileID)
-	if !ok {
-		profile = model.PricingProfile{
-			ID:       "default",
-			Name:     "default",
-			Currency: "USD",
-		}
-	}
-
 	now := time.Now().UTC()
 	healthy := []resolvedCandidate{}
 	degraded := []resolvedCandidate{}
@@ -1094,6 +1103,14 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 				multiplier := provider.DefaultMarkupMultiplier * target.MarkupMultiplier
 				if multiplier <= 0 {
 					multiplier = 1
+				}
+				profile, ok := state.ResolvePricingProfile(route.PricingProfileID, route.Alias, target.UpstreamModel)
+				if !ok {
+					profile = model.PricingProfile{
+						ID:       "default",
+						Name:     "default",
+						Currency: "USD",
+					}
 				}
 				candidate := resolvedCandidate{
 					provider:     provider,
@@ -1149,7 +1166,7 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 	if len(filteredCandidates) == 0 {
 		return nil, model.ModelRoute{}, model.PricingProfile{}, "", fmt.Errorf("route %q has no candidate within provider retry budgets", alias)
 	}
-	return filteredCandidates, route, profile, scenario, nil
+	return filteredCandidates, route, filteredCandidates[0].pricing, scenario, nil
 }
 
 func applyRouteScenario(route model.ModelRoute, requested string) (model.ModelRoute, string, error) {

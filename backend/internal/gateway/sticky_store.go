@@ -33,4 +33,6 @@ type endpointRuntimeStore interface {
 	AcquireEndpoint(candidate resolvedCandidate, now time.Time) (bool, error)
 	ReportEndpointSuccess(candidate resolvedCandidate, now time.Time, halfOpen bool) error
 	ReportEndpointFailure(candidate resolvedCandidate, now time.Time, halfOpen bool) error
+	LoadEndpointState(candidate resolvedCandidate) (endpointRuntimeState, bool, error)
+	ResetEndpoint(candidate resolvedCandidate) error
 }

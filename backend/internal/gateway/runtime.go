@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -91,6 +92,22 @@ type runtimeState struct {
 	runtimeWrites         int
 }
 
+type EndpointCircuitStatus struct {
+	ProviderID          string     `json:"provider_id"`
+	ProviderName        string     `json:"provider_name"`
+	EndpointID          string     `json:"endpoint_id"`
+	EndpointURL         string     `json:"endpoint_url"`
+	State               string     `json:"state"`
+	Enabled             bool       `json:"enabled"`
+	FailureThreshold    int        `json:"failure_threshold"`
+	ConsecutiveFailures int        `json:"consecutive_failures"`
+	HalfOpenInFlight    int        `json:"half_open_inflight"`
+	OpenUntil           *time.Time `json:"open_until,omitempty"`
+	LastCheckedAt       *time.Time `json:"last_checked_at,omitempty"`
+	LastStatusCode      int        `json:"last_status_code,omitempty"`
+	LastError           string     `json:"last_error,omitempty"`
+}
+
 func newRuntimeState(stickyStore ...stickyBindingStore) *runtimeState {
 	var currentStickyStore stickyBindingStore
 	if len(stickyStore) > 0 {
@@ -147,6 +164,109 @@ func (r *runtimeState) endpointOpen(candidate resolvedCandidate, now time.Time) 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.endpointOpenLocked(candidate, now)
+}
+
+func (r *runtimeState) endpointStatus(candidate resolvedCandidate, now time.Time) (endpointRuntimeState, bool) {
+	if store, ok := r.stickyStore.(endpointRuntimeStore); ok && store != nil {
+		state, exists, err := store.LoadEndpointState(candidate)
+		if err == nil {
+			return state, exists
+		}
+		slog.Warn("endpoint runtime cache state read failed", "provider_id", candidate.provider.ID, "endpoint_id", candidate.endpoint.ID, "error", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, ok := r.endpoints[endpointRuntimeKey(candidate)]
+	if !ok || state == nil {
+		return endpointRuntimeState{}, false
+	}
+	return *state, true
+}
+
+func (r *runtimeState) CircuitStatuses(state model.RoutingState, now time.Time) []EndpointCircuitStatus {
+	now = now.UTC()
+	items := make([]EndpointCircuitStatus, 0)
+	for _, provider := range state.Providers {
+		for _, endpoint := range provider.Endpoints {
+			if strings.TrimSpace(endpoint.ID) == "" {
+				continue
+			}
+			candidate := resolvedCandidate{provider: provider, endpoint: endpoint}
+			runtimeState, exists := r.endpointStatus(candidate, now)
+			status := EndpointCircuitStatus{
+				ProviderID:          provider.ID,
+				ProviderName:        provider.Name,
+				EndpointID:          endpoint.ID,
+				EndpointURL:         endpoint.BaseURL,
+				Enabled:             provider.CircuitBreaker.IsEnabled(),
+				FailureThreshold:    provider.CircuitBreaker.FailureThreshold,
+				ConsecutiveFailures: runtimeState.ConsecutiveFailures,
+				HalfOpenInFlight:    runtimeState.HalfOpenInFlight,
+				LastStatusCode:      runtimeState.LastStatusCode,
+				LastError:           runtimeState.LastError,
+				State:               "closed",
+			}
+			if exists {
+				if !runtimeState.OpenUntil.IsZero() {
+					next := runtimeState.OpenUntil.UTC()
+					status.OpenUntil = &next
+				}
+				if !runtimeState.LastCheckedAt.IsZero() {
+					next := runtimeState.LastCheckedAt.UTC()
+					status.LastCheckedAt = &next
+				}
+				switch {
+				case runtimeState.OpenUntil.After(now):
+					status.State = "open"
+				case provider.CircuitBreaker.IsEnabled() &&
+					runtimeState.ConsecutiveFailures >= max(provider.CircuitBreaker.FailureThreshold, 1):
+					status.State = "half_open"
+				}
+			}
+			items = append(items, status)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].State != items[j].State {
+			return circuitStateSortOrder(items[i].State) < circuitStateSortOrder(items[j].State)
+		}
+		if items[i].ProviderName != items[j].ProviderName {
+			return items[i].ProviderName < items[j].ProviderName
+		}
+		if items[i].ProviderID != items[j].ProviderID {
+			return items[i].ProviderID < items[j].ProviderID
+		}
+		return items[i].EndpointID < items[j].EndpointID
+	})
+	return items
+}
+
+func (r *runtimeState) ResetCircuits(state model.RoutingState, providerID, endpointID string) int {
+	providerID = strings.TrimSpace(providerID)
+	endpointID = strings.TrimSpace(endpointID)
+	resetCount := 0
+	for _, provider := range state.Providers {
+		if providerID != "" && provider.ID != providerID {
+			continue
+		}
+		for _, endpoint := range provider.Endpoints {
+			if endpointID != "" && endpoint.ID != endpointID {
+				continue
+			}
+			candidate := resolvedCandidate{provider: provider, endpoint: endpoint}
+			if store, ok := r.stickyStore.(endpointRuntimeStore); ok && store != nil {
+				if err := store.ResetEndpoint(candidate); err != nil {
+					slog.Warn("endpoint runtime cache reset failed", "provider_id", provider.ID, "endpoint_id", endpoint.ID, "error", err)
+				}
+			}
+			r.mu.Lock()
+			delete(r.endpoints, endpointRuntimeKey(candidate))
+			r.mu.Unlock()
+			resetCount++
+		}
+	}
+	return resetCount
 }
 
 func (r *runtimeState) credentialCoolingDown(candidate resolvedCandidate, now time.Time) bool {
@@ -735,6 +855,17 @@ func (r *runtimeState) endpointOpenLocked(candidate resolvedCandidate, now time.
 		limit = 1
 	}
 	return endpoint.HalfOpenInFlight >= limit
+}
+
+func circuitStateSortOrder(state string) int {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "open":
+		return 0
+	case "half_open":
+		return 1
+	default:
+		return 2
+	}
 }
 
 func endpointRuntimeKey(candidate resolvedCandidate) string {

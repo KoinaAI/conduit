@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -838,9 +839,61 @@ func (h *Handlers) DeleteGatewayKey(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// GetPricingAliases serves GET /api/admin/pricing-aliases.
+func (h *Handlers) GetPricingAliases(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, h.store.Snapshot().PricingAliases)
+}
+
+// UpdatePricingAliases serves PUT /api/admin/pricing-aliases.
+func (h *Handlers) UpdatePricingAliases(w http.ResponseWriter, r *http.Request) {
+	var payload []model.PricingAliasRule
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	saved, err := h.updateState(func(state *model.State) error {
+		rules := slices.Clone(payload)
+		if err := validatePricingAliasRules(state, rules); err != nil {
+			return err
+		}
+		state.PricingAliases = rules
+		return nil
+	})
+	if err != nil {
+		writeMutationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, saved.PricingAliases)
+}
+
 // ListRequestHistory serves GET /api/admin/request-history.
-func (h *Handlers) ListRequestHistory(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.store.Snapshot().RequestHistory)
+func (h *Handlers) ListRequestHistory(w http.ResponseWriter, r *http.Request) {
+	query, err := readRequestHistoryQuery(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	page, err := h.store.QueryRequestHistory(query)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+// GetRequestHistoryRecord serves GET /api/admin/request-history/{id}.
+func (h *Handlers) GetRequestHistoryRecord(w http.ResponseWriter, r *http.Request) {
+	record, ok, err := h.store.RequestRecord(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "request record not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, record)
 }
 
 // GetRequestAttempts serves GET /api/admin/request-history/{id}/attempts.
@@ -851,6 +904,71 @@ func (h *Handlers) GetRequestAttempts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, attempts)
+}
+
+// ListActiveSessions serves GET /api/admin/runtime/sessions.
+func (h *Handlers) ListActiveSessions(w http.ResponseWriter, r *http.Request) {
+	limit, err := readPositiveIntQuery(r, "limit", 50, 200)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	activeWithinMinutes, err := readPositiveIntQuery(r, "active_within_minutes", 15, 24*60)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	items, err := h.store.ActiveSessions(time.Now().UTC(), time.Duration(activeWithinMinutes)*time.Minute, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active_within_minutes": activeWithinMinutes,
+		"items":                 items,
+	})
+}
+
+// GetProviderUsage serves GET /api/admin/runtime/provider-usage.
+func (h *Handlers) GetProviderUsage(w http.ResponseWriter, r *http.Request) {
+	limit, err := readPositiveIntQuery(r, "limit", 200, 500)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	items, err := h.store.ProviderUsage(time.Now().UTC(), limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// GetCircuitStatus serves GET /api/admin/runtime/circuits.
+func (h *Handlers) GetCircuitStatus(w http.ResponseWriter, _ *http.Request) {
+	if h.gateway == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": h.gateway.CircuitStatuses()})
+}
+
+// ResetCircuits serves POST /api/admin/runtime/circuits/reset.
+func (h *Handlers) ResetCircuits(w http.ResponseWriter, r *http.Request) {
+	if h.gateway == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
+		return
+	}
+	var payload struct {
+		ProviderID string `json:"provider_id"`
+		EndpointID string `json:"endpoint_id"`
+	}
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	resetCount := h.gateway.ResetCircuits(payload.ProviderID, payload.EndpointID)
+	writeJSON(w, http.StatusOK, map[string]any{"reset": resetCount})
 }
 
 // GetStatsSummary serves GET /api/admin/stats/summary.
@@ -1143,11 +1261,30 @@ func buildOpenAPISpec() map[string]any {
 				"put":    map[string]any{"summary": "Update gateway key"},
 				"delete": map[string]any{"summary": "Delete gateway key"},
 			},
+			"/api/admin/pricing-aliases": map[string]any{
+				"get": map[string]any{"summary": "List pricing alias rules"},
+				"put": map[string]any{"summary": "Replace pricing alias rules"},
+			},
 			"/api/admin/request-history": map[string]any{
-				"get": map[string]any{"summary": "List request history"},
+				"get": map[string]any{"summary": "List request history with filters"},
+			},
+			"/api/admin/request-history/{id}": map[string]any{
+				"get": map[string]any{"summary": "Get one request history record"},
 			},
 			"/api/admin/request-history/{id}/attempts": map[string]any{
 				"get": map[string]any{"summary": "Get recorded upstream attempts for one request"},
+			},
+			"/api/admin/runtime/sessions": map[string]any{
+				"get": map[string]any{"summary": "List active sessions derived from recent request history"},
+			},
+			"/api/admin/runtime/provider-usage": map[string]any{
+				"get": map[string]any{"summary": "Summarize rolling provider usage windows"},
+			},
+			"/api/admin/runtime/circuits": map[string]any{
+				"get": map[string]any{"summary": "List passive circuit states for provider endpoints"},
+			},
+			"/api/admin/runtime/circuits/reset": map[string]any{
+				"post": map[string]any{"summary": "Reset passive circuit state for matching endpoints"},
 			},
 			"/api/admin/stats/summary": map[string]any{
 				"get": map[string]any{"summary": "Get aggregate request statistics"},
@@ -1413,9 +1550,85 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 	return nil
 }
 
+func readRequestHistoryQuery(r *http.Request) (store.RequestHistoryQuery, error) {
+	query := r.URL.Query()
+	limit, err := readPositiveIntQuery(r, "limit", 50, 200)
+	if err != nil {
+		return store.RequestHistoryQuery{}, err
+	}
+	statusCode, err := readOptionalIntValue(query.Get("status_code"), "status_code")
+	if err != nil {
+		return store.RequestHistoryQuery{}, err
+	}
+	stream, err := readOptionalBoolValue(query.Get("stream"), "stream")
+	if err != nil {
+		return store.RequestHistoryQuery{}, err
+	}
+	hasError, err := readOptionalBoolValue(query.Get("has_error"), "has_error")
+	if err != nil {
+		return store.RequestHistoryQuery{}, err
+	}
+	return store.RequestHistoryQuery{
+		Limit:        limit,
+		Cursor:       strings.TrimSpace(query.Get("cursor")),
+		Protocol:     model.Protocol(strings.TrimSpace(query.Get("protocol"))),
+		RouteAlias:   strings.TrimSpace(query.Get("route_alias")),
+		ProviderID:   strings.TrimSpace(query.Get("provider_id")),
+		GatewayKeyID: strings.TrimSpace(query.Get("gateway_key_id")),
+		SessionID:    strings.TrimSpace(query.Get("session_id")),
+		StatusCode:   statusCode,
+		Stream:       stream,
+		HasError:     hasError,
+		Search:       strings.TrimSpace(query.Get("search")),
+	}, nil
+}
+
 func readStatsWindow(r *http.Request) (store.StatsWindow, error) {
 	query := r.URL.Query()
 	return store.ResolveStatsWindow(query.Get("window"), query.Get("days"), time.Now().UTC())
+}
+
+func readPositiveIntQuery(r *http.Request, key string, defaultValue, maxValue int) (int, error) {
+	return readPositiveIntValue(r.URL.Query().Get(key), key, defaultValue, maxValue)
+}
+
+func readPositiveIntValue(raw, field string, defaultValue, maxValue int) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultValue, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a positive integer", field)
+	}
+	if value <= 0 || value > maxValue {
+		return 0, fmt.Errorf("%s must be between 1 and %d", field, maxValue)
+	}
+	return value, nil
+}
+
+func readOptionalIntValue(raw, field string) (*int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be an integer", field)
+	}
+	return &value, nil
+}
+
+func readOptionalBoolValue(raw, field string) (*bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be a boolean", field)
+	}
+	return &value, nil
 }
 
 func bearerToken(value string) string {
@@ -1491,6 +1704,41 @@ func validateRouteAlias(routes []model.ModelRoute, alias, currentAlias string) e
 			continue
 		}
 		return errValidation("route alias already exists")
+	}
+	return nil
+}
+
+func validatePricingAliasRules(state *model.State, rules []model.PricingAliasRule) error {
+	if state == nil {
+		return errValidation("state is required")
+	}
+	seen := map[string]struct{}{}
+	for index := range rules {
+		rule := &rules[index]
+		rule.Name = strings.TrimSpace(rule.Name)
+		rule.Pattern = strings.TrimSpace(rule.Pattern)
+		rule.PricingProfileID = strings.TrimSpace(rule.PricingProfileID)
+		rule.MatchType = rule.MatchType.Canonical()
+		if rule.MatchType == "" {
+			return errValidation("pricing alias match_type must be exact, prefix, or wildcard")
+		}
+		if rule.Pattern == "" {
+			return errValidation("pricing alias pattern is required")
+		}
+		if rule.PricingProfileID == "" {
+			return errValidation("pricing alias pricing_profile_id is required")
+		}
+		if _, ok := state.FindPricingProfile(rule.PricingProfileID); !ok {
+			return errValidation("pricing alias pricing_profile_id must reference an existing pricing profile")
+		}
+		if rule.MatchType == model.PricingAliasMatchWildcard && strings.Count(rule.Pattern, "*") > 1 {
+			return errValidation("pricing alias wildcard pattern may contain at most one *")
+		}
+		key := strings.ToLower(string(rule.MatchType)) + "\x00" + strings.ToLower(rule.Pattern) + "\x00" + strings.ToLower(rule.PricingProfileID)
+		if _, exists := seen[key]; exists {
+			return errValidation("pricing alias rules must be unique")
+		}
+		seen[key] = struct{}{}
 	}
 	return nil
 }

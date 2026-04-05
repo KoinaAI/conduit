@@ -99,13 +99,12 @@ func ResolveStatsWindow(windowValue, daysValue string, now time.Time) (StatsWind
 
 // StatsSummary returns aggregate statistics for one time window.
 func (s *FileStore) StatsSummary(window StatsWindow) (StatsSummaryReport, error) {
-	records, err := s.statsRecords(window)
-	if err != nil {
-		return StatsSummaryReport{}, err
-	}
 	var metrics StatsMetrics
-	for _, record := range records {
+	if err := s.scanStatsRows(window, func(record statsRecord) error {
 		metrics.addRecord(record)
+		return nil
+	}); err != nil {
+		return StatsSummaryReport{}, err
 	}
 	metrics.finalize()
 	return StatsSummaryReport{
@@ -171,11 +170,6 @@ func statsWindowForDays(days int, now time.Time) (StatsWindow, error) {
 }
 
 func (s *FileStore) statsBreakdown(window StatsWindow, groupKey func(model.RequestRecord) (string, string)) (StatsBreakdownReport, error) {
-	records, err := s.statsRecords(window)
-	if err != nil {
-		return StatsBreakdownReport{}, err
-	}
-
 	type group struct {
 		id      string
 		name    string
@@ -183,8 +177,8 @@ func (s *FileStore) statsBreakdown(window StatsWindow, groupKey func(model.Reque
 	}
 
 	groups := map[string]*group{}
-	for _, record := range records {
-		id, name := groupKey(record)
+	if err := s.scanStatsRows(window, func(record statsRecord) error {
+		id, name := groupKey(record.RequestRecord())
 		compositeKey := id + "\x00" + name
 		current, ok := groups[compositeKey]
 		if !ok {
@@ -192,6 +186,9 @@ func (s *FileStore) statsBreakdown(window StatsWindow, groupKey func(model.Reque
 			groups[compositeKey] = current
 		}
 		current.metrics.addRecord(record)
+		return nil
+	}); err != nil {
+		return StatsBreakdownReport{}, err
 	}
 
 	items := make([]StatsBreakdownRow, 0, len(groups))
@@ -222,47 +219,81 @@ func (s *FileStore) statsBreakdown(window StatsWindow, groupKey func(model.Reque
 	}, nil
 }
 
-func (s *FileStore) statsRecords(window StatsWindow) ([]model.RequestRecord, error) {
+type statsRecord struct {
+	routeAlias    string
+	gatewayKeyID  string
+	accountID     string
+	providerName  string
+	upstreamModel string
+	statusCode    int
+	stream        bool
+	usage         model.UsageSummary
+	billing       model.BillingSummary
+}
+
+func (r statsRecord) RequestRecord() model.RequestRecord {
+	return model.RequestRecord{
+		RouteAlias:    r.routeAlias,
+		GatewayKeyID:  r.gatewayKeyID,
+		AccountID:     r.accountID,
+		ProviderName:  r.providerName,
+		UpstreamModel: r.upstreamModel,
+		StatusCode:    r.statusCode,
+		Stream:        r.stream,
+		Usage:         r.usage,
+		Billing:       r.billing,
+	}
+}
+
+func (s *FileStore) scanStatsRows(window StatsWindow, visit func(statsRecord) error) error {
 	s.mu.RLock()
 	db := s.db
 	s.mu.RUnlock()
 	if db == nil {
-		return nil, errors.New("store is closed")
+		return errors.New("store is closed")
 	}
 
 	rows, err := db.Query(
-		s.rebind(`SELECT payload FROM request_records WHERE started_at >= ? AND started_at <= ? ORDER BY started_at DESC`),
+		s.rebind(`SELECT route_alias, gateway_key_id, account_id, provider_name, status_code, stream, payload FROM request_records WHERE started_at >= ? AND started_at <= ? ORDER BY started_at DESC`),
 		window.StartAt.UTC().Format(time.RFC3339Nano),
 		window.EndAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
 
-	records := []model.RequestRecord{}
 	for rows.Next() {
-		record, err := scanRequestRecord(rows)
+		record, err := scanStatsRecord(rows)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		records = append(records, record)
+		if err := visit(record); err != nil {
+			return err
+		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return records, nil
+	return rows.Err()
 }
 
-func scanRequestRecord(rows *sql.Rows) (model.RequestRecord, error) {
+func scanStatsRecord(rows *sql.Rows) (statsRecord, error) {
+	var record statsRecord
 	var raw []byte
-	if err := rows.Scan(&raw); err != nil {
-		return model.RequestRecord{}, err
+	var stream int
+	if err := rows.Scan(&record.routeAlias, &record.gatewayKeyID, &record.accountID, &record.providerName, &record.statusCode, &stream, &raw); err != nil {
+		return statsRecord{}, err
 	}
-	var record model.RequestRecord
-	if err := json.Unmarshal(raw, &record); err != nil {
-		return model.RequestRecord{}, err
+	var payload struct {
+		UpstreamModel string               `json:"upstream_model"`
+		Usage         model.UsageSummary   `json:"usage"`
+		Billing       model.BillingSummary `json:"billing"`
 	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return statsRecord{}, err
+	}
+	record.upstreamModel = payload.UpstreamModel
+	record.stream = stream != 0
+	record.usage = payload.Usage
+	record.billing = payload.Billing
 	return record, nil
 }
 
@@ -277,22 +308,22 @@ func (s *FileStore) gatewayKeyNameMap() map[string]string {
 	return names
 }
 
-func (m *StatsMetrics) addRecord(record model.RequestRecord) {
+func (m *StatsMetrics) addRecord(record statsRecord) {
 	m.RequestCount++
-	if record.StatusCode >= httpStatusSuccessMin && record.StatusCode < httpStatusSuccessMax {
+	if record.statusCode >= httpStatusSuccessMin && record.statusCode < httpStatusSuccessMax {
 		m.SuccessCount++
 	} else {
 		m.ErrorCount++
 	}
-	if record.Stream {
+	if record.stream {
 		m.StreamCount++
 	}
-	m.InputTokens += record.Usage.InputTokens
-	m.OutputTokens += record.Usage.OutputTokens
-	m.TotalTokens += record.Usage.TotalTokens
-	m.CachedInputTokens += record.Usage.CachedInputTokens
-	m.ReasoningTokens += record.Usage.ReasoningTokens
-	m.FinalCost += record.Billing.FinalCost
+	m.InputTokens += record.usage.InputTokens
+	m.OutputTokens += record.usage.OutputTokens
+	m.TotalTokens += record.usage.TotalTokens
+	m.CachedInputTokens += record.usage.CachedInputTokens
+	m.ReasoningTokens += record.usage.ReasoningTokens
+	m.FinalCost += record.billing.FinalCost
 }
 
 func (m *StatsMetrics) finalize() {

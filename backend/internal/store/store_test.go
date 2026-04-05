@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -116,6 +117,40 @@ func TestOpenRoundTripPreservesGatewayKeySecretHash(t *testing.T) {
 	}
 	if !model.VerifyGatewaySecret(key.SecretHash, "gateway-secret-123") {
 		t.Fatalf("expected persisted secret hash to stay valid")
+	}
+}
+
+func TestOpenHonorsConfiguredRequestHistoryLimitOnReload(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	fileStore, err := Open(path, WithRequestHistoryLimit(5))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	for index := 0; index < 8; index++ {
+		recordID := "req-" + strconv.Itoa(index+1)
+		if err := fileStore.AppendRequestRecord(model.RequestRecord{ID: recordID, StartedAt: time.Now().UTC().Add(time.Duration(index) * time.Millisecond)}, nil, 5); err != nil {
+			t.Fatalf("append record %s: %v", recordID, err)
+		}
+	}
+	if err := fileStore.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := Open(path, WithRequestHistoryLimit(5))
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+
+	saved := reopened.Snapshot()
+	if len(saved.RequestHistory) != 5 {
+		t.Fatalf("expected 5 records after reopen, got %d", len(saved.RequestHistory))
+	}
+	if saved.RequestHistory[0].ID != "req-4" || saved.RequestHistory[4].ID != "req-8" {
+		t.Fatalf("expected most recent 5 records after reopen, got %+v", saved.RequestHistory)
 	}
 }
 

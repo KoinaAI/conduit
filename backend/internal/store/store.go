@@ -36,12 +36,19 @@ const (
 // FileStore keeps the public type name stable while switching the persistence
 // backend from a JSON file to SQLite.
 type FileStore struct {
-	path    string
-	backend storageBackend
-	db      *sql.DB
-	mu      sync.RWMutex
-	state   model.State
+	path                string
+	backend             storageBackend
+	db                  *sql.DB
+	requestHistoryLimit int
+	mu                  sync.RWMutex
+	state               model.State
 }
+
+type openConfig struct {
+	requestHistoryLimit int
+}
+
+type OpenOption func(*openConfig)
 
 // HealthCounts summarizes lightweight in-memory counts for health endpoints.
 type HealthCounts struct {
@@ -56,10 +63,18 @@ type HealthCounts struct {
 
 // Open initializes the configured persistence backend and imports legacy JSON
 // state when the SQLite path still contains the previous file-store format.
-func Open(locator string) (*FileStore, error) {
+func Open(locator string, options ...OpenOption) (*FileStore, error) {
 	locator = strings.TrimSpace(locator)
 	if locator == "" {
 		return nil, errors.New("state path or database url is required")
+	}
+	openCfg := openConfig{
+		requestHistoryLimit: 1000,
+	}
+	for _, option := range options {
+		if option != nil {
+			option(&openCfg)
+		}
 	}
 
 	backend, err := detectBackend(locator)
@@ -84,9 +99,10 @@ func Open(locator string) (*FileStore, error) {
 	}
 
 	store := &FileStore{
-		path:    locator,
-		backend: backend,
-		db:      db,
+		path:                locator,
+		backend:             backend,
+		db:                  db,
+		requestHistoryLimit: openCfg.requestHistoryLimit,
 	}
 	if err := store.initSchema(); err != nil {
 		_ = db.Close()
@@ -97,6 +113,15 @@ func Open(locator string) (*FileStore, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+func WithRequestHistoryLimit(limit int) OpenOption {
+	return func(cfg *openConfig) {
+		if cfg == nil {
+			return
+		}
+		cfg.requestHistoryLimit = limit
+	}
 }
 
 func detectBackend(locator string) (storageBackend, error) {
@@ -148,7 +173,9 @@ func (s *FileStore) Close() error {
 	if s.db == nil {
 		return nil
 	}
-	_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+	if s.backend == backendSQLite {
+		_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+	}
 	err := s.db.Close()
 	s.db = nil
 	return err
@@ -448,7 +475,7 @@ func (s *FileStore) load(legacyState *model.State) error {
 	}
 
 	existing.Normalize()
-	history, err := s.loadRequestHistoryLocked(1000)
+	history, err := s.loadRequestHistoryLocked(s.requestHistoryLimit)
 	if err != nil {
 		return err
 	}

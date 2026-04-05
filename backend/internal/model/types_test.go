@@ -1,6 +1,7 @@
 package model
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -173,5 +174,28 @@ func TestStateRoutingSnapshotDeepCopiesRoutingCollections(t *testing.T) {
 	}
 	if !state.GatewayKeys[0].ExpiresAt.Equal(expiresAt) {
 		t.Fatalf("gateway key expires_at pointer was not cloned")
+	}
+}
+
+func TestStateNormalizeAssignsProviderCapabilitiesByKind(t *testing.T) {
+	t.Parallel()
+
+	state := DefaultState()
+	state.Providers = []Provider{
+		{ID: "openai", Kind: ProviderKindOpenAICompatible},
+		{ID: "anthropic", Kind: ProviderKindAnthropic, Capabilities: []Protocol{ProtocolOpenAIResponses, ProtocolAnthropic}},
+		{ID: "gemini", Kind: ProviderKindGemini, Capabilities: []Protocol{ProtocolGeminiGenerate, ProtocolOpenAIChat, ProtocolGeminiStream}},
+	}
+
+	state.Normalize()
+
+	if got := state.Providers[0].Capabilities; !slices.Equal(got, []Protocol{ProtocolOpenAIChat, ProtocolOpenAIResponses}) {
+		t.Fatalf("unexpected openai-compatible capabilities: %+v", got)
+	}
+	if got := state.Providers[1].Capabilities; !slices.Equal(got, []Protocol{ProtocolAnthropic}) {
+		t.Fatalf("unexpected anthropic capabilities: %+v", got)
+	}
+	if got := state.Providers[2].Capabilities; !slices.Equal(got, []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream}) {
+		t.Fatalf("unexpected gemini capabilities: %+v", got)
 	}
 }

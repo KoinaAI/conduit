@@ -107,7 +107,7 @@ func (s *Service) CheckinState(ctx context.Context, state *model.State, integrat
 
 // ValidateBaseURL rejects unsafe integration management endpoints.
 func (s *Service) ValidateBaseURL(baseURL string) error {
-	_, err := s.resolveBaseURL(baseURL)
+	_, err := s.resolveBaseURL(context.Background(), baseURL)
 	return err
 }
 
@@ -636,7 +636,7 @@ func (s *Service) getRawJSON(ctx context.Context, baseURL, rawPath string, heade
 }
 
 func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath string, headers map[string]string, body []byte) (map[string]any, error) {
-	resolved, err := s.resolveBaseURL(baseURL)
+	resolved, err := s.resolveBaseURL(ctx, baseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -948,7 +948,7 @@ func pointerBool(value bool) *bool {
 	return &v
 }
 
-func (s *Service) resolveBaseURL(baseURL string) (resolvedBaseURL, error) {
+func (s *Service) resolveBaseURL(ctx context.Context, baseURL string) (resolvedBaseURL, error) {
 	trimmedBaseURL := strings.TrimSpace(baseURL)
 	parsed, err := url.Parse(trimmedBaseURL)
 	if err != nil {
@@ -992,7 +992,7 @@ func (s *Service) resolveBaseURL(baseURL string) (resolvedBaseURL, error) {
 	if lookupIPs == nil {
 		lookupIPs = net.DefaultResolver.LookupIP
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	ips, err := lookupIPs(ctx, "ip", host)
 	if err != nil {

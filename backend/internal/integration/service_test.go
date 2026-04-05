@@ -754,7 +754,7 @@ func TestResolveBaseURLPinsResolvedAddress(t *testing.T) {
 		return []net.IP{net.ParseIP("203.0.113.10")}, nil
 	}
 
-	resolved, err := service.resolveBaseURL("https://relay.example/api")
+	resolved, err := service.resolveBaseURL(context.Background(), "https://relay.example/api")
 	if err != nil {
 		t.Fatalf("resolve base url: %v", err)
 	}

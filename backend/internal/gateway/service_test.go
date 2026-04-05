@@ -827,6 +827,155 @@ func TestGatewayAppliesRouteTransformers(t *testing.T) {
 	}
 }
 
+func TestResponsesPrependMessageTransformerTargetsInputPayload(t *testing.T) {
+	t.Parallel()
+
+	requests := make(chan observedRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- observedRequest{
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			Body:          string(body),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}`))
+	}))
+	defer upstream.Close()
+
+	state := model.DefaultState()
+	state.Providers = []model.Provider{{
+		ID:             "openai",
+		Name:           "OpenAI",
+		Kind:           model.ProviderKindOpenAICompatible,
+		BaseURL:        upstream.URL + "/v1",
+		APIKey:         "openai-key",
+		Enabled:        true,
+		Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
+		TimeoutSeconds: 30,
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{{
+			ID:               "target-1",
+			AccountID:        "openai",
+			UpstreamModel:    "gpt-5.4-fast",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+		Transformers: []model.RouteTransformer{{
+			Name:  "prepend-system",
+			Phase: model.TransformerPhaseRequest,
+			Type:  model.TransformerTypePrependMessage,
+			Value: map[string]any{
+				"role":    "system",
+				"content": "route=${route_alias} upstream=${upstream_model}",
+			},
+		}},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	res, body := postJSON(t, gatewayServer.URL+"/v1/responses", `{"model":"gpt-5.4","input":"hello"}`)
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
+	}
+
+	seen := <-requests
+	var upstreamPayload map[string]any
+	if err := json.Unmarshal([]byte(seen.Body), &upstreamPayload); err != nil {
+		t.Fatalf("decode upstream payload: %v body=%s", err, seen.Body)
+	}
+	input, ok := upstreamPayload["input"].([]any)
+	if !ok || len(input) != 2 {
+		t.Fatalf("expected responses payload input array with prepended item, got %+v", upstreamPayload)
+	}
+	firstMessage, _ := input[0].(map[string]any)
+	if got := firstMessage["role"]; got != "system" {
+		t.Fatalf("expected first responses input item to be system, got %+v", firstMessage)
+	}
+	content, _ := firstMessage["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("expected one content block in prepended responses item, got %+v", firstMessage)
+	}
+	textBlock, _ := content[0].(map[string]any)
+	if got := textBlock["text"]; got != "route=gpt-5.4 upstream=gpt-5.4-fast" {
+		t.Fatalf("unexpected prepended responses content: %+v", firstMessage)
+	}
+}
+
+func TestGatewayAppliesResponseBodyTransformersToStreamingPassthrough(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	state := model.DefaultState()
+	state.Providers = []model.Provider{{
+		ID:             "openai",
+		Name:           "OpenAI",
+		Kind:           model.ProviderKindOpenAICompatible,
+		BaseURL:        upstream.URL + "/v1",
+		APIKey:         "openai-key",
+		Enabled:        true,
+		Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+		TimeoutSeconds: 30,
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{{
+			ID:               "target-1",
+			AccountID:        "openai",
+			UpstreamModel:    "gpt-5.4-fast",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+		Transformers: []model.RouteTransformer{
+			{
+				Name:   "drop-usage",
+				Phase:  model.TransformerPhaseResponse,
+				Type:   model.TransformerTypeDeleteJSON,
+				Target: "usage",
+			},
+			{
+				Name:   "response-metadata",
+				Phase:  model.TransformerPhaseResponse,
+				Type:   model.TransformerTypeSetJSON,
+				Target: "metadata.gateway_route",
+				Value:  "${route_alias}",
+			},
+		},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	res, body := postJSON(t, gatewayServer.URL+"/v1/chat/completions", `{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", res.StatusCode, body)
+	}
+	if strings.Contains(body, `"usage"`) {
+		t.Fatalf("expected streaming response transformer to remove usage blocks, got %s", body)
+	}
+	if !strings.Contains(body, `"metadata":{"gateway_route":"gpt-5.4"}`) {
+		t.Fatalf("expected streaming response transformer to inject metadata, got %s", body)
+	}
+	if res.Trailer.Get("X-Gateway-Total-Tokens") != "5" {
+		t.Fatalf("expected usage trailers to preserve upstream accounting, got %+v", res.Trailer)
+	}
+}
+
 func startGatewayServer(t *testing.T, state model.State) *httptest.Server {
 	t.Helper()
 

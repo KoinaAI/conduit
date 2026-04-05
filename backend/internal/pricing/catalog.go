@@ -118,22 +118,50 @@ func (s *Service) FetchProfiles(ctx context.Context) ([]model.PricingProfile, er
 }
 
 func ApplySyncResult(state *model.State, result SyncResult) int {
-	if state == nil || len(result.Profiles) == 0 {
+	if state == nil {
 		return 0
 	}
-	indexByID := make(map[string]int, len(state.PricingProfiles))
-	for index, profile := range state.PricingProfiles {
-		indexByID[profile.ID] = index
-	}
+
+	desired := make(map[string]model.PricingProfile, len(result.Profiles))
 	applied := 0
 	for _, profile := range result.Profiles {
-		if index, ok := indexByID[profile.ID]; ok {
-			state.PricingProfiles[index] = profile
-		} else {
-			state.PricingProfiles = append(state.PricingProfiles, profile)
-			indexByID[profile.ID] = len(state.PricingProfiles) - 1
+		if strings.HasPrefix(profile.ID, managedCatalogProfilePrefix) {
+			desired[profile.ID] = profile
+			applied++
 		}
-		applied++
+	}
+
+	filtered := make([]model.PricingProfile, 0, len(state.PricingProfiles)+len(desired))
+	for _, profile := range state.PricingProfiles {
+		if !strings.HasPrefix(profile.ID, managedCatalogProfilePrefix) {
+			filtered = append(filtered, profile)
+			continue
+		}
+		if next, ok := desired[profile.ID]; ok {
+			filtered = append(filtered, next)
+			delete(desired, profile.ID)
+		}
+	}
+	for _, profile := range desired {
+		filtered = append(filtered, profile)
+	}
+	state.PricingProfiles = filtered
+
+	validManagedIDs := make(map[string]struct{}, len(filtered))
+	for _, profile := range filtered {
+		if strings.HasPrefix(profile.ID, managedCatalogProfilePrefix) {
+			validManagedIDs[profile.ID] = struct{}{}
+		}
+	}
+	for index := range state.ModelRoutes {
+		profileID := strings.TrimSpace(state.ModelRoutes[index].PricingProfileID)
+		if !strings.HasPrefix(profileID, managedCatalogProfilePrefix) {
+			continue
+		}
+		if _, ok := validManagedIDs[profileID]; ok {
+			continue
+		}
+		state.ModelRoutes[index].PricingProfileID = ""
 	}
 	sort.Slice(state.PricingProfiles, func(i, j int) bool {
 		return state.PricingProfiles[i].ID < state.PricingProfiles[j].ID

@@ -360,6 +360,47 @@ func TestBuildCandidatePlanAppliesScenarioOverride(t *testing.T) {
 	}
 }
 
+func TestBuildCandidatePlanRejectsUnknownScenario(t *testing.T) {
+	t.Parallel()
+
+	service := &Service{runtime: newRuntimeState()}
+	state := model.DefaultState()
+	state.Providers = []model.Provider{{
+		ID:           "provider-primary",
+		Name:         "Primary",
+		Kind:         model.ProviderKindOpenAICompatible,
+		BaseURL:      "https://primary.example/v1",
+		APIKey:       "key-primary",
+		Enabled:      true,
+		Capabilities: []model.Protocol{model.ProtocolOpenAIChat},
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-primary",
+			BaseURL: "https://primary.example/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{ID: "cred-primary", APIKey: "key-primary", Enabled: true}},
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{{
+			ID:               "target-primary",
+			AccountID:        "provider-primary",
+			Enabled:          true,
+			Weight:           1,
+			MarkupMultiplier: 1,
+		}},
+		Scenarios: []model.RouteScenario{{
+			Name: "background",
+		}},
+	}}
+	state.Normalize()
+
+	_, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "typo-background")
+	if err == nil || !strings.Contains(err.Error(), "does not define scenario") {
+		t.Fatalf("expected unknown scenario to fail fast, got %v", err)
+	}
+}
+
 func TestBuildCandidatePlanFailoverRoutingHonorsPriorityBands(t *testing.T) {
 	t.Parallel()
 

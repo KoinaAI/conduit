@@ -224,7 +224,8 @@ func TestRunPricingSyncPersistsManagedCatalogProfiles(t *testing.T) {
 
 	fileStore := openTestStore(t, model.DefaultState())
 	handlers := New(config.Config{
-		PricingCatalogURL: server.URL,
+		PricingSyncEnabled: true,
+		PricingCatalogURL:  server.URL,
 	}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
 
 	result := handlers.RunPricingSync(context.Background())
@@ -239,6 +240,82 @@ func TestRunPricingSyncPersistsManagedCatalogProfiles(t *testing.T) {
 	}
 	if profile.InputPerMillion != 2.5 || profile.CachedInputPerMillion != 0.5 {
 		t.Fatalf("unexpected managed pricing profile values: %+v", profile)
+	}
+}
+
+func TestRunPricingSyncRejectsManualExecutionWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{
+		PricingSyncEnabled: false,
+		PricingCatalogURL:  "https://models.dev/api.json",
+	}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	result := handlers.RunPricingSync(context.Background())
+	if got := result["error"]; got != "pricing catalog is not configured" {
+		t.Fatalf("expected disabled pricing sync to reject manual execution, got %+v", result)
+	}
+}
+
+func TestCheckinAllIntegrationsRunsManualMaintenanceEndpoint(t *testing.T) {
+	t.Parallel()
+
+	var postCount atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/user/checkin":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": map[string]any{
+					"stats": map[string]any{
+						"is_checked_in": false,
+					},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/user/checkin":
+			postCount.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": map[string]any{
+					"quota_awarded": 8,
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		Integrations: []model.Integration{{
+			ID:        "integration-1",
+			Name:      "NewAPI",
+			Kind:      model.IntegrationKindNewAPI,
+			BaseURL:   server.URL,
+			UserID:    "132",
+			AccessKey: "token",
+			Enabled:   true,
+			Snapshot: model.IntegrationSnapshot{
+				SupportsCheckin: true,
+			},
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/maintenance/checkins", nil)
+	recorder := httptest.NewRecorder()
+	handlers.CheckinAllIntegrations(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected manual checkin endpoint to succeed, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := postCount.Load(); got != 1 {
+		t.Fatalf("expected one manual checkin POST, got %d", got)
+	}
+	if fileStore.Snapshot().Integrations[0].Snapshot.LastCheckinAt == nil {
+		t.Fatal("expected manual checkin to persist last_checkin_at")
 	}
 }
 
@@ -1272,6 +1349,7 @@ func TestBuildOpenAPISpecCoversAdminRoutes(t *testing.T) {
 		"/api/admin/stats/by-provider",
 		"/api/admin/stats/by-model",
 		"/api/admin/openapi.json",
+		"/api/admin/maintenance/checkins",
 		"/api/admin/maintenance/probes",
 		"/api/admin/maintenance/pricing-sync",
 	}

@@ -40,11 +40,15 @@ func New(cfg config.Config, store *store.FileStore, integration *integration.Ser
 	if len(gatewayService) > 0 {
 		currentGateway = gatewayService[0]
 	}
+	var pricingService *pricing.Service
+	if cfg.PricingSyncEnabled {
+		pricingService = pricing.NewService(cfg.PricingCatalogURL, nil)
+	}
 	return &Handlers{
 		cfg:         cfg,
 		store:       store,
 		integration: integration,
-		pricing:     pricing.NewService(cfg.PricingCatalogURL, nil),
+		pricing:     pricingService,
 		gateway:     currentGateway,
 	}
 }
@@ -944,6 +948,22 @@ func (h *Handlers) ProbeAllProviders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// CheckinAllIntegrations executes manual check-ins for all enabled integrations
+// that advertise check-in support.
+func (h *Handlers) CheckinAllIntegrations(w http.ResponseWriter, r *http.Request) {
+	result := h.RunCheckinsReport(r.Context(), false)
+	failures, _ := result["failures"].([]map[string]any)
+	if len(failures) == 0 {
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if successCount, _ := result["success_count"].(int); successCount == 0 {
+		writeJSON(w, http.StatusBadGateway, result)
+		return
+	}
+	writeJSON(w, http.StatusMultiStatus, result)
+}
+
 // SyncPricingCatalog executes a managed pricing catalog refresh.
 func (h *Handlers) SyncPricingCatalog(w http.ResponseWriter, r *http.Request) {
 	result := h.RunPricingSync(r.Context())
@@ -956,17 +976,72 @@ func (h *Handlers) SyncPricingCatalog(w http.ResponseWriter, r *http.Request) {
 
 // RunCheckins executes background daily check-ins.
 func (h *Handlers) RunCheckins(ctx context.Context) {
+	_ = h.RunCheckinsReport(ctx, true)
+}
+
+// RunCheckinsReport executes automatic or manual check-ins and returns a
+// detailed result summary suitable for admin maintenance endpoints.
+func (h *Handlers) RunCheckinsReport(ctx context.Context, dueOnly bool) map[string]any {
 	now := time.Now().UTC()
 	snapshot := h.store.Snapshot()
-	results := h.integration.PrepareDailyCheckins(ctx, snapshot, now)
+	results := make([]integration.DailyCheckinResult, 0, len(snapshot.Integrations))
+	for _, current := range snapshot.Integrations {
+		if !current.Enabled || !current.Snapshot.SupportsCheckin {
+			continue
+		}
+		if dueOnly && !integration.NeedsCheckin(current, now) {
+			continue
+		}
+		results = append(results, integration.DailyCheckinResult{
+			IntegrationID: current.ID,
+			Result:        h.integration.PrepareCheckin(ctx, current),
+		})
+	}
 	if len(results) == 0 {
-		return
+		return map[string]any{
+			"checked_at":     now,
+			"results":        []any{},
+			"success_count":  0,
+			"failure_count":  0,
+			"skipped_due_to": map[string]any{"mode": map[bool]string{true: "automatic", false: "manual"}[dueOnly]},
+		}
 	}
 
-	_, _ = h.store.Update(func(state *model.State) error {
-		_ = h.integration.ApplyDailyCheckins(state, results)
+	failures := make([]map[string]any, 0)
+	for _, result := range results {
+		if result.Result.Err == nil {
+			continue
+		}
+		failures = append(failures, map[string]any{
+			"integration_id": result.IntegrationID,
+			"error":          result.Result.Err.Error(),
+		})
+	}
+
+	saved, err := h.store.Update(func(state *model.State) error {
+		for _, result := range results {
+			_ = h.integration.ApplyCheckinResult(state, result.IntegrationID, result.Result)
+		}
 		return nil
 	})
+	if err != nil {
+		return map[string]any{
+			"checked_at":    now,
+			"results":       results,
+			"success_count": 0,
+			"failure_count": len(results),
+			"error":         err.Error(),
+		}
+	}
+
+	return map[string]any{
+		"checked_at":    now,
+		"results":       results,
+		"success_count": len(results) - len(failures),
+		"failure_count": len(failures),
+		"failures":      failures,
+		"state":         saved,
+	}
 }
 
 // RunProbes executes active endpoint probes and returns the probe report.
@@ -1200,6 +1275,9 @@ func buildOpenAPISpec() map[string]any {
 			},
 			"/api/admin/maintenance/probes": map[string]any{
 				"post": map[string]any{"summary": "Probe all provider endpoints"},
+			},
+			"/api/admin/maintenance/checkins": map[string]any{
+				"post": map[string]any{"summary": "Run check-ins for all enabled integrations that support daily checkin"},
 			},
 			"/api/admin/maintenance/pricing-sync": map[string]any{
 				"post": map[string]any{"summary": "Refresh managed pricing profiles from the public catalog"},

@@ -28,6 +28,33 @@ const (
 	ProviderKindGemini           ProviderKind = "gemini"
 )
 
+func defaultProviderCapabilities(kind ProviderKind) []Protocol {
+	switch kind {
+	case ProviderKindAnthropic:
+		return []Protocol{ProtocolAnthropic}
+	case ProviderKindGemini:
+		return []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream}
+	default:
+		return []Protocol{ProtocolOpenAIChat, ProtocolOpenAIResponses}
+	}
+}
+
+func providerKindSupportsProtocol(kind ProviderKind, protocol Protocol) bool {
+	switch kind {
+	case ProviderKindAnthropic:
+		return protocol == ProtocolAnthropic
+	case ProviderKindGemini:
+		return protocol == ProtocolGeminiGenerate || protocol == ProtocolGeminiStream
+	default:
+		switch protocol {
+		case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolOpenAIRealtime, ProtocolAnthropic, ProtocolGeminiGenerate, ProtocolGeminiStream:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
 // IntegrationKind identifies supported relay-management integrations.
 type IntegrationKind string
 
@@ -439,8 +466,19 @@ func (s *State) Normalize() {
 		if p.Headers == nil {
 			p.Headers = map[string]string{}
 		}
-		if p.Capabilities == nil {
-			p.Capabilities = []Protocol{ProtocolOpenAIChat, ProtocolOpenAIResponses}
+		if len(p.Capabilities) == 0 {
+			p.Capabilities = defaultProviderCapabilities(p.Kind)
+		} else {
+			filtered := make([]Protocol, 0, len(p.Capabilities))
+			for _, capability := range p.Capabilities {
+				if providerKindSupportsProtocol(p.Kind, capability) && !slices.Contains(filtered, capability) {
+					filtered = append(filtered, capability)
+				}
+			}
+			if len(filtered) == 0 {
+				filtered = defaultProviderCapabilities(p.Kind)
+			}
+			p.Capabilities = filtered
 		}
 		if p.CircuitBreaker.FailureThreshold <= 0 {
 			p.CircuitBreaker.FailureThreshold = 3

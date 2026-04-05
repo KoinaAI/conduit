@@ -87,3 +87,39 @@ func TestApplySyncResultUpsertsManagedCatalogProfiles(t *testing.T) {
 		t.Fatalf("expected managed profile to be updated, got %+v", profile)
 	}
 }
+
+func TestApplySyncResultRemovesStaleManagedCatalogProfilesAndRouteBindings(t *testing.T) {
+	t.Parallel()
+
+	state := model.State{
+		Version: "2026-04-01",
+		PricingProfiles: []model.PricingProfile{
+			{ID: "manual", Name: "manual", Currency: "USD", InputPerMillion: 1},
+			{ID: "pricing-catalog-models-dev-openai-gpt-5-4", Name: "current", Currency: "USD", InputPerMillion: 2},
+			{ID: "pricing-catalog-models-dev-openai-gpt-4-1", Name: "stale", Currency: "USD", InputPerMillion: 3},
+		},
+		ModelRoutes: []model.ModelRoute{
+			{Alias: "gpt-5.4", PricingProfileID: "pricing-catalog-models-dev-openai-gpt-5-4"},
+			{Alias: "gpt-4.1", PricingProfileID: "pricing-catalog-models-dev-openai-gpt-4-1"},
+		},
+	}
+	state.Normalize()
+
+	applied := ApplySyncResult(&state, SyncResult{
+		Profiles: []model.PricingProfile{
+			{ID: "pricing-catalog-models-dev-openai-gpt-5-4", Name: "models.dev / openai / gpt-5.4", Currency: "USD", InputPerMillion: 4},
+		},
+	})
+	if applied != 1 {
+		t.Fatalf("expected one managed profile to be applied, got %d", applied)
+	}
+	if _, ok := state.FindPricingProfile("pricing-catalog-models-dev-openai-gpt-4-1"); ok {
+		t.Fatalf("expected stale managed catalog profile to be removed, got %+v", state.PricingProfiles)
+	}
+	if state.ModelRoutes[1].PricingProfileID != "" {
+		t.Fatalf("expected route bound to stale managed profile to be cleared, got %+v", state.ModelRoutes[1])
+	}
+	if state.ModelRoutes[0].PricingProfileID != "pricing-catalog-models-dev-openai-gpt-5-4" {
+		t.Fatalf("expected valid managed route binding to remain, got %+v", state.ModelRoutes[0])
+	}
+}

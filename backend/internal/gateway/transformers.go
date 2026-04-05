@@ -84,6 +84,23 @@ func applyResponseTransformers(headers http.Header, payload map[string]any, tran
 	return payload, nil
 }
 
+func applyResponseBodyTransformers(payload map[string]any, transformers []model.RouteTransformer, candidate resolvedCandidate) (map[string]any, error) {
+	if payload == nil {
+		return nil, nil
+	}
+	filtered := make([]model.RouteTransformer, 0, len(transformers))
+	for _, transformer := range filterTransformers(transformers, model.TransformerPhaseResponse) {
+		switch transformer.Type {
+		case model.TransformerTypeSetJSON, model.TransformerTypeDeleteJSON:
+			filtered = append(filtered, transformer)
+		}
+	}
+	if len(filtered) == 0 {
+		return payload, nil
+	}
+	return applyResponseTransformers(http.Header{}, payload, filtered, candidate)
+}
+
 func filterTransformers(transformers []model.RouteTransformer, phase model.TransformerPhase) []model.RouteTransformer {
 	if len(transformers) == 0 {
 		return nil
@@ -157,11 +174,44 @@ func prependTransformerMessage(payload map[string]any, raw any, contextValues ma
 	if content == "" {
 		return fmt.Errorf("prepend_message transformer content is required")
 	}
-	current, _ := payload["messages"].([]any)
-	payload["messages"] = append([]any{map[string]any{
+	messagePayload := map[string]any{
 		"role":    role,
 		"content": content,
-	}}, current...)
+	}
+	if current, ok := payload["messages"].([]any); ok || payload["messages"] != nil || payload["input"] == nil {
+		payload["messages"] = append([]any{messagePayload}, current...)
+		return nil
+	}
+	return prependTransformerResponsesInput(payload, role, content)
+}
+
+func prependTransformerResponsesInput(payload map[string]any, role, content string) error {
+	message := map[string]any{
+		"role": role,
+		"content": []map[string]any{{
+			"type": "input_text",
+			"text": content,
+		}},
+	}
+	switch current := payload["input"].(type) {
+	case nil:
+		payload["input"] = []any{message}
+	case string:
+		payload["input"] = []any{
+			message,
+			map[string]any{
+				"role": "user",
+				"content": []map[string]any{{
+					"type": "input_text",
+					"text": current,
+				}},
+			},
+		}
+	case []any:
+		payload["input"] = append([]any{message}, current...)
+	default:
+		return fmt.Errorf("prepend_message transformer requires messages or input to be an array or string")
+	}
 	return nil
 }
 

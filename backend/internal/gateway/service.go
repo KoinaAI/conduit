@@ -1021,7 +1021,10 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 	if !ok {
 		return nil, model.ModelRoute{}, model.PricingProfile{}, "", fmt.Errorf("route %q is not configured", alias)
 	}
-	route, scenario = applyRouteScenario(route, scenario)
+	route, scenario, err := applyRouteScenario(route, scenario)
+	if err != nil {
+		return nil, model.ModelRoute{}, model.PricingProfile{}, "", err
+	}
 	profile, ok := state.FindPricingProfile(route.PricingProfileID)
 	if !ok {
 		profile = model.PricingProfile{
@@ -1111,17 +1114,17 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 	return filteredCandidates, route, profile, scenario, nil
 }
 
-func applyRouteScenario(route model.ModelRoute, requested string) (model.ModelRoute, string) {
+func applyRouteScenario(route model.ModelRoute, requested string) (model.ModelRoute, string, error) {
 	requested = strings.TrimSpace(requested)
 	if requested == "" {
-		return route, ""
+		return route, "", nil
 	}
 	for _, scenario := range route.Scenarios {
 		if !strings.EqualFold(strings.TrimSpace(scenario.Name), requested) {
 			continue
 		}
 		if len(scenario.Targets) == 0 {
-			return route, strings.TrimSpace(scenario.Name)
+			return route, strings.TrimSpace(scenario.Name), nil
 		}
 		effective := route
 		effective.Targets = make([]model.RouteTarget, len(scenario.Targets))
@@ -1132,9 +1135,9 @@ func applyRouteScenario(route model.ModelRoute, requested string) (model.ModelRo
 		if canonical := scenario.Strategy.Canonical(); canonical != "" {
 			effective.Strategy = canonical
 		}
-		return effective, strings.TrimSpace(scenario.Name)
+		return effective, strings.TrimSpace(scenario.Name), nil
 	}
-	return route, ""
+	return model.ModelRoute{}, "", fmt.Errorf("route %q does not define scenario %q", route.Alias, requested)
 }
 
 func stickyRouteKey(alias, scenario string) string {
@@ -1848,17 +1851,23 @@ func writeBillingMetadata(headers http.Header, record model.RequestRecord) {
 	headers.Set("X-Gateway-Billing-Multiplier", fmt.Sprintf("%.4f", record.Billing.Multiplier))
 }
 
-func copyStreamingResponse(w http.ResponseWriter, body io.Reader, observer *UsageObserver) error {
+func copyStreamingResponse(w http.ResponseWriter, body io.Reader, observer *UsageObserver, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	reader := bufio.NewReader(body)
 	flusher, _ := w.(http.Flusher)
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			observer.ObserveLine(line)
-			if _, writeErr := w.Write(line); writeErr != nil {
+			output := line
+			if transformedLine, transformErr := transformStreamingResponseLine(line, transformers, candidate); transformErr != nil {
+				return transformErr
+			} else if transformedLine != nil {
+				output = transformedLine
+			}
+			if _, writeErr := w.Write(output); writeErr != nil {
 				return writeErr
 			}
-			if flusher != nil && len(bytes.TrimSpace(line)) == 0 {
+			if flusher != nil && len(bytes.TrimSpace(output)) == 0 {
 				flusher.Flush()
 			}
 		}

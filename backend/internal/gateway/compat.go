@@ -85,7 +85,6 @@ func prepareUpstreamExchange(protocol model.Protocol, providerKind model.Provide
 		}
 	case model.ProtocolGeminiGenerate, model.ProtocolGeminiStream:
 		if providerKind == model.ProviderKindGemini {
-			currentPath := currentPath
 			parts := strings.Split(currentPath, "/models/")
 			if len(parts) != 2 {
 				return upstreamExchange{}, errors.New("invalid gemini path")
@@ -671,7 +670,7 @@ func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response,
 				return err
 			}
 			w.WriteHeader(resp.StatusCode)
-			if err := copyStreamingResponse(w, resp.Body, observer); err != nil {
+			if err := copyStreamingResponse(w, resp.Body, observer, transformers, candidate); err != nil {
 				return proxyResponseWriteError{err: err}
 			}
 			return nil
@@ -721,6 +720,33 @@ func transformPassthroughResponseBody(payload []byte, headers http.Header, trans
 		return nil, err
 	}
 	return json.Marshal(nextBody)
+}
+
+func transformStreamingResponseLine(line []byte, transformers []model.RouteTransformer, candidate resolvedCandidate) ([]byte, error) {
+	if len(filterTransformers(transformers, model.TransformerPhaseResponse)) == 0 || !hasBodyTransformers(transformers, model.TransformerPhaseResponse) {
+		return line, nil
+	}
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "data:") {
+		return line, nil
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return line, nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+		return nil, err
+	}
+	body, err := applyResponseBodyTransformers(body, transformers, candidate)
+	if err != nil {
+		return nil, err
+	}
+	nextPayload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return []byte("data: " + string(nextPayload) + "\n"), nil
 }
 
 func writeAnthropicJSON(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
@@ -812,7 +838,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 					messageID = upstream.ID
 				}
 				if !messageStarted {
-					if err := writeSSEEvent(w, "message_start", map[string]any{
+					if err := writeResponseSSEEvent(w, "message_start", map[string]any{
 						"type": "message_start",
 						"message": map[string]any{
 							"id":            messageID,
@@ -824,7 +850,7 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 							"stop_sequence": nil,
 							"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
 						},
-					}); err != nil {
+					}, transformers, candidate); err != nil {
 						return proxyResponseWriteError{err: err}
 					}
 					messageStarted = true
@@ -833,20 +859,20 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 				deltaText := firstChoiceDeltaText(upstream)
 				if deltaText != "" {
 					if !contentStarted {
-						if err := writeSSEEvent(w, "content_block_start", map[string]any{
+						if err := writeResponseSSEEvent(w, "content_block_start", map[string]any{
 							"type":          "content_block_start",
 							"index":         0,
 							"content_block": map[string]any{"type": "text", "text": ""},
-						}); err != nil {
+						}, transformers, candidate); err != nil {
 							return proxyResponseWriteError{err: err}
 						}
 						contentStarted = true
 					}
-					if err := writeSSEEvent(w, "content_block_delta", map[string]any{
+					if err := writeResponseSSEEvent(w, "content_block_delta", map[string]any{
 						"type":  "content_block_delta",
 						"index": 0,
 						"delta": map[string]any{"type": "text_delta", "text": deltaText},
-					}); err != nil {
+					}, transformers, candidate); err != nil {
 						return proxyResponseWriteError{err: err}
 					}
 					flush()
@@ -870,15 +896,15 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 		}
 	}
 	if contentStarted {
-		if err := writeSSEEvent(w, "content_block_stop", map[string]any{
+		if err := writeResponseSSEEvent(w, "content_block_stop", map[string]any{
 			"type":  "content_block_stop",
 			"index": 0,
-		}); err != nil {
+		}, transformers, candidate); err != nil {
 			return proxyResponseWriteError{err: err}
 		}
 	}
 	usage := observer.Summary()
-	if err := writeSSEEvent(w, "message_delta", map[string]any{
+	if err := writeResponseSSEEvent(w, "message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   finishReason,
@@ -887,10 +913,10 @@ func writeAnthropicSSE(w http.ResponseWriter, resp *http.Response, observer *Usa
 		"usage": map[string]any{
 			"output_tokens": usage.OutputTokens,
 		},
-	}); err != nil {
+	}, transformers, candidate); err != nil {
 		return proxyResponseWriteError{err: err}
 	}
-	if err := writeSSEEvent(w, "message_stop", map[string]any{"type": "message_stop"}); err != nil {
+	if err := writeResponseSSEEvent(w, "message_stop", map[string]any{"type": "message_stop"}, transformers, candidate); err != nil {
 		return proxyResponseWriteError{err: err}
 	}
 	flush()
@@ -982,7 +1008,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 				}
 				deltaText := firstChoiceDeltaText(upstream)
 				if deltaText != "" {
-					if err := writeSSEData(w, map[string]any{
+					if err := writeResponseSSEData(w, map[string]any{
 						"candidates": []map[string]any{
 							{
 								"index": 0,
@@ -992,7 +1018,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 								},
 							},
 						},
-					}); err != nil {
+					}, transformers, candidate); err != nil {
 						return proxyResponseWriteError{err: err}
 					}
 					flush()
@@ -1007,17 +1033,16 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 		}
 	}
 
-	if err := writeSSEData(w, map[string]any{
+	if err := writeResponseSSEData(w, map[string]any{
 		"candidates": []map[string]any{
 			{
 				"index":        0,
-				"content":      map[string]any{"role": "model", "parts": []map[string]any{}},
 				"finishReason": finishReason,
 			},
 		},
 		"usageMetadata": usageSummaryMap(observer.Summary()),
 		"modelVersion":  publicAlias,
-	}); err != nil {
+	}, transformers, candidate); err != nil {
 		return proxyResponseWriteError{err: err}
 	}
 	flush()
@@ -1049,6 +1074,24 @@ func writeSSEData(w http.ResponseWriter, payload any) error {
 		return err
 	}
 	return nil
+}
+
+func writeResponseSSEEvent(w http.ResponseWriter, event string, payload map[string]any, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
+		return err
+	}
+	return writeResponseSSEData(w, payload, transformers, candidate)
+}
+
+func writeResponseSSEData(w http.ResponseWriter, payload map[string]any, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	nextPayload, err := applyResponseBodyTransformers(payload, transformers, candidate)
+	if err != nil {
+		return err
+	}
+	if nextPayload == nil {
+		nextPayload = payload
+	}
+	return writeSSEData(w, nextPayload)
 }
 
 func clearWriteDeadline(w http.ResponseWriter) {

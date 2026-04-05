@@ -33,7 +33,7 @@ func New(cfg config.Config) (*App, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	store, err := store.Open(cfg.StoreLocator())
+	store, err := store.Open(cfg.StoreLocator(), store.WithRequestHistoryLimit(cfg.RequestHistory))
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +100,7 @@ func (a *App) Handler() http.Handler {
 	adminMux.HandleFunc("GET /api/admin/stats/by-model", a.admin.GetStatsByModel)
 	adminMux.HandleFunc("GET /api/admin/meta", a.admin.GetMeta)
 	adminMux.HandleFunc("GET /api/admin/openapi.json", a.admin.OpenAPI)
+	adminMux.HandleFunc("POST /api/admin/maintenance/checkins", a.admin.CheckinAllIntegrations)
 	adminMux.HandleFunc("POST /api/admin/maintenance/probes", a.admin.ProbeAllProviders)
 	adminMux.HandleFunc("POST /api/admin/maintenance/pricing-sync", a.admin.SyncPricingCatalog)
 	mux.Handle("/api/admin/", withCORS(

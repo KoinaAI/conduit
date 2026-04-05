@@ -620,6 +620,41 @@ func TestServiceCircuitStatusesAndReset(t *testing.T) {
 	}
 }
 
+func TestServiceStickyBindingsAndReset(t *testing.T) {
+	t.Parallel()
+
+	service := newProbeTestService(t, model.ProviderKindOpenAICompatible, "https://provider.example")
+	now := time.Now().UTC()
+	candidate := resolvedCandidate{
+		provider: model.Provider{
+			ID:                      "provider-1",
+			StickySessionTTLSeconds: 300,
+		},
+		route:        model.ModelRoute{Alias: "gpt-5.4"},
+		scenario:     "codex",
+		endpoint:     model.ProviderEndpoint{ID: "endpoint-1"},
+		credential:   model.ProviderCredential{ID: "credential-1", APIKey: "provider-key"},
+		gatewayKeyID: "gk-1",
+	}
+
+	service.runtime.bindStickyCandidate(candidate, "session-1", now)
+
+	items := service.StickyBindings()
+	if len(items) != 1 {
+		t.Fatalf("expected one sticky binding, got %+v", items)
+	}
+	if items[0].GatewayKeyID != "gk-1" || items[0].RouteAlias != "gpt-5.4" || items[0].Scenario != "codex" || items[0].SessionID != "session-1" {
+		t.Fatalf("unexpected sticky binding payload: %+v", items[0])
+	}
+
+	if reset := service.ResetStickyBindings("gk-1", "gpt-5.4", "codex", "session-1"); reset != 1 {
+		t.Fatalf("expected one sticky binding reset, got %d", reset)
+	}
+	if items = service.StickyBindings(); len(items) != 0 {
+		t.Fatalf("expected sticky bindings to be cleared, got %+v", items)
+	}
+}
+
 func testBoolPointer(value bool) *bool {
 	v := value
 	return &v
@@ -819,6 +854,56 @@ func TestPrepareUpstreamExchangeResponsesToAnthropic(t *testing.T) {
 	}
 }
 
+func TestPrepareUpstreamExchangeChatToAnthropic(t *testing.T) {
+	t.Parallel()
+
+	exchange, err := prepareUpstreamExchange(model.ProtocolOpenAIChat, model.ProviderKindAnthropic, "/v1/chat/completions", parsedProxyRequest{
+		routeAlias: "gpt-5.4",
+		stream:     true,
+		jsonPayload: map[string]any{
+			"model":    "gpt-5.4",
+			"stream":   true,
+			"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+			"tools": []any{
+				map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name":       "search",
+						"parameters": map[string]any{"type": "object"},
+					},
+				},
+			},
+		},
+	}, "claude-3-7-sonnet")
+	if err != nil {
+		t.Fatalf("prepare upstream exchange: %v", err)
+	}
+	if exchange.Path != "/v1/messages" {
+		t.Fatalf("unexpected upstream path: %s", exchange.Path)
+	}
+	if !exchange.Stream {
+		t.Fatal("expected stream flag to be preserved")
+	}
+	if exchange.ResponseMode != responseModeAnthropicSSE {
+		t.Fatalf("unexpected response mode: %s", exchange.ResponseMode)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(exchange.Body, &payload); err != nil {
+		t.Fatalf("decode anthropic payload: %v", err)
+	}
+	if payload["model"] != "claude-3-7-sonnet" {
+		t.Fatalf("expected upstream model rewrite for anthropic conversion, got %+v", payload["model"])
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 1 || messages[0].(map[string]any)["role"] != "user" {
+		t.Fatalf("expected user chat message to be preserved, got %+v", payload["messages"])
+	}
+	if len(payload["tools"].([]any)) != 1 {
+		t.Fatalf("expected tool definitions to be preserved, got %+v", payload["tools"])
+	}
+}
+
 func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
 	t.Parallel()
 
@@ -878,6 +963,55 @@ func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
 	declarations := tools[0].(map[string]any)["functionDeclarations"].([]any)
 	if len(declarations) != 1 {
 		t.Fatalf("expected one gemini function declaration, got %+v", tools)
+	}
+}
+
+func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
+	t.Parallel()
+
+	exchange, err := prepareUpstreamExchange(model.ProtocolOpenAIChat, model.ProviderKindGemini, "/v1/chat/completions", parsedProxyRequest{
+		routeAlias: "gpt-5.4",
+		stream:     true,
+		jsonPayload: map[string]any{
+			"model":  "gpt-5.4",
+			"stream": true,
+			"messages": []any{
+				map[string]any{"role": "system", "content": "be concise"},
+				map[string]any{"role": "user", "content": "hello"},
+			},
+			"tools": []any{
+				map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name":       "search",
+						"parameters": map[string]any{"type": "object"},
+					},
+				},
+			},
+		},
+	}, "gemini-2.5-pro")
+	if err != nil {
+		t.Fatalf("prepare upstream exchange: %v", err)
+	}
+	if exchange.Path != "/v1beta/models/gemini-2.5-pro:streamGenerateContent" {
+		t.Fatalf("unexpected upstream path: %s", exchange.Path)
+	}
+	if exchange.ResponseMode != responseModeGeminiSSE {
+		t.Fatalf("unexpected response mode: %s", exchange.ResponseMode)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(exchange.Body, &payload); err != nil {
+		t.Fatalf("decode gemini payload: %v", err)
+	}
+	systemInstruction := payload["systemInstruction"].(map[string]any)
+	systemParts := systemInstruction["parts"].([]any)
+	if len(systemParts) != 1 || systemParts[0].(map[string]any)["text"] != "be concise" {
+		t.Fatalf("expected system chat message to become systemInstruction, got %+v", payload["systemInstruction"])
+	}
+	contents := payload["contents"].([]any)
+	if len(contents) != 1 || contents[0].(map[string]any)["role"] != "user" {
+		t.Fatalf("expected user chat message to remain in contents, got %+v", payload["contents"])
 	}
 }
 

@@ -929,6 +929,35 @@ func (h *Handlers) ListActiveSessions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GetStickyBindings serves GET /api/admin/runtime/sticky-bindings.
+func (h *Handlers) GetStickyBindings(w http.ResponseWriter, _ *http.Request) {
+	if h.gateway == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": h.gateway.StickyBindings()})
+}
+
+// ResetStickyBindings serves POST /api/admin/runtime/sticky-bindings/reset.
+func (h *Handlers) ResetStickyBindings(w http.ResponseWriter, r *http.Request) {
+	if h.gateway == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
+		return
+	}
+	var payload struct {
+		GatewayKeyID string `json:"gateway_key_id"`
+		RouteAlias   string `json:"route_alias"`
+		Scenario     string `json:"scenario"`
+		SessionID    string `json:"session_id"`
+	}
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	resetCount := h.gateway.ResetStickyBindings(payload.GatewayKeyID, payload.RouteAlias, payload.Scenario, payload.SessionID)
+	writeJSON(w, http.StatusOK, map[string]any{"reset": resetCount})
+}
+
 // GetProviderUsage serves GET /api/admin/runtime/provider-usage.
 func (h *Handlers) GetProviderUsage(w http.ResponseWriter, r *http.Request) {
 	limit, err := readPositiveIntQuery(r, "limit", 200, 500)
@@ -1276,6 +1305,12 @@ func buildOpenAPISpec() map[string]any {
 			},
 			"/api/admin/runtime/sessions": map[string]any{
 				"get": map[string]any{"summary": "List active sessions derived from recent request history"},
+			},
+			"/api/admin/runtime/sticky-bindings": map[string]any{
+				"get": map[string]any{"summary": "List live sticky routing bindings"},
+			},
+			"/api/admin/runtime/sticky-bindings/reset": map[string]any{
+				"post": map[string]any{"summary": "Reset live sticky routing bindings"},
 			},
 			"/api/admin/runtime/provider-usage": map[string]any{
 				"get": map[string]any{"summary": "Summarize rolling provider usage windows"},

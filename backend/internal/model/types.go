@@ -31,9 +31,9 @@ const (
 func defaultProviderCapabilities(kind ProviderKind) []Protocol {
 	switch kind {
 	case ProviderKindAnthropic:
-		return []Protocol{ProtocolAnthropic, ProtocolOpenAIResponses}
+		return []Protocol{ProtocolAnthropic, ProtocolOpenAIChat, ProtocolOpenAIResponses}
 	case ProviderKindGemini:
-		return []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream, ProtocolOpenAIResponses}
+		return []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream, ProtocolOpenAIChat, ProtocolOpenAIResponses}
 	default:
 		return []Protocol{ProtocolOpenAIChat, ProtocolOpenAIResponses}
 	}
@@ -42,9 +42,9 @@ func defaultProviderCapabilities(kind ProviderKind) []Protocol {
 func providerKindSupportsProtocol(kind ProviderKind, protocol Protocol) bool {
 	switch kind {
 	case ProviderKindAnthropic:
-		return protocol == ProtocolAnthropic || protocol == ProtocolOpenAIResponses
+		return protocol == ProtocolAnthropic || protocol == ProtocolOpenAIChat || protocol == ProtocolOpenAIResponses
 	case ProviderKindGemini:
-		return protocol == ProtocolGeminiGenerate || protocol == ProtocolGeminiStream || protocol == ProtocolOpenAIResponses
+		return protocol == ProtocolGeminiGenerate || protocol == ProtocolGeminiStream || protocol == ProtocolOpenAIChat || protocol == ProtocolOpenAIResponses
 	default:
 		switch protocol {
 		case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolOpenAIRealtime, ProtocolAnthropic, ProtocolGeminiGenerate, ProtocolGeminiStream:
@@ -146,6 +146,12 @@ type Provider struct {
 	RoutingMode             ProviderRoutingMode  `json:"routing_mode,omitempty"`
 	MaxAttempts             int                  `json:"max_attempts,omitempty"`
 	StickySessionTTLSeconds int                  `json:"sticky_session_ttl_seconds,omitempty"`
+	MaxConcurrency          int                  `json:"max_concurrency,omitempty"`
+	RateLimitRPM            int                  `json:"rate_limit_rpm,omitempty"`
+	HourlyBudgetUSD         float64              `json:"hourly_budget_usd,omitempty"`
+	DailyBudgetUSD          float64              `json:"daily_budget_usd,omitempty"`
+	WeeklyBudgetUSD         float64              `json:"weekly_budget_usd,omitempty"`
+	MonthlyBudgetUSD        float64              `json:"monthly_budget_usd,omitempty"`
 	HealthcheckPath         string               `json:"healthcheck_path,omitempty"`
 	Endpoints               []ProviderEndpoint   `json:"endpoints,omitempty"`
 	Credentials             []ProviderCredential `json:"credentials,omitempty"`
@@ -471,6 +477,24 @@ func (s *State) Normalize() {
 		}
 		if p.MaxAttempts <= 0 {
 			p.MaxAttempts = 3
+		}
+		if p.MaxConcurrency < 0 {
+			p.MaxConcurrency = 0
+		}
+		if p.RateLimitRPM < 0 {
+			p.RateLimitRPM = 0
+		}
+		if p.HourlyBudgetUSD < 0 {
+			p.HourlyBudgetUSD = 0
+		}
+		if p.DailyBudgetUSD < 0 {
+			p.DailyBudgetUSD = 0
+		}
+		if p.WeeklyBudgetUSD < 0 {
+			p.WeeklyBudgetUSD = 0
+		}
+		if p.MonthlyBudgetUSD < 0 {
+			p.MonthlyBudgetUSD = 0
 		}
 		if p.StickySessionTTLSeconds <= 0 {
 			p.StickySessionTTLSeconds = 300

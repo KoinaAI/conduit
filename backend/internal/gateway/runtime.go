@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -84,6 +85,7 @@ type runtimeState struct {
 	sticky                map[string]stickyBinding
 	stickyStore           stickyBindingStore
 	stickyWrites          int
+	providerWindows       map[string]*gatewayKeyWindow
 	keyWindows            map[string]*gatewayKeyWindow
 	roundRobin            map[string]uint64
 	invalidGatewayLookups map[string]invalidGatewayLookupState
@@ -108,6 +110,17 @@ type EndpointCircuitStatus struct {
 	LastError           string     `json:"last_error,omitempty"`
 }
 
+type StickyBindingStatus struct {
+	GatewayKeyID string    `json:"gateway_key_id"`
+	RouteAlias   string    `json:"route_alias"`
+	Scenario     string    `json:"scenario,omitempty"`
+	SessionID    string    `json:"session_id"`
+	ProviderID   string    `json:"provider_id"`
+	EndpointID   string    `json:"endpoint_id"`
+	CredentialID string    `json:"credential_id"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
 func newRuntimeState(stickyStore ...stickyBindingStore) *runtimeState {
 	var currentStickyStore stickyBindingStore
 	if len(stickyStore) > 0 {
@@ -118,11 +131,100 @@ func newRuntimeState(stickyStore ...stickyBindingStore) *runtimeState {
 		credentials:           map[string]*credentialRuntimeState{},
 		sticky:                map[string]stickyBinding{},
 		stickyStore:           currentStickyStore,
+		providerWindows:       map[string]*gatewayKeyWindow{},
 		keyWindows:            map[string]*gatewayKeyWindow{},
 		roundRobin:            map[string]uint64{},
 		invalidGatewayLookups: map[string]invalidGatewayLookupState{},
 		authFailures:          map[string]*gatewayAuthFailureState{},
 	}
+}
+
+func (r *runtimeState) StickyBindings(now time.Time) []StickyBindingStatus {
+	if lister, ok := r.stickyStore.(stickyBindingListingStore); ok && lister != nil {
+		remote, err := lister.ListStickyBindings(now)
+		if err != nil {
+			slog.Warn("gateway sticky binding list failed", "error", err)
+		} else {
+			return stickyBindingStatusesFromRecords(remote)
+		}
+	}
+	r.mu.Lock()
+	r.sweepExpiredStickyLocked(now)
+	records := make([]stickyBindingRecord, 0, len(r.sticky))
+	for key, binding := range r.sticky {
+		records = append(records, stickyBindingRecord{Key: key, Binding: binding})
+	}
+	r.mu.Unlock()
+	return stickyBindingStatusesFromRecords(records)
+}
+
+func stickyBindingStatusesFromRecords(records []stickyBindingRecord) []StickyBindingStatus {
+	merged := make(map[string]StickyBindingStatus, len(records))
+	for _, record := range records {
+		status, ok := stickyBindingStatusFromRecord(record)
+		if !ok {
+			continue
+		}
+		merged[record.Key] = status
+	}
+
+	items := make([]StickyBindingStatus, 0, len(merged))
+	for _, status := range merged {
+		items = append(items, status)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].ExpiresAt.Equal(items[j].ExpiresAt) {
+			return items[i].ExpiresAt.After(items[j].ExpiresAt)
+		}
+		if items[i].GatewayKeyID != items[j].GatewayKeyID {
+			return items[i].GatewayKeyID < items[j].GatewayKeyID
+		}
+		if items[i].RouteAlias != items[j].RouteAlias {
+			return items[i].RouteAlias < items[j].RouteAlias
+		}
+		if items[i].Scenario != items[j].Scenario {
+			return items[i].Scenario < items[j].Scenario
+		}
+		return items[i].SessionID < items[j].SessionID
+	})
+	return items
+}
+
+func (r *runtimeState) ResetStickyBindings(gatewayKeyID, routeAlias, scenario, sessionID string, now time.Time) int {
+	keysToDelete := map[string]struct{}{}
+
+	r.mu.Lock()
+	r.sweepExpiredStickyLocked(now)
+	for key, binding := range r.sticky {
+		record := stickyBindingRecord{Key: key, Binding: binding}
+		if stickyBindingMatches(record, gatewayKeyID, routeAlias, scenario, sessionID) {
+			delete(r.sticky, key)
+			keysToDelete[key] = struct{}{}
+		}
+	}
+	r.mu.Unlock()
+
+	if lister, ok := r.stickyStore.(stickyBindingListingStore); ok && lister != nil {
+		records, err := lister.ListStickyBindings(now)
+		if err != nil {
+			slog.Warn("gateway sticky binding list failed during reset", "error", err)
+		} else {
+			for _, record := range records {
+				if stickyBindingMatches(record, gatewayKeyID, routeAlias, scenario, sessionID) {
+					keysToDelete[record.Key] = struct{}{}
+				}
+			}
+		}
+	}
+
+	if r.stickyStore != nil {
+		for key := range keysToDelete {
+			if err := r.stickyStore.DeleteStickyBinding(key); err != nil {
+				slog.Warn("gateway sticky binding delete failed", "key", key, "error", err)
+			}
+		}
+	}
+	return len(keysToDelete)
 }
 
 func (r *runtimeState) endpointState(key string) *endpointRuntimeState {
@@ -461,11 +563,107 @@ func (r *runtimeState) stickyKey(gatewayKeyID, alias, sessionID string) string {
 	return fmt.Sprintf("%d:%s\x00%d:%s\x00%d:%s", len(left), left, len(middle), middle, len(right), right)
 }
 
+func stickyBindingStatusFromRecord(record stickyBindingRecord) (StickyBindingStatus, bool) {
+	gatewayKeyID, routeAlias, scenario, sessionID, ok := parseStickyBindingKey(record.Key)
+	if !ok {
+		return StickyBindingStatus{}, false
+	}
+	return StickyBindingStatus{
+		GatewayKeyID: gatewayKeyID,
+		RouteAlias:   routeAlias,
+		Scenario:     scenario,
+		SessionID:    sessionID,
+		ProviderID:   record.Binding.ProviderID,
+		EndpointID:   record.Binding.EndpointID,
+		CredentialID: record.Binding.CredentialID,
+		ExpiresAt:    record.Binding.ExpiresAt,
+	}, true
+}
+
+func parseStickyBindingKey(key string) (gatewayKeyID, routeAlias, scenario, sessionID string, ok bool) {
+	values := make([]string, 0, 3)
+	for len(key) > 0 {
+		colon := strings.IndexByte(key, ':')
+		if colon <= 0 {
+			return "", "", "", "", false
+		}
+		size, err := strconv.Atoi(key[:colon])
+		if err != nil || size < 0 {
+			return "", "", "", "", false
+		}
+		start := colon + 1
+		end := start + size
+		if end > len(key) {
+			return "", "", "", "", false
+		}
+		values = append(values, key[start:end])
+		key = key[end:]
+		if key == "" {
+			break
+		}
+		if key[0] != '\x00' {
+			return "", "", "", "", false
+		}
+		key = key[1:]
+	}
+	if len(values) != 3 {
+		return "", "", "", "", false
+	}
+	routeKey := values[1]
+	routeAlias = routeKey
+	if separator := strings.IndexByte(routeKey, '\x00'); separator >= 0 {
+		routeAlias = routeKey[:separator]
+		scenario = routeKey[separator+1:]
+	}
+	if values[0] == "" || routeAlias == "" || values[2] == "" {
+		return "", "", "", "", false
+	}
+	return values[0], routeAlias, scenario, values[2], true
+}
+
+func stickyBindingMatches(record stickyBindingRecord, gatewayKeyID, routeAlias, scenario, sessionID string) bool {
+	status, ok := stickyBindingStatusFromRecord(record)
+	if !ok {
+		return false
+	}
+	if wanted := strings.TrimSpace(gatewayKeyID); wanted != "" && status.GatewayKeyID != wanted {
+		return false
+	}
+	if wanted := strings.ToLower(strings.TrimSpace(routeAlias)); wanted != "" && status.RouteAlias != wanted {
+		return false
+	}
+	if wanted := strings.ToLower(strings.TrimSpace(scenario)); wanted != "" && status.Scenario != wanted {
+		return false
+	}
+	if wanted := strings.ToLower(strings.TrimSpace(sessionID)); wanted != "" && status.SessionID != wanted {
+		return false
+	}
+	return true
+}
+
 func (r *runtimeState) stickyBindingFor(gatewayKeyID, alias, sessionID string, now time.Time) (stickyBinding, bool) {
 	if strings.TrimSpace(sessionID) == "" {
 		return stickyBinding{}, false
 	}
 	key := r.stickyKey(gatewayKeyID, alias, sessionID)
+
+	if r.stickyStore != nil {
+		binding, ok, err := r.stickyStore.LoadStickyBinding(key, now)
+		if err == nil {
+			r.mu.Lock()
+			if ok {
+				r.sticky[key] = binding
+			} else {
+				delete(r.sticky, key)
+			}
+			r.mu.Unlock()
+			if ok {
+				return binding, true
+			}
+			return stickyBinding{}, false
+		}
+		slog.Warn("gateway sticky binding cache read failed", "key", key, "error", err)
+	}
 
 	r.mu.Lock()
 	binding, ok := r.sticky[key]
@@ -481,21 +679,7 @@ func (r *runtimeState) stickyBindingFor(gatewayKeyID, alias, sessionID string, n
 	}
 	r.mu.Unlock()
 
-	if r.stickyStore == nil {
-		return stickyBinding{}, false
-	}
-	binding, ok, err := r.stickyStore.LoadStickyBinding(key, now)
-	if err != nil {
-		slog.Warn("gateway sticky binding cache read failed", "key", key, "error", err)
-		return stickyBinding{}, false
-	}
-	if !ok {
-		return stickyBinding{}, false
-	}
-	r.mu.Lock()
-	r.sticky[key] = binding
-	r.mu.Unlock()
-	return binding, true
+	return stickyBinding{}, false
 }
 
 func (r *runtimeState) sweepExpiredStickyLocked(now time.Time) {
@@ -512,6 +696,69 @@ func (r *runtimeState) deleteRemoteStickyBinding(key string) {
 	}
 	if err := r.stickyStore.DeleteStickyBinding(key); err != nil {
 		slog.Warn("gateway sticky binding cache delete failed", "key", key, "error", err)
+	}
+}
+
+func (r *runtimeState) acquireProvider(provider model.Provider, now time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	window := r.providerWindows[provider.ID]
+	if window == nil {
+		window = &gatewayKeyWindow{}
+		r.providerWindows[provider.ID] = window
+	}
+
+	minuteBucket := now.UTC().Truncate(time.Minute)
+	if window.MinuteBucket.IsZero() || !window.MinuteBucket.Equal(minuteBucket) {
+		window.MinuteBucket = minuteBucket
+		window.RequestCount = 0
+	}
+	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
+	hourlyCost, dailyCost, weeklyCost, monthlyCost := gatewaySpendTotals(window.SpendEvents, now)
+
+	if provider.RateLimitRPM > 0 && window.RequestCount >= provider.RateLimitRPM {
+		return errProviderRateLimit
+	}
+	if provider.MaxConcurrency > 0 && window.InFlight >= provider.MaxConcurrency {
+		return errProviderConcurrencyLimit
+	}
+	if provider.HourlyBudgetUSD > 0 && hourlyCost >= provider.HourlyBudgetUSD {
+		return errProviderHourlyBudget
+	}
+	if provider.DailyBudgetUSD > 0 && dailyCost >= provider.DailyBudgetUSD {
+		return errProviderDailyBudget
+	}
+	if provider.WeeklyBudgetUSD > 0 && weeklyCost >= provider.WeeklyBudgetUSD {
+		return errProviderWeeklyBudget
+	}
+	if provider.MonthlyBudgetUSD > 0 && monthlyCost >= provider.MonthlyBudgetUSD {
+		return errProviderMonthlyBudget
+	}
+
+	window.RequestCount++
+	window.InFlight++
+	return nil
+}
+
+func (r *runtimeState) releaseProvider(providerID string, costUSD float64) {
+	now := time.Now().UTC()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	window := r.providerWindows[providerID]
+	if window == nil {
+		return
+	}
+	if window.InFlight > 0 {
+		window.InFlight--
+	}
+	if costUSD > 0 {
+		window.SpendEvents = append(pruneGatewaySpendEvents(window.SpendEvents, now), gatewaySpendEvent{
+			At:      now,
+			CostUSD: costUSD,
+		})
 	}
 }
 

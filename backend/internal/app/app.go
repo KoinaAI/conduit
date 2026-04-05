@@ -96,6 +96,8 @@ func (a *App) Handler() http.Handler {
 	adminMux.HandleFunc("GET /api/admin/request-history/{id}", a.admin.GetRequestHistoryRecord)
 	adminMux.HandleFunc("GET /api/admin/request-history/{id}/attempts", a.admin.GetRequestAttempts)
 	adminMux.HandleFunc("GET /api/admin/runtime/sessions", a.admin.ListActiveSessions)
+	adminMux.HandleFunc("GET /api/admin/runtime/sticky-bindings", a.admin.GetStickyBindings)
+	adminMux.HandleFunc("POST /api/admin/runtime/sticky-bindings/reset", a.admin.ResetStickyBindings)
 	adminMux.HandleFunc("GET /api/admin/runtime/provider-usage", a.admin.GetProviderUsage)
 	adminMux.HandleFunc("GET /api/admin/runtime/circuits", a.admin.GetCircuitStatus)
 	adminMux.HandleFunc("POST /api/admin/runtime/circuits/reset", a.admin.ResetCircuits)

@@ -341,8 +341,45 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			candidate.sessionID = parsedRequest.sessionID
 
 			attemptStarted := time.Now().UTC()
+			if err := s.runtime.acquireProvider(candidate.provider, attemptStarted); err != nil {
+				attemptSpan.RecordError(err)
+				attemptSpan.SetStatus(codes.Error, err.Error())
+				attemptSpan.End()
+				lastErr = err
+				lastStatusCode = providerLimitStatusCode(err)
+				hasNext := index < len(candidates)-1
+				attempts = append(attempts, model.RequestAttemptRecord{
+					RequestID:     record.ID,
+					Sequence:      index + 1,
+					ProviderID:    candidate.provider.ID,
+					ProviderName:  candidate.provider.Name,
+					EndpointID:    candidate.endpoint.ID,
+					EndpointURL:   candidate.endpoint.BaseURL,
+					CredentialID:  candidate.credential.ID,
+					UpstreamModel: exchange.UpstreamModel,
+					StatusCode:    lastStatusCode,
+					Retryable:     true,
+					Decision:      nextDecision(true, hasNext),
+					StartedAt:     attemptStarted,
+					DurationMS:    0,
+					Error:         err.Error(),
+				})
+				appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, nextDecision(true, hasNext), true, lastStatusCode, 0, err)
+				if hasNext {
+					logger.Warn("gateway candidate skipped by provider limits",
+						"provider_id", candidate.provider.ID,
+						"endpoint_id", candidate.endpoint.ID,
+						"credential_id", candidate.credential.ID,
+						"attempt", index+1,
+						"error", err,
+					)
+					continue
+				}
+				break
+			}
 			halfOpenProbe, err := s.runtime.acquireEndpoint(candidate, attemptStarted)
 			if err != nil {
+				s.runtime.releaseProvider(candidate.provider.ID, 0)
 				attemptSpan.RecordError(err)
 				attemptSpan.SetStatus(codes.Error, err.Error())
 				attemptSpan.End()
@@ -379,6 +416,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			}
 			resp, err := s.doProxyRequest(attemptCtx, candidate, exchange, r.Method, r.Header, parsedRequest.rawQuery)
 			if err != nil {
+				s.runtime.releaseProvider(candidate.provider.ID, 0)
 				attemptSpan.RecordError(err)
 				attemptSpan.SetStatus(codes.Error, err.Error())
 				attemptSpan.End()
@@ -419,6 +457,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			}
 
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				s.runtime.releaseProvider(candidate.provider.ID, 0)
 				attemptSpan.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
 				_ = resp.Body.Close()
@@ -485,6 +524,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			writeErr := s.writeProxyResponse(w, resp, observer, exchange, parsedRequest.routeAlias, candidate.route.Transformers, candidate)
 			_ = resp.Body.Close()
 			if writeErr != nil {
+				s.runtime.releaseProvider(candidate.provider.ID, 0)
 				attemptSpan.RecordError(writeErr)
 				attemptSpan.SetStatus(codes.Error, writeErr.Error())
 				attemptSpan.End()
@@ -532,6 +572,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			record.Usage = observer.Summary()
 			record.Billing = billing.Calculate(candidate.pricing, record.Usage, candidate.multiplier, candidate.pricing.Name)
 			finalCost = record.Billing.FinalCost
+			s.runtime.releaseProvider(candidate.provider.ID, record.Billing.FinalCost)
 			attemptSpan.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 			attemptSpan.End()
 			appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, index+1, "success", false, resp.StatusCode, 0, nil)
@@ -663,8 +704,15 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidate := candidates[0]
+	if err := s.runtime.acquireProvider(candidate.provider, time.Now().UTC()); err != nil {
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
+		writeError(w, providerLimitStatusCode(err), err.Error())
+		return
+	}
 	upstreamURL, err := joinProxyURL(candidate.endpoint.BaseURL, "/v1/realtime")
 	if err != nil {
+		s.runtime.releaseProvider(candidate.provider.ID, 0)
 		requestSpan.RecordError(err)
 		requestSpan.SetStatus(codes.Error, err.Error())
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -682,6 +730,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 
 	dialer, err := s.websocketDialerForProvider(candidate.provider)
 	if err != nil {
+		s.runtime.releaseProvider(candidate.provider.ID, 0)
 		requestSpan.RecordError(err)
 		requestSpan.SetStatus(codes.Error, err.Error())
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -690,6 +739,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{CheckOrigin: s.allowRealtimeOrigin}
 	clientConn, err := upgrader.Upgrade(w, r, routingMetadataHeader(route, candidate, 0, sessionID, appliedScenario))
 	if err != nil {
+		s.runtime.releaseProvider(candidate.provider.ID, 0)
 		return
 	}
 	defer clientConn.Close()
@@ -710,6 +760,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 
 	serverConn, _, err := dialer.DialContext(ctx, upstreamURL.String(), headers)
 	if err != nil {
+		s.runtime.releaseProvider(candidate.provider.ID, 0)
 		requestSpan.RecordError(err)
 		requestSpan.SetStatus(codes.Error, err.Error())
 		_ = clientConn.WriteJSON(map[string]any{"type": "error", "error": err.Error()})
@@ -760,6 +811,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	record.Usage = observer.Summary()
 	record.Billing = billing.Calculate(candidate.pricing, record.Usage, candidate.multiplier, candidate.pricing.Name)
 	finalCost = record.Billing.FinalCost
+	s.runtime.releaseProvider(candidate.provider.ID, record.Billing.FinalCost)
 	requestSpan.SetAttributes(
 		attribute.String("gateway.provider_id", candidate.provider.ID),
 		attribute.String("gateway.endpoint_id", candidate.endpoint.ID),
@@ -984,6 +1036,14 @@ func (s *Service) CircuitStatuses() []EndpointCircuitStatus {
 	return s.runtime.CircuitStatuses(s.store.RoutingSnapshot(), time.Now().UTC())
 }
 
+// StickyBindings returns the current session-to-provider sticky routing state.
+func (s *Service) StickyBindings() []StickyBindingStatus {
+	if s == nil || s.runtime == nil {
+		return nil
+	}
+	return s.runtime.StickyBindings(time.Now().UTC())
+}
+
 // ResetCircuits clears passive circuit state for matching endpoints. Empty
 // provider and endpoint filters reset every configured endpoint.
 func (s *Service) ResetCircuits(providerID, endpointID string) int {
@@ -991,6 +1051,14 @@ func (s *Service) ResetCircuits(providerID, endpointID string) int {
 		return 0
 	}
 	return s.runtime.ResetCircuits(s.store.RoutingSnapshot(), providerID, endpointID)
+}
+
+// ResetStickyBindings clears sticky routing state for matching sessions.
+func (s *Service) ResetStickyBindings(gatewayKeyID, routeAlias, scenario, sessionID string) int {
+	if s == nil || s.runtime == nil {
+		return 0
+	}
+	return s.runtime.ResetStickyBindings(gatewayKeyID, routeAlias, scenario, sessionID, time.Now().UTC())
 }
 
 // RunProbes actively checks configured endpoints so the admin plane can inspect
@@ -1614,6 +1682,17 @@ func parseRetryAfter(headers http.Header) time.Duration {
 		return 0
 	}
 	return clampRetryAfterCooldown(delay)
+}
+
+func providerLimitStatusCode(err error) int {
+	switch {
+	case errors.Is(err, errProviderRateLimit), errors.Is(err, errProviderConcurrencyLimit):
+		return http.StatusTooManyRequests
+	case errors.Is(err, errProviderHourlyBudget), errors.Is(err, errProviderDailyBudget), errors.Is(err, errProviderWeeklyBudget), errors.Is(err, errProviderMonthlyBudget):
+		return http.StatusPaymentRequired
+	default:
+		return http.StatusServiceUnavailable
+	}
 }
 
 func writeGatewayAuthError(w http.ResponseWriter, err error) {

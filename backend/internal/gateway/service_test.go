@@ -771,6 +771,97 @@ func TestGatewayFallsBackToEstimatedUsageWhenUpstreamOmitsUsage(t *testing.T) {
 	}
 }
 
+func TestGatewayFallsBackWhenPrimaryProviderHitsProviderRPM(t *testing.T) {
+	t.Parallel()
+
+	firstCalls := 0
+	firstServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","choices":[{"message":{"content":"from-first"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer firstServer.Close()
+
+	secondCalls := 0
+	secondServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_2","choices":[{"message":{"content":"from-second"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer secondServer.Close()
+
+	state := model.DefaultState()
+	state.Providers = []model.Provider{
+		{
+			ID:             "provider-1",
+			Name:           "First",
+			Kind:           model.ProviderKindOpenAICompatible,
+			Enabled:        true,
+			MaxAttempts:    1,
+			RateLimitRPM:   1,
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-first",
+				BaseURL: firstServer.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-first",
+				APIKey:  "first-key",
+				Enabled: true,
+			}},
+		},
+		{
+			ID:             "provider-2",
+			Name:           "Second",
+			Kind:           model.ProviderKindOpenAICompatible,
+			Enabled:        true,
+			MaxAttempts:    1,
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
+			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-second",
+				BaseURL: secondServer.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-second",
+				APIKey:  "second-key",
+				Enabled: true,
+			}},
+		},
+	}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{
+			{ID: "target-1", AccountID: "provider-1", UpstreamModel: "gpt-5.4-up", Weight: 1, Enabled: true, MarkupMultiplier: 1},
+			{ID: "target-2", AccountID: "provider-2", UpstreamModel: "gpt-5.4-up", Weight: 1, Enabled: true, MarkupMultiplier: 1},
+		},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	firstRes, firstBody := postJSON(t, gatewayServer.URL+"/v1/chat/completions", `{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`)
+	defer firstRes.Body.Close()
+	if firstRes.StatusCode != http.StatusOK || !strings.Contains(firstBody, "from-first") {
+		t.Fatalf("expected first request to use primary provider, got %d body=%s", firstRes.StatusCode, firstBody)
+	}
+
+	secondRes, secondBody := postJSON(t, gatewayServer.URL+"/v1/chat/completions", `{"model":"gpt-5.4","messages":[{"role":"user","content":"hi again"}]}`)
+	defer secondRes.Body.Close()
+	if secondRes.StatusCode != http.StatusOK || !strings.Contains(secondBody, "from-second") {
+		t.Fatalf("expected second request to fall back after provider rpm limit, got %d body=%s", secondRes.StatusCode, secondBody)
+	}
+	if firstCalls != 1 {
+		t.Fatalf("expected primary provider to be called once before limit skipped it, got %d", firstCalls)
+	}
+	if secondCalls != 1 {
+		t.Fatalf("expected fallback provider to serve the second request, got %d calls", secondCalls)
+	}
+}
+
 func TestGatewayAppliesRouteTransformers(t *testing.T) {
 	t.Parallel()
 

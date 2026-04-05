@@ -192,10 +192,10 @@ func TestStateNormalizeAssignsProviderCapabilitiesByKind(t *testing.T) {
 	if got := state.Providers[0].Capabilities; !slices.Equal(got, []Protocol{ProtocolOpenAIChat, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected openai-compatible capabilities: %+v", got)
 	}
-	if got := state.Providers[1].Capabilities; !slices.Equal(got, []Protocol{ProtocolAnthropic, ProtocolOpenAIResponses}) {
+	if got := state.Providers[1].Capabilities; !slices.Equal(got, []Protocol{ProtocolAnthropic, ProtocolOpenAIChat, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected anthropic capabilities: %+v", got)
 	}
-	if got := state.Providers[2].Capabilities; !slices.Equal(got, []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream, ProtocolOpenAIResponses}) {
+	if got := state.Providers[2].Capabilities; !slices.Equal(got, []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream, ProtocolOpenAIChat, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected gemini capabilities: %+v", got)
 	}
 }

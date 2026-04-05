@@ -185,9 +185,8 @@ func (s *FileStore) ActiveSessions(now time.Time, activeWithin time.Duration, li
 	cutoff := now.Add(-activeWithin)
 
 	rows, err := db.Query(
-		s.rebind(`SELECT payload FROM request_records WHERE started_at >= ? ORDER BY started_at DESC, id DESC LIMIT ?`),
+		s.rebind(`SELECT payload FROM request_records WHERE started_at >= ? ORDER BY started_at DESC, id DESC`),
 		cutoff.Format(time.RFC3339Nano),
-		limit*20,
 	)
 	if err != nil {
 		return nil, err
@@ -278,9 +277,8 @@ func (s *FileStore) ProviderUsage(now time.Time, limit int) ([]ProviderUsageRow,
 	cutoff := now.Add(-30 * 24 * time.Hour)
 
 	rows, err := db.Query(
-		s.rebind(`SELECT payload FROM request_records WHERE started_at >= ? ORDER BY started_at DESC, id DESC LIMIT ?`),
+		s.rebind(`SELECT payload FROM request_records WHERE started_at >= ? ORDER BY started_at DESC, id DESC`),
 		cutoff.Format(time.RFC3339Nano),
-		limit*50,
 	)
 	if err != nil {
 		return nil, err

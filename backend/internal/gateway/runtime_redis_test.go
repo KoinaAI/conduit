@@ -50,6 +50,53 @@ func TestRedisStickyBindingsAreSharedAcrossRuntimeInstances(t *testing.T) {
 	}
 }
 
+func TestRedisStickyBindingsCanBeListedAndResetAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	first := newRuntimeState(store)
+	second := newRuntimeState(store)
+	now := time.Now().UTC()
+	candidate := resolvedCandidate{
+		provider: model.Provider{
+			ID:                      "provider-1",
+			StickySessionTTLSeconds: 300,
+		},
+		route: model.ModelRoute{
+			Alias: "gpt-5.4",
+		},
+		scenario: "codex",
+		endpoint: model.ProviderEndpoint{
+			ID: "endpoint-1",
+		},
+		credential: model.ProviderCredential{
+			ID: "credential-1",
+		},
+		gatewayKeyID: "gateway-key-1",
+	}
+
+	first.bindStickyCandidate(candidate, "session-1", now)
+
+	items := second.StickyBindings(now)
+	if len(items) != 1 {
+		t.Fatalf("expected one shared sticky binding, got %+v", items)
+	}
+	if items[0].Scenario != "codex" || items[0].SessionID != "session-1" {
+		t.Fatalf("unexpected shared sticky binding payload: %+v", items[0])
+	}
+	if reset := second.ResetStickyBindings("gateway-key-1", "gpt-5.4", "codex", "session-1", now); reset != 1 {
+		t.Fatalf("expected one sticky binding reset, got %d", reset)
+	}
+	if items = first.StickyBindings(now); len(items) != 0 {
+		t.Fatalf("expected sticky binding reset to replicate across runtimes, got %+v", items)
+	}
+}
+
 func TestRedisRoundRobinOffsetsAreSharedAcrossRuntimeInstances(t *testing.T) {
 	t.Parallel()
 

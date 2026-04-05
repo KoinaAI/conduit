@@ -35,23 +35,59 @@ func responseWriteStarted(err error) bool {
 func prepareUpstreamExchange(protocol model.Protocol, providerKind model.ProviderKind, currentPath string, request parsedProxyRequest, upstreamModel string) (upstreamExchange, error) {
 	switch protocol {
 	case model.ProtocolOpenAIChat:
-		if providerKind != model.ProviderKindOpenAICompatible {
+		switch providerKind {
+		case model.ProviderKindOpenAICompatible:
+			payload := cloneJSONMap(request.jsonPayload)
+			payload["model"] = upstreamModel
+			body, err := json.Marshal(payload)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			return upstreamExchange{
+				Path:          currentPath,
+				Body:          body,
+				Stream:        request.stream,
+				ResponseMode:  responseModePassthrough,
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+			}, nil
+		case model.ProviderKindAnthropic:
+			payload := cloneJSONMap(request.jsonPayload)
+			payload["model"] = upstreamModel
+			body, err := openAIChatPayloadToAnthropic(payload)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			return upstreamExchange{
+				Path:          "/v1/messages",
+				Body:          body,
+				Stream:        request.stream,
+				ResponseMode:  chooseResponseMode(request.stream, responseModeAnthropicJSON, responseModeAnthropicSSE),
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+			}, nil
+		case model.ProviderKindGemini:
+			payload := cloneJSONMap(request.jsonPayload)
+			payload["model"] = upstreamModel
+			body, err := openAIChatPayloadToGemini(payload)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			path := "/v1beta/models/" + upstreamModel + ":generateContent"
+			if request.stream {
+				path = "/v1beta/models/" + upstreamModel + ":streamGenerateContent"
+			}
+			return upstreamExchange{
+				Path:          path,
+				Body:          body,
+				Stream:        request.stream,
+				ResponseMode:  chooseResponseMode(request.stream, responseModeGeminiJSON, responseModeGeminiSSE),
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+			}, nil
+		default:
 			return upstreamExchange{}, fmt.Errorf("provider kind %s does not support protocol %s", providerKind, protocol)
 		}
-		payload := cloneJSONMap(request.jsonPayload)
-		payload["model"] = upstreamModel
-		body, err := json.Marshal(payload)
-		if err != nil {
-			return upstreamExchange{}, err
-		}
-		return upstreamExchange{
-			Path:          currentPath,
-			Body:          body,
-			Stream:        request.stream,
-			ResponseMode:  responseModePassthrough,
-			UpstreamModel: upstreamModel,
-			PublicAlias:   request.routeAlias,
-		}, nil
 	case model.ProtocolOpenAIResponses:
 		switch providerKind {
 		case model.ProviderKindOpenAICompatible:

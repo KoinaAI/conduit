@@ -87,6 +87,50 @@ func (s *redisStickyStore) DeleteStickyBinding(key string) error {
 	return s.client.Del(ctx, s.key(key)).Err()
 }
 
+func (s *redisStickyStore) ListStickyBindings(now time.Time) ([]stickyBindingRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	pattern := s.stickyPrefix() + "*"
+	cursor := uint64(0)
+	records := make([]stickyBindingRecord, 0, 16)
+	for {
+		keys, next, err := s.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, redisKey := range keys {
+			payload, err := s.client.Get(ctx, redisKey).Bytes()
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			var binding stickyBinding
+			if err := json.Unmarshal(payload, &binding); err != nil {
+				_ = s.client.Del(ctx, redisKey).Err()
+				continue
+			}
+			if !binding.ExpiresAt.After(now) {
+				_ = s.client.Del(ctx, redisKey).Err()
+				continue
+			}
+
+			records = append(records, stickyBindingRecord{
+				Key:     strings.TrimPrefix(redisKey, s.stickyPrefix()),
+				Binding: binding,
+			})
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return records, nil
+}
+
 func (s *redisStickyStore) NextRoundRobinValue(key string) (uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
@@ -373,11 +417,15 @@ func (s *redisStickyStore) ClearGatewayAuthFailures(source, lookupHash string) e
 }
 
 func (s *redisStickyStore) key(key string) string {
+	return s.stickyPrefix() + key
+}
+
+func (s *redisStickyStore) stickyPrefix() string {
 	prefix := strings.TrimSpace(s.prefix)
 	if prefix == "" {
 		prefix = "conduit"
 	}
-	return prefix + ":sticky:" + key
+	return prefix + ":sticky:"
 }
 
 func (s *redisStickyStore) roundRobinKey(key string) string {

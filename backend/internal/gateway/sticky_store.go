@@ -12,6 +12,15 @@ type stickyBindingStore interface {
 	DeleteStickyBinding(key string) error
 }
 
+type stickyBindingRecord struct {
+	Key     string
+	Binding stickyBinding
+}
+
+type stickyBindingListingStore interface {
+	ListStickyBindings(now time.Time) ([]stickyBindingRecord, error)
+}
+
 type roundRobinCounterStore interface {
 	NextRoundRobinValue(key string) (uint64, error)
 }

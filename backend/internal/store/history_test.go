@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -170,6 +171,59 @@ func TestActiveSessionsAggregatesRecentRequests(t *testing.T) {
 	}
 }
 
+func TestActiveSessionsScansFullWindowInsteadOfSamplingRecentRows(t *testing.T) {
+	t.Parallel()
+
+	fileStore, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer fileStore.Close()
+
+	now := time.Now().UTC()
+	for index := 0; index < 24; index++ {
+		record := model.RequestRecord{
+			ID:              "req-dominant-" + strconv.Itoa(index),
+			RouteAlias:      "gpt-5.4",
+			AccountID:       "provider-1",
+			ProviderName:    "OpenAI",
+			GatewayKeyID:    "gk-1",
+			ClientSessionID: "sess-dominant",
+			StatusCode:      200,
+			StartedAt:       now.Add(-time.Duration(index) * time.Second),
+			Usage:           model.UsageSummary{TotalTokens: 1},
+		}
+		if err := fileStore.AppendRequestRecord(record, nil, 100); err != nil {
+			t.Fatalf("append dominant session record %d: %v", index, err)
+		}
+	}
+	lateRecord := model.RequestRecord{
+		ID:              "req-tail-session",
+		RouteAlias:      "claude-3.7",
+		AccountID:       "provider-2",
+		ProviderName:    "Anthropic",
+		GatewayKeyID:    "gk-2",
+		ClientSessionID: "sess-tail",
+		StatusCode:      200,
+		StartedAt:       now.Add(-5 * time.Minute),
+		Usage:           model.UsageSummary{TotalTokens: 10},
+	}
+	if err := fileStore.AppendRequestRecord(lateRecord, nil, 100); err != nil {
+		t.Fatalf("append tail session record: %v", err)
+	}
+
+	items, err := fileStore.ActiveSessions(now, 15*time.Minute, 10)
+	if err != nil {
+		t.Fatalf("active sessions: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected both sessions to appear after full-window scan, got %+v", items)
+	}
+	if items[1].SessionID != "sess-tail" {
+		t.Fatalf("expected tail session to remain visible, got %+v", items)
+	}
+}
+
 func TestProviderUsageAggregatesRollingWindows(t *testing.T) {
 	t.Parallel()
 
@@ -229,6 +283,52 @@ func TestProviderUsageAggregatesRollingWindows(t *testing.T) {
 	}
 	if items[0].MonthlyCostUSD != 2.0 || items[0].MonthlyErrors != 1 {
 		t.Fatalf("unexpected monthly provider usage: %+v", items[0])
+	}
+}
+
+func TestProviderUsageScansFullWindowInsteadOfSamplingRecentRows(t *testing.T) {
+	t.Parallel()
+
+	fileStore, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer fileStore.Close()
+
+	now := time.Now().UTC()
+	for index := 0; index < 120; index++ {
+		record := model.RequestRecord{
+			ID:           "req-provider-a-" + strconv.Itoa(index),
+			AccountID:    "provider-a",
+			ProviderName: "Provider A",
+			StatusCode:   200,
+			StartedAt:    now.Add(-time.Duration(index) * time.Minute),
+			Billing:      model.BillingSummary{FinalCost: 0.01},
+		}
+		if err := fileStore.AppendRequestRecord(record, nil, 200); err != nil {
+			t.Fatalf("append provider-a record %d: %v", index, err)
+		}
+	}
+	if err := fileStore.AppendRequestRecord(model.RequestRecord{
+		ID:           "req-provider-b-tail",
+		AccountID:    "provider-b",
+		ProviderName: "Provider B",
+		StatusCode:   200,
+		StartedAt:    now.Add(-20 * 24 * time.Hour),
+		Billing:      model.BillingSummary{FinalCost: 0.25},
+	}, nil, 200); err != nil {
+		t.Fatalf("append provider-b tail record: %v", err)
+	}
+
+	items, err := fileStore.ProviderUsage(now, 10)
+	if err != nil {
+		t.Fatalf("provider usage: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected both providers to remain visible after full-window scan, got %+v", items)
+	}
+	if items[1].ProviderID != "provider-b" {
+		t.Fatalf("expected provider-b to remain visible, got %+v", items)
 	}
 }
 

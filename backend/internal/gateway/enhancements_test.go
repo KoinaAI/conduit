@@ -169,6 +169,88 @@ func TestReleaseGatewayKeyAppendsRollingSpendEvent(t *testing.T) {
 	}
 }
 
+func TestAcquireProviderEnforcesRollingBudgets(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 5, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		key    string
+		limits model.Provider
+		events []gatewaySpendEvent
+		want   error
+	}{
+		{
+			name: "hourly",
+			key:  "provider-hourly",
+			limits: model.Provider{
+				ID:              "provider-hourly",
+				HourlyBudgetUSD: 5,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-30 * time.Minute), CostUSD: 5}},
+			want:   errProviderHourlyBudget,
+		},
+		{
+			name: "daily",
+			key:  "provider-daily",
+			limits: model.Provider{
+				ID:             "provider-daily",
+				DailyBudgetUSD: 10,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-23 * time.Hour), CostUSD: 10}},
+			want:   errProviderDailyBudget,
+		},
+		{
+			name: "weekly",
+			key:  "provider-weekly",
+			limits: model.Provider{
+				ID:              "provider-weekly",
+				WeeklyBudgetUSD: 20,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-6 * 24 * time.Hour), CostUSD: 20}},
+			want:   errProviderWeeklyBudget,
+		},
+		{
+			name: "monthly",
+			key:  "provider-monthly",
+			limits: model.Provider{
+				ID:               "provider-monthly",
+				MonthlyBudgetUSD: 30,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-29 * 24 * time.Hour), CostUSD: 30}},
+			want:   errProviderMonthlyBudget,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			runtime := newRuntimeState()
+			runtime.providerWindows[tc.key] = &gatewayKeyWindow{SpendEvents: tc.events}
+			if err := runtime.acquireProvider(tc.limits, now); !errors.Is(err, tc.want) {
+				t.Fatalf("expected %v, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestReleaseProviderAppendsRollingSpendEvent(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	runtime.providerWindows["provider-1"] = &gatewayKeyWindow{InFlight: 1}
+
+	runtime.releaseProvider("provider-1", 1.25)
+
+	window := runtime.providerWindows["provider-1"]
+	if window.InFlight != 0 {
+		t.Fatalf("expected in-flight counter to be decremented, got %+v", window)
+	}
+	if len(window.SpendEvents) != 1 || window.SpendEvents[0].CostUSD != 1.25 {
+		t.Fatalf("expected rolling spend event to be recorded, got %+v", window.SpendEvents)
+	}
+}
+
 func TestRuntimeReadPathsDoNotAllocateState(t *testing.T) {
 	t.Parallel()
 

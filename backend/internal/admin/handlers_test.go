@@ -1375,6 +1375,8 @@ func TestBuildOpenAPISpecCoversAdminRoutes(t *testing.T) {
 		"/api/admin/request-history/{id}",
 		"/api/admin/request-history/{id}/attempts",
 		"/api/admin/runtime/sessions",
+		"/api/admin/runtime/sticky-bindings",
+		"/api/admin/runtime/sticky-bindings/reset",
 		"/api/admin/runtime/provider-usage",
 		"/api/admin/runtime/circuits",
 		"/api/admin/runtime/circuits/reset",

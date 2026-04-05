@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/app"
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 func TestAdminCORSRejectsCrossOriginByDefault(t *testing.T) {
@@ -196,16 +196,15 @@ func TestAdminStatsRouteRegistered(t *testing.T) {
 func newTestServer(t *testing.T, cfg config.Config) *httptest.Server {
 	t.Helper()
 
-	if err := os.MkdirAll(filepath.Dir(cfg.StatePath), 0o755); err != nil {
-		t.Fatalf("mkdir state dir: %v", err)
-	}
-
-	data, err := json.Marshal(model.DefaultState())
+	fileStore, err := store.Open(filepath.Join(filepath.Dir(cfg.StatePath), filepath.Base(cfg.StatePath)))
 	if err != nil {
-		t.Fatalf("marshal state: %v", err)
+		t.Fatalf("open store: %v", err)
 	}
-	if err := os.WriteFile(cfg.StatePath, data, 0o600); err != nil {
-		t.Fatalf("write state: %v", err)
+	if _, err := fileStore.Replace(model.DefaultState()); err != nil {
+		t.Fatalf("replace state: %v", err)
+	}
+	if err := fileStore.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
 	}
 
 	instance, err := app.New(cfg)

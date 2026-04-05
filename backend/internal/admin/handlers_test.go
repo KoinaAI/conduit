@@ -88,7 +88,7 @@ func TestRunCheckinsSkipsAlreadyCheckedInIntegrations(t *testing.T) {
 	}
 }
 
-func TestGetStateRedactsSensitiveFields(t *testing.T) {
+func TestAdminEndpointsRedactSensitiveFields(t *testing.T) {
 	t.Parallel()
 
 	fileStore := openTestStore(t, model.State{
@@ -97,9 +97,12 @@ func TestGetStateRedactsSensitiveFields(t *testing.T) {
 			ID:      "provider-1",
 			Name:    "Provider",
 			Kind:    model.ProviderKindOpenAICompatible,
-			BaseURL: "https://provider.example",
-			APIKey:  "provider-secret-key",
 			Enabled: true,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-1",
+				BaseURL: "https://provider.example",
+				Enabled: true,
+			}},
 			Credentials: []model.ProviderCredential{{
 				ID:      "cred-1",
 				APIKey:  "credential-secret-key",
@@ -125,47 +128,98 @@ func TestGetStateRedactsSensitiveFields(t *testing.T) {
 	})
 
 	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
-	req := httptest.NewRequest(http.MethodGet, "/api/admin/state", nil)
+	t.Run("provider", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/providers/provider-1", nil)
+		req.SetPathValue("id", "provider-1")
+		recorder := httptest.NewRecorder()
+		handlers.GetProvider(recorder, req)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d", recorder.Code)
+		}
+
+		var provider map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &provider); err != nil {
+			t.Fatalf("decode provider: %v", err)
+		}
+		credentials := provider["credentials"].([]any)
+		credential := credentials[0].(map[string]any)
+		if got := credential["api_key"]; got != "" && got != nil {
+			t.Fatalf("expected provider credential api_key to be redacted, got %v", got)
+		}
+		if credential["api_key_preview"] == "" {
+			t.Fatalf("expected provider credential api_key preview, got %+v", credential)
+		}
+	})
+
+	t.Run("integrations", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/integrations", nil)
+		recorder := httptest.NewRecorder()
+		handlers.ListIntegrations(recorder, req)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d", recorder.Code)
+		}
+
+		var integrations []map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &integrations); err != nil {
+			t.Fatalf("decode integrations: %v", err)
+		}
+		integrationPayload := integrations[0]
+		if got := integrationPayload["access_key"]; got != "" && got != nil {
+			t.Fatalf("expected integration access_key to be redacted, got %v", got)
+		}
+		if got := integrationPayload["relay_api_key"]; got != "" && got != nil {
+			t.Fatalf("expected integration relay_api_key to be redacted, got %v", got)
+		}
+		if integrationPayload["access_key_preview"] == "" || integrationPayload["relay_api_key_preview"] == "" {
+			t.Fatalf("expected integration previews, got %+v", integrationPayload)
+		}
+	})
+
+	t.Run("gateway keys", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/gateway-keys", nil)
+		recorder := httptest.NewRecorder()
+		handlers.ListGatewayKeys(recorder, req)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("unexpected status: %d", recorder.Code)
+		}
+
+		var gatewayKeys []map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &gatewayKeys); err != nil {
+			t.Fatalf("decode gateway keys: %v", err)
+		}
+		key := gatewayKeys[0]
+		if _, ok := key["secret_hash"]; ok {
+			t.Fatalf("did not expect secret_hash in admin response: %+v", key)
+		}
+		if _, ok := key["secret_lookup_hash"]; ok {
+			t.Fatalf("did not expect secret_lookup_hash in admin response: %+v", key)
+		}
+	})
+}
+
+func TestCreateProviderRejectsLegacyFlatPayload(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.DefaultState())
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/providers", strings.NewReader(`{
+		"id":"provider-1",
+		"name":"Provider",
+		"kind":"openai-compatible",
+		"base_url":"https://provider.example",
+		"api_key":"provider-key",
+		"enabled":true
+	}`))
+	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
-	handlers.GetState(recorder, req)
+	handlers.CreateProvider(recorder, req)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("unexpected status: %d", recorder.Code)
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	providers := payload["providers"].([]any)
-	provider := providers[0].(map[string]any)
-	if got := provider["api_key"]; got != "" && got != nil {
-		t.Fatalf("expected provider api_key to be redacted, got %v", got)
-	}
-	if provider["api_key_preview"] == "" {
-		t.Fatalf("expected provider api_key preview, got %+v", provider)
-	}
-
-	integrations := payload["integrations"].([]any)
-	integrationPayload := integrations[0].(map[string]any)
-	if got := integrationPayload["access_key"]; got != "" && got != nil {
-		t.Fatalf("expected integration access_key to be redacted, got %v", got)
-	}
-	if got := integrationPayload["relay_api_key"]; got != "" && got != nil {
-		t.Fatalf("expected integration relay_api_key to be redacted, got %v", got)
-	}
-	if integrationPayload["access_key_preview"] == "" || integrationPayload["relay_api_key_preview"] == "" {
-		t.Fatalf("expected integration previews, got %+v", integrationPayload)
-	}
-
-	gatewayKeys := payload["gateway_keys"].([]any)
-	key := gatewayKeys[0].(map[string]any)
-	if _, ok := key["secret_hash"]; ok {
-		t.Fatalf("did not expect secret_hash in admin response: %+v", key)
-	}
-	if _, ok := key["secret_lookup_hash"]; ok {
-		t.Fatalf("did not expect secret_lookup_hash in admin response: %+v", key)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected legacy flat provider payload to be rejected, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -357,10 +411,10 @@ func TestCreateProviderRejectsInvalidProxyURL(t *testing.T) {
 		"id":"provider-1",
 		"name":"Provider",
 		"kind":"openai-compatible",
-		"base_url":"https://provider.example",
-		"api_key":"provider-key",
 		"enabled":true,
 		"capabilities":["openai.chat"],
+		"endpoints":[{"id":"endpoint-1","base_url":"https://provider.example","enabled":true}],
+		"credentials":[{"id":"credential-1","api_key":"provider-key","enabled":true}],
 		"proxy_url":"ftp://proxy.example:21"
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -382,10 +436,10 @@ func TestCreateProviderAcceptsSOCKSProxyURL(t *testing.T) {
 		"id":"provider-1",
 		"name":"Provider",
 		"kind":"openai-compatible",
-		"base_url":"https://provider.example",
-		"api_key":"provider-key",
 		"enabled":true,
 		"capabilities":["openai.chat"],
+		"endpoints":[{"id":"endpoint-1","base_url":"https://provider.example","enabled":true}],
+		"credentials":[{"id":"credential-1","api_key":"provider-key","enabled":true}],
 		"proxy_url":"socks5://127.0.0.1:1080"
 	}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -415,9 +469,17 @@ func TestDeleteIntegrationCleansLinkedProviderRoutesAndManagedPricing(t *testing
 			ID:      "provider-1",
 			Name:    "Relay",
 			Kind:    model.ProviderKindOpenAICompatible,
-			BaseURL: "https://relay.example",
-			APIKey:  "relay-key",
 			Enabled: true,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-1",
+				BaseURL: "https://relay.example",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-1",
+				APIKey:  "relay-key",
+				Enabled: true,
+			}},
 		}},
 		Integrations: []model.Integration{{
 			ID:               "integration-1",
@@ -571,7 +633,7 @@ func TestCreateRouteRejectsInvalidTransformer(t *testing.T) {
 	}
 }
 
-func TestPutStatePreservesRouteStrategyWhenCompatibilityPayloadOmitsIt(t *testing.T) {
+func TestUpdateRouteClearsScenariosWhenOmitted(t *testing.T) {
 	t.Parallel()
 
 	fileStore := openTestStore(t, model.State{
@@ -579,6 +641,16 @@ func TestPutStatePreservesRouteStrategyWhenCompatibilityPayloadOmitsIt(t *testin
 		ModelRoutes: []model.ModelRoute{{
 			Alias:    "gpt-5.4",
 			Strategy: model.RouteStrategyRoundRobin,
+			Scenarios: []model.RouteScenario{{
+				Name: "background",
+				Targets: []model.RouteTarget{{
+					ID:               "scenario-target-1",
+					AccountID:        "provider-1",
+					Weight:           1,
+					Enabled:          true,
+					MarkupMultiplier: 1,
+				}},
+			}},
 			Targets: []model.RouteTarget{{
 				ID:               "target-1",
 				AccountID:        "provider-1",
@@ -590,21 +662,29 @@ func TestPutStatePreservesRouteStrategyWhenCompatibilityPayloadOmitsIt(t *testin
 	})
 	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
 
-	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{"version":"2026-04-01","providers":[],"model_routes":[{"alias":"gpt-5.4","targets":[{"id":"target-1","account_id":"provider-1","weight":1,"enabled":true,"markup_multiplier":1}]}],"pricing_profiles":[],"integrations":[],"gateway_keys":[],"request_history":[]}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/routes/gpt-5.4", strings.NewReader(`{
+		"alias":"gpt-5.4",
+		"strategy":"round-robin",
+		"targets":[{"id":"target-1","account_id":"provider-1","weight":1,"enabled":true,"markup_multiplier":1}]
+	}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("alias", "gpt-5.4")
 	recorder := httptest.NewRecorder()
-	handlers.PutState(recorder, req)
+	handlers.UpdateRoute(recorder, req)
 
 	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected put state ok, got %d body=%s", recorder.Code, recorder.Body.String())
+		t.Fatalf("expected route update ok, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 
 	saved, ok := fileStore.Snapshot().FindRoute("gpt-5.4")
 	if !ok {
-		t.Fatal("expected route to remain after put state")
+		t.Fatal("expected route to remain after update")
 	}
 	if saved.Strategy != model.RouteStrategyRoundRobin {
-		t.Fatalf("expected route strategy to be preserved, got %q", saved.Strategy)
+		t.Fatalf("expected route strategy to remain explicit, got %q", saved.Strategy)
+	}
+	if len(saved.Scenarios) != 0 {
+		t.Fatalf("expected omitted scenarios to be cleared, got %+v", saved.Scenarios)
 	}
 }
 
@@ -618,9 +698,17 @@ func TestDeleteProviderPrunesEmptyRoutesAndGatewayKeyReferences(t *testing.T) {
 			ID:      "provider-1",
 			Name:    "provider",
 			Kind:    model.ProviderKindOpenAICompatible,
-			BaseURL: "https://provider.example",
-			APIKey:  "provider-key",
 			Enabled: true,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-1",
+				BaseURL: "https://provider.example",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-1",
+				APIKey:  "provider-key",
+				Enabled: true,
+			}},
 		}},
 		ModelRoutes: []model.ModelRoute{
 			{
@@ -863,214 +951,6 @@ func TestSyncIntegrationFailureDoesNotPersistSnapshotError(t *testing.T) {
 	saved := fileStore.Snapshot()
 	if saved.Integrations[0].Snapshot.LastError != "keep-me" {
 		t.Fatalf("expected sync failure not to overwrite persisted snapshot error, got %+v", saved.Integrations[0].Snapshot)
-	}
-}
-
-func TestPutStatePreservesExistingRequestHistory(t *testing.T) {
-	t.Parallel()
-
-	fileStore := openTestStore(t, model.State{
-		Version: "2026-04-01",
-		RequestHistory: []model.RequestRecord{{
-			ID:         "req-original",
-			RouteAlias: "gpt-5.4",
-			StartedAt:  time.Date(2026, time.April, 2, 0, 0, 0, 0, time.UTC),
-		}},
-	})
-	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
-
-	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{
-		"version":"2026-04-01",
-		"providers":[],
-		"model_routes":[],
-		"pricing_profiles":[],
-		"integrations":[],
-		"gateway_keys":[],
-		"request_history":[{"id":"req-overwrite","route_alias":"malicious"}]
-	}`))
-	req.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	handlers.PutState(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
-	}
-
-	saved := fileStore.Snapshot()
-	if len(saved.RequestHistory) != 1 {
-		t.Fatalf("expected request history to stay unchanged, got %+v", saved.RequestHistory)
-	}
-	if saved.RequestHistory[0].ID != "req-original" {
-		t.Fatalf("expected existing request history to be preserved, got %+v", saved.RequestHistory)
-	}
-}
-
-func TestPutStatePreservesGatewayKeySecrets(t *testing.T) {
-	t.Parallel()
-
-	hash, err := model.HashGatewaySecret("original-secret-123")
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
-	}
-	fileStore := openTestStore(t, model.State{
-		Version: "2026-04-01",
-		GatewayKeys: []model.GatewayKey{{
-			ID:               "gk-1",
-			Name:             "gateway",
-			SecretHash:       hash,
-			SecretLookupHash: "lookup-hash",
-			SecretPreview:    model.SecretPreview("original-secret-123"),
-			Enabled:          true,
-		}},
-	})
-	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
-
-	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{
-		"version":"2026-04-01",
-		"providers":[],
-		"model_routes":[],
-		"pricing_profiles":[],
-		"integrations":[],
-		"gateway_keys":[{
-			"id":"gk-1",
-			"name":"gateway",
-			"secret_hash":"forged-hash",
-			"secret_lookup_hash":"forged-lookup",
-			"secret_preview":"forged-preview",
-			"enabled":true
-		}],
-		"request_history":[]
-	}`))
-	req.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	handlers.PutState(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
-	}
-
-	saved := fileStore.Snapshot()
-	key, ok := saved.FindGatewayKey("gk-1")
-	if !ok {
-		t.Fatal("expected gateway key to remain")
-	}
-	if key.SecretHash == "" || key.SecretLookupHash == "" {
-		t.Fatalf("expected gateway key secrets to be preserved, got %+v", key)
-	}
-	if key.SecretHash == "forged-hash" || key.SecretLookupHash == "forged-lookup" || key.SecretPreview == "forged-preview" {
-		t.Fatalf("expected compatibility state update to ignore incoming secret-derived fields, got %+v", key)
-	}
-	if !model.VerifyGatewaySecret(key.SecretHash, "original-secret-123") {
-		t.Fatalf("expected preserved secret hash to remain valid")
-	}
-}
-
-func TestPutStateDoesNotBorrowGatewayKeySecretsAcrossDifferentIDs(t *testing.T) {
-	t.Parallel()
-
-	hash, err := model.HashGatewaySecret("original-secret-123")
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
-	}
-	fileStore := openTestStore(t, model.State{
-		Version: "2026-04-01",
-		GatewayKeys: []model.GatewayKey{{
-			ID:               "gk-1",
-			Name:             "gateway",
-			SecretHash:       hash,
-			SecretLookupHash: "lookup-hash",
-			SecretPreview:    model.SecretPreview("original-secret-123"),
-			Enabled:          true,
-		}},
-	})
-	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
-
-	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{
-		"version":"2026-04-01",
-		"providers":[],
-		"model_routes":[],
-		"pricing_profiles":[],
-		"integrations":[],
-		"gateway_keys":[{"id":"gk-2","name":"new-key","enabled":true}],
-		"request_history":[]
-	}`))
-	req.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	handlers.PutState(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
-	}
-
-	saved := fileStore.Snapshot()
-	key, ok := saved.FindGatewayKey("gk-2")
-	if !ok {
-		t.Fatal("expected replacement gateway key to be present")
-	}
-	if key.SecretHash != "" || key.SecretLookupHash != "" || key.SecretPreview != "" {
-		t.Fatalf("expected unmatched gateway key IDs not to inherit existing secrets, got %+v", key)
-	}
-}
-
-func TestPutStateDoesNotBorrowCredentialSecretsAcrossDifferentIDs(t *testing.T) {
-	t.Parallel()
-
-	fileStore := openTestStore(t, model.State{
-		Version: "2026-04-01",
-		Providers: []model.Provider{{
-			ID:      "provider-1",
-			Name:    "provider",
-			Kind:    model.ProviderKindOpenAICompatible,
-			BaseURL: "https://provider.example",
-			APIKey:  "provider-key",
-			Enabled: true,
-			Credentials: []model.ProviderCredential{{
-				ID:      "cred-1",
-				Label:   "primary",
-				APIKey:  "credential-secret",
-				Enabled: true,
-			}},
-		}},
-	})
-	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
-
-	req := httptest.NewRequest(http.MethodPut, "/api/admin/state", strings.NewReader(`{
-		"version":"2026-04-01",
-		"providers":[{
-			"id":"provider-1",
-			"name":"provider",
-			"kind":"openai-compatible",
-			"base_url":"https://provider.example",
-			"enabled":true,
-			"credentials":[{"id":"cred-2","label":"replacement","enabled":true}]
-		}],
-		"model_routes":[],
-		"pricing_profiles":[],
-		"integrations":[],
-		"gateway_keys":[],
-		"request_history":[]
-	}`))
-	req.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	handlers.PutState(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
-	}
-
-	saved := fileStore.Snapshot()
-	provider, ok := saved.FindProvider("provider-1")
-	if !ok {
-		t.Fatal("expected provider to remain")
-	}
-	if len(provider.Credentials) != 1 {
-		t.Fatalf("expected one credential, got %+v", provider.Credentials)
-	}
-	if provider.Credentials[0].ID != "cred-2" {
-		t.Fatalf("expected replacement credential to be kept, got %+v", provider.Credentials[0])
-	}
-	if provider.Credentials[0].APIKey != "" {
-		t.Fatalf("expected unmatched credential IDs not to inherit API keys, got %+v", provider.Credentials[0])
 	}
 }
 
@@ -1327,7 +1207,6 @@ func TestBuildOpenAPISpecCoversAdminRoutes(t *testing.T) {
 
 	paths := buildOpenAPISpec()["paths"].(map[string]any)
 	required := []string{
-		"/api/admin/state",
 		"/api/admin/meta",
 		"/api/admin/integrations/sync",
 		"/api/admin/providers",

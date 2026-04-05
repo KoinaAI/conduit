@@ -318,7 +318,7 @@ func responseInputItemToOpenAIMessages(item map[string]any) ([]map[string]any, e
 		message := map[string]any{"role": role}
 		content := responseMessageContentToOpenAIContent(item["content"])
 		if role == "tool" {
-			message["tool_call_id"] = strings.TrimSpace(firstNonEmptyString(item["tool_call_id"], item["call_id"], item["id"]))
+			message["tool_call_id"] = strings.TrimSpace(stringValue(item["tool_call_id"]))
 			message["content"] = responseContentToText(item["content"])
 			return []map[string]any{message}, nil
 		}
@@ -350,7 +350,7 @@ func responseInputItemToOpenAIMessages(item map[string]any) ([]map[string]any, e
 			"tool_calls": []map[string]any{call},
 		}}, nil
 	case "function_call_output":
-		toolCallID := strings.TrimSpace(firstNonEmptyString(item["call_id"], item["tool_call_id"], item["id"]))
+		toolCallID := strings.TrimSpace(stringValue(item["call_id"]))
 		if toolCallID == "" {
 			return nil, nil
 		}
@@ -448,8 +448,8 @@ func responseMessageToolCalls(value any) []map[string]any {
 }
 
 func responseFunctionCallItem(item map[string]any) (map[string]any, bool) {
-	callID := strings.TrimSpace(firstNonEmptyString(item["call_id"], item["tool_call_id"], item["id"]))
-	name := strings.TrimSpace(firstNonEmptyString(item["name"], item["tool_name"]))
+	callID := strings.TrimSpace(stringValue(item["call_id"]))
+	name := strings.TrimSpace(stringValue(item["name"]))
 	if name == "" {
 		return nil, false
 	}
@@ -457,11 +457,6 @@ func responseFunctionCallItem(item map[string]any) (map[string]any, bool) {
 		callID = model.NewID("toolcall")
 	}
 	arguments := marshalJSONObject(item["arguments"])
-	if strings.TrimSpace(arguments) == "{}" {
-		if parameters, ok := item["parameters"]; ok {
-			arguments = marshalJSONObject(parameters)
-		}
-	}
 	return map[string]any{
 		"id":   callID,
 		"type": "function",
@@ -490,13 +485,6 @@ func normalizeResponsesToolDefinitions(value any) ([]map[string]any, bool) {
 		if !ok {
 			continue
 		}
-		if function, ok := tool["function"].(map[string]any); ok && strings.EqualFold(strings.TrimSpace(stringValue(tool["type"])), "function") {
-			tools = append(tools, map[string]any{
-				"type":     "function",
-				"function": function,
-			})
-			continue
-		}
 		name := strings.TrimSpace(stringValue(tool["name"]))
 		if name == "" {
 			continue
@@ -506,7 +494,7 @@ func normalizeResponsesToolDefinitions(value any) ([]map[string]any, bool) {
 			"function": map[string]any{
 				"name":        name,
 				"description": tool["description"],
-				"parameters":  firstNonNil(tool["parameters"], tool["input_schema"]),
+				"parameters":  tool["parameters"],
 			},
 		})
 	}
@@ -520,9 +508,9 @@ func openAIChatPayloadToAnthropic(payload map[string]any) ([]byte, error) {
 	out := map[string]any{
 		"model": firstNonEmptyString(payload["model"]),
 	}
-	if maxTokens, ok := firstNonNil(payload["max_tokens"], payload["max_output_tokens"]).(float64); ok && maxTokens > 0 {
+	if maxTokens, ok := payload["max_tokens"].(float64); ok && maxTokens > 0 {
 		out["max_tokens"] = int(maxTokens)
-	} else if maxTokens, ok := firstNonNil(payload["max_tokens"], payload["max_output_tokens"]).(int); ok && maxTokens > 0 {
+	} else if maxTokens, ok := payload["max_tokens"].(int); ok && maxTokens > 0 {
 		out["max_tokens"] = maxTokens
 	} else {
 		out["max_tokens"] = 4096
@@ -600,7 +588,7 @@ func openAIChatMessageToAnthropic(message map[string]any) map[string]any {
 }
 
 func openAIChatToolMessageToAnthropic(message map[string]any) map[string]any {
-	toolCallID := strings.TrimSpace(firstNonEmptyString(message["tool_call_id"], message["call_id"], message["id"]))
+	toolCallID := strings.TrimSpace(stringValue(message["tool_call_id"]))
 	if toolCallID == "" {
 		return openAIChatMessageToAnthropic(map[string]any{
 			"role":    "user",
@@ -779,7 +767,7 @@ func openAIChatPayloadToGemini(payload map[string]any) ([]byte, error) {
 
 func openAIChatGenerationConfig(payload map[string]any) map[string]any {
 	config := map[string]any{}
-	if maxTokens := firstNonNil(payload["max_tokens"], payload["max_output_tokens"]); maxTokens != nil {
+	if maxTokens := payload["max_tokens"]; maxTokens != nil {
 		config["maxOutputTokens"] = maxTokens
 	}
 	if temperature, ok := payload["temperature"]; ok {
@@ -822,7 +810,7 @@ func openAIChatMessageToGemini(message map[string]any, toolNames map[string]stri
 }
 
 func openAIChatToolMessageToGemini(message map[string]any, toolNames map[string]string) map[string]any {
-	callID := strings.TrimSpace(firstNonEmptyString(message["tool_call_id"], message["call_id"], message["id"]))
+	callID := strings.TrimSpace(stringValue(message["tool_call_id"]))
 	if callID == "" {
 		return openAIChatMessageToGemini(map[string]any{
 			"role":    "user",
@@ -1111,13 +1099,6 @@ func geminiToOpenAIChat(rawBody []byte, upstreamModel string, stream bool) ([]by
 	messages := make([]map[string]any, 0, 8)
 	tracker := newGeminiToolCallTracker()
 	if systemInstruction, ok := payload["systemInstruction"].(map[string]any); ok {
-		if text := flattenGeminiParts(systemInstruction["parts"]); text != "" {
-			messages = append(messages, map[string]any{
-				"role":    "system",
-				"content": text,
-			})
-		}
-	} else if systemInstruction, ok := payload["system_instruction"].(map[string]any); ok {
 		if text := flattenGeminiParts(systemInstruction["parts"]); text != "" {
 			messages = append(messages, map[string]any{
 				"role":    "system",

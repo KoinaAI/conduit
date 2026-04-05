@@ -65,8 +65,6 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", a.Healthz)
 
 	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("GET /api/admin/state", a.admin.GetState)
-	adminMux.HandleFunc("PUT /api/admin/state", a.admin.PutState)
 	adminMux.HandleFunc("POST /api/admin/integrations/sync", a.admin.SyncAllIntegrations)
 	adminMux.HandleFunc("GET /api/admin/providers", a.admin.ListProviders)
 	adminMux.HandleFunc("POST /api/admin/providers", a.admin.CreateProvider)
@@ -277,9 +275,7 @@ func gatewayAllowedHeaders() string {
 		"Content-Type",
 		"X-API-Key",
 		"X-Session-ID",
-		"Session-ID",
 		"X-Routing-Scenario",
-		"Routing-Scenario",
 		"X-Codex-Turn-State",
 		"X-Codex-Turn-Metadata",
 		"X-Codex-Parent-Thread-Id",

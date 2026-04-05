@@ -86,29 +86,18 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 		return model.GatewayKey{}, errAuthLocked
 	}
 	lookupHash := model.GatewaySecretLookupHash(secret, s.cfg.SecretLookupPepper())
-	legacyLookupHash := model.LegacyGatewaySecretLookupHash(secret)
 	fastCandidates := make([]model.GatewayKey, 0, 1)
-	legacyLookupCandidates := make([]model.GatewayKey, 0, 1)
-	legacyCandidates := make([]model.GatewayKey, 0, len(state.GatewayKeys))
 
 	for _, key := range state.GatewayKeys {
 		if !key.Enabled || key.IsExpired(now) {
 			continue
 		}
-		if key.SecretLookupHash == "" {
-			legacyCandidates = append(legacyCandidates, key)
-			continue
-		}
 		if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(lookupHash)) == 1 {
 			fastCandidates = append(fastCandidates, key)
-			continue
-		}
-		if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(legacyLookupHash)) == 1 {
-			legacyLookupCandidates = append(legacyLookupCandidates, key)
 		}
 	}
 
-	candidateFingerprint := gatewayAuthCandidateFingerprint(fastCandidates, legacyLookupCandidates, legacyCandidates)
+	candidateFingerprint := gatewayAuthCandidateFingerprint(fastCandidates)
 	if s.runtime.invalidGatewayLookupCached(lookupHash, candidateFingerprint, now) {
 		s.runtime.recordGatewayAuthFailure(source, lookupHash, candidateFingerprint, now)
 		slog.Warn("gateway authentication failed",
@@ -120,7 +109,7 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 		return model.GatewayKey{}, errUnauthorized
 	}
 
-	key, ok := findGatewayKeyMatch(secret, fastCandidates, legacyLookupCandidates, legacyCandidates)
+	key, ok := findGatewayKeyMatch(secret, fastCandidates)
 	if !ok {
 		s.runtime.recordGatewayAuthFailure(source, lookupHash, candidateFingerprint, now)
 		slog.Warn("gateway authentication failed",

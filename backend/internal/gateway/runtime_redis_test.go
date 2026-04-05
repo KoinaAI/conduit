@@ -152,6 +152,38 @@ func TestRedisGatewayKeyWindowsAreSharedAcrossRuntimeInstances(t *testing.T) {
 	}
 }
 
+func TestRedisProviderWindowsAreSharedAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	now := time.Now().UTC()
+	provider := model.Provider{
+		ID:              "provider-1",
+		RateLimitRPM:    2,
+		MaxConcurrency:  1,
+		HourlyBudgetUSD: 1,
+	}
+
+	if err := runtimeA.acquireProvider(provider, now); err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	if err := runtimeB.acquireProvider(provider, now); err != errProviderConcurrencyLimit {
+		t.Fatalf("expected shared provider concurrency limit, got %v", err)
+	}
+	runtimeA.releaseProvider(provider.ID, 1)
+
+	if err := runtimeB.acquireProvider(provider, now); err != errProviderHourlyBudget {
+		t.Fatalf("expected shared provider hourly budget limit, got %v", err)
+	}
+}
+
 func TestRedisGatewayAuthStateIsSharedAcrossRuntimeInstances(t *testing.T) {
 	t.Parallel()
 

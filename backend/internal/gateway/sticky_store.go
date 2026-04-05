@@ -30,6 +30,11 @@ type gatewayKeyRuntimeStore interface {
 	ReleaseGatewayKey(keyID string, costUSD float64, now time.Time) error
 }
 
+type providerRuntimeStore interface {
+	AcquireProvider(provider model.Provider, now time.Time) error
+	ReleaseProvider(providerID string, costUSD float64, now time.Time) error
+}
+
 type gatewayAuthRuntimeStore interface {
 	GatewayAuthSourceLocked(source string, now time.Time) (bool, error)
 	InvalidGatewayLookupCached(lookupHash, candidateFingerprint string, now time.Time) (bool, error)

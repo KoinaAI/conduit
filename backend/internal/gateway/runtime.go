@@ -700,6 +700,20 @@ func (r *runtimeState) deleteRemoteStickyBinding(key string) {
 }
 
 func (r *runtimeState) acquireProvider(provider model.Provider, now time.Time) error {
+	if store, ok := r.stickyStore.(providerRuntimeStore); ok && store != nil {
+		err := store.AcquireProvider(provider, now)
+		if err == nil ||
+			errors.Is(err, errProviderRateLimit) ||
+			errors.Is(err, errProviderConcurrencyLimit) ||
+			errors.Is(err, errProviderHourlyBudget) ||
+			errors.Is(err, errProviderDailyBudget) ||
+			errors.Is(err, errProviderWeeklyBudget) ||
+			errors.Is(err, errProviderMonthlyBudget) {
+			return err
+		}
+		slog.Warn("provider runtime cache acquire failed", "provider_id", provider.ID, "error", err)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -743,6 +757,13 @@ func (r *runtimeState) acquireProvider(provider model.Provider, now time.Time) e
 
 func (r *runtimeState) releaseProvider(providerID string, costUSD float64) {
 	now := time.Now().UTC()
+	if store, ok := r.stickyStore.(providerRuntimeStore); ok && store != nil {
+		if err := store.ReleaseProvider(providerID, costUSD, now); err != nil {
+			slog.Warn("provider runtime cache release failed", "provider_id", providerID, "error", err)
+		} else {
+			return
+		}
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()

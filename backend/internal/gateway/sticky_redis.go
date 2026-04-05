@@ -354,6 +354,74 @@ func (s *redisStickyStore) ReleaseGatewayKey(keyID string, costUSD float64, now 
 	return nil
 }
 
+func (s *redisStickyStore) AcquireProvider(provider model.Provider, now time.Time) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	if err := s.enforceProviderBudgets(ctx, provider, now); err != nil {
+		return err
+	}
+
+	rateKey := ""
+	if provider.RateLimitRPM > 0 {
+		rateKey = s.providerRateKey(provider.ID, now)
+		count, err := s.client.Incr(ctx, rateKey).Result()
+		if err != nil {
+			return err
+		}
+		_ = s.client.Expire(ctx, rateKey, 2*time.Minute).Err()
+		if count > int64(provider.RateLimitRPM) {
+			_, _ = s.client.Decr(ctx, rateKey).Result()
+			return errProviderRateLimit
+		}
+	}
+
+	if provider.MaxConcurrency > 0 {
+		inflightKey := s.providerInFlightKey(provider.ID)
+		count, err := s.client.Incr(ctx, inflightKey).Result()
+		if err != nil {
+			if rateKey != "" {
+				_, _ = s.client.Decr(ctx, rateKey).Result()
+			}
+			return err
+		}
+		_ = s.client.Expire(ctx, inflightKey, time.Hour).Err()
+		if count > int64(provider.MaxConcurrency) {
+			_, _ = s.client.Decr(ctx, inflightKey).Result()
+			if rateKey != "" {
+				_, _ = s.client.Decr(ctx, rateKey).Result()
+			}
+			return errProviderConcurrencyLimit
+		}
+	}
+
+	return nil
+}
+
+func (s *redisStickyStore) ReleaseProvider(providerID string, costUSD float64, now time.Time) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	if strings.TrimSpace(providerID) == "" {
+		return nil
+	}
+	if _, err := s.client.Decr(ctx, s.providerInFlightKey(providerID)).Result(); err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+	if costUSD <= 0 {
+		return nil
+	}
+	member := s.gatewaySpendMember(now, costUSD)
+	if err := s.client.ZAdd(ctx, s.providerSpendKey(providerID), redis.Z{
+		Score:  float64(now.UTC().UnixMilli()),
+		Member: member,
+	}).Err(); err != nil {
+		return err
+	}
+	_ = s.client.Expire(ctx, s.providerSpendKey(providerID), 31*24*time.Hour).Err()
+	return nil
+}
+
 func (s *redisStickyStore) GatewayAuthSourceLocked(source string, _ time.Time) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
@@ -440,6 +508,10 @@ func (s *redisStickyStore) gatewayRateKey(keyID string, now time.Time) string {
 	return s.prefixedKey("gateway:rate", strings.TrimSpace(keyID), strconv.FormatInt(now.UTC().Truncate(time.Minute).Unix(), 10))
 }
 
+func (s *redisStickyStore) providerRateKey(providerID string, now time.Time) string {
+	return s.prefixedKey("provider:rate", strings.TrimSpace(providerID), strconv.FormatInt(now.UTC().Truncate(time.Minute).Unix(), 10))
+}
+
 func (s *redisStickyStore) endpointCircuitKey(candidate resolvedCandidate) string {
 	return s.prefixedKey("endpoint:circuit", endpointRuntimeKey(candidate))
 }
@@ -448,8 +520,16 @@ func (s *redisStickyStore) gatewayInFlightKey(keyID string) string {
 	return s.prefixedKey("gateway:inflight", strings.TrimSpace(keyID))
 }
 
+func (s *redisStickyStore) providerInFlightKey(providerID string) string {
+	return s.prefixedKey("provider:inflight", strings.TrimSpace(providerID))
+}
+
 func (s *redisStickyStore) gatewaySpendKey(keyID string) string {
 	return s.prefixedKey("gateway:spend", strings.TrimSpace(keyID))
+}
+
+func (s *redisStickyStore) providerSpendKey(providerID string) string {
+	return s.prefixedKey("provider:spend", strings.TrimSpace(providerID))
 }
 
 func (s *redisStickyStore) gatewaySpendMember(now time.Time, costUSD float64) string {
@@ -530,6 +610,57 @@ func (s *redisStickyStore) enforceGatewayBudgets(ctx context.Context, key model.
 		return errWeeklyBudget
 	case key.MonthlyBudgetUSD > 0 && monthlyCost >= key.MonthlyBudgetUSD:
 		return errMonthlyBudget
+	default:
+		return nil
+	}
+}
+
+func (s *redisStickyStore) enforceProviderBudgets(ctx context.Context, provider model.Provider, now time.Time) error {
+	if provider.HourlyBudgetUSD <= 0 && provider.DailyBudgetUSD <= 0 && provider.WeeklyBudgetUSD <= 0 && provider.MonthlyBudgetUSD <= 0 {
+		return nil
+	}
+	spendKey := s.providerSpendKey(provider.ID)
+	cutoff := strconv.FormatInt(now.Add(-30*24*time.Hour).UTC().UnixMilli(), 10)
+	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", cutoff).Err(); err != nil {
+		return err
+	}
+	entries, err := s.client.ZRangeByScoreWithScores(ctx, spendKey, &redis.ZRangeBy{
+		Min: cutoff,
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return err
+	}
+	var hourlyCost, dailyCost, weeklyCost, monthlyCost float64
+	for _, entry := range entries {
+		recordedAt := time.UnixMilli(int64(entry.Score)).UTC()
+		cost, ok := parseGatewaySpendMember(entry.Member)
+		if !ok {
+			continue
+		}
+		age := now.Sub(recordedAt)
+		if age <= time.Hour {
+			hourlyCost += cost
+		}
+		if age <= 24*time.Hour {
+			dailyCost += cost
+		}
+		if age <= 7*24*time.Hour {
+			weeklyCost += cost
+		}
+		if age <= 30*24*time.Hour {
+			monthlyCost += cost
+		}
+	}
+	switch {
+	case provider.HourlyBudgetUSD > 0 && hourlyCost >= provider.HourlyBudgetUSD:
+		return errProviderHourlyBudget
+	case provider.DailyBudgetUSD > 0 && dailyCost >= provider.DailyBudgetUSD:
+		return errProviderDailyBudget
+	case provider.WeeklyBudgetUSD > 0 && weeklyCost >= provider.WeeklyBudgetUSD:
+		return errProviderWeeklyBudget
+	case provider.MonthlyBudgetUSD > 0 && monthlyCost >= provider.MonthlyBudgetUSD:
+		return errProviderMonthlyBudget
 	default:
 		return nil
 	}

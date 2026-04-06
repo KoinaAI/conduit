@@ -255,6 +255,46 @@ func TestRedisProviderUsageListingReflectsSharedRuntimeWindows(t *testing.T) {
 	}
 }
 
+func TestRedisInflightHeartbeatKeepsDistributedConcurrencyAlive(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	now := time.Now().UTC()
+	gatewayKey := model.GatewayKey{
+		ID:             "gk-1",
+		MaxConcurrency: 1,
+	}
+	provider := model.Provider{
+		ID:             "provider-1",
+		MaxConcurrency: 1,
+	}
+
+	if err := runtimeA.acquireGatewayKey(gatewayKey, now); err != nil {
+		t.Fatalf("acquire gateway key: %v", err)
+	}
+	if err := runtimeA.acquireProvider(provider, now); err != nil {
+		t.Fatalf("acquire provider: %v", err)
+	}
+
+	redisServer.FastForward(59 * time.Minute)
+	runtimeA.touchInFlightLeases(gatewayKey.ID, provider.ID, time.Hour)
+	redisServer.FastForward(59 * time.Minute)
+
+	if err := runtimeB.acquireGatewayKey(gatewayKey, now); err != errConcurrencyLimit {
+		t.Fatalf("expected gateway key concurrency to remain enforced after heartbeat, got %v", err)
+	}
+	if err := runtimeB.acquireProvider(provider, now); err != errProviderConcurrencyLimit {
+		t.Fatalf("expected provider concurrency to remain enforced after heartbeat, got %v", err)
+	}
+}
+
 func TestRedisGatewayAuthStateIsSharedAcrossRuntimeInstances(t *testing.T) {
 	t.Parallel()
 

@@ -193,8 +193,11 @@ func (s *Service) Close() error {
 }
 
 func (s *Service) trackRuntimeSession(session LiveSessionStatus) func() {
-	key := s.runtime.startSession(session, defaultRuntimeSessionTTL)
-	if key == "" {
+	key := ""
+	if strings.TrimSpace(session.SessionID) != "" {
+		key = s.runtime.startSession(session, defaultRuntimeSessionTTL)
+	}
+	if key == "" && strings.TrimSpace(session.GatewayKeyID) == "" && strings.TrimSpace(session.ProviderID) == "" {
 		return func() {}
 	}
 	stop := make(chan struct{})
@@ -211,7 +214,11 @@ func (s *Service) trackRuntimeSession(session LiveSessionStatus) func() {
 		for {
 			select {
 			case <-ticker.C:
-				s.runtime.touchSession(key, time.Now().UTC(), defaultRuntimeSessionTTL)
+				now := time.Now().UTC()
+				if key != "" {
+					s.runtime.touchSession(key, now, defaultRuntimeSessionTTL)
+				}
+				s.runtime.touchInFlightLeases(session.GatewayKeyID, session.ProviderID, time.Hour)
 			case <-stop:
 				return
 			}
@@ -221,7 +228,9 @@ func (s *Service) trackRuntimeSession(session LiveSessionStatus) func() {
 	return func() {
 		once.Do(func() {
 			close(stop)
-			s.runtime.endSession(key)
+			if key != "" {
+				s.runtime.endSession(key)
+			}
 		})
 	}
 }

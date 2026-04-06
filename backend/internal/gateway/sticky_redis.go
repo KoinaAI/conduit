@@ -418,6 +418,15 @@ func (s *redisStickyStore) ReleaseGatewayKey(keyID string, costUSD float64, now 
 	return nil
 }
 
+func (s *redisStickyStore) TouchGatewayKeyInFlight(keyID string, ttl time.Duration) error {
+	if strings.TrimSpace(keyID) == "" || ttl <= 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Expire(ctx, s.gatewayInFlightKey(keyID), ttl).Err()
+}
+
 func (s *redisStickyStore) AcquireProvider(provider model.Provider, now time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
@@ -482,6 +491,15 @@ func (s *redisStickyStore) ReleaseProvider(providerID string, costUSD float64, n
 	}
 	_ = s.client.Expire(ctx, s.providerSpendKey(providerID), 31*24*time.Hour).Err()
 	return nil
+}
+
+func (s *redisStickyStore) TouchProviderInFlight(providerID string, ttl time.Duration) error {
+	if strings.TrimSpace(providerID) == "" || ttl <= 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Expire(ctx, s.providerInFlightKey(providerID), ttl).Err()
 }
 
 func (s *redisStickyStore) LoadProviderRuntime(provider model.Provider, now time.Time) (ProviderRuntimeStatus, bool, error) {

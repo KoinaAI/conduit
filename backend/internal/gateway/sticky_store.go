@@ -33,12 +33,14 @@ type roundRobinCounterStore interface {
 type gatewayKeyRuntimeStore interface {
 	AcquireGatewayKey(key model.GatewayKey, now time.Time) error
 	ReleaseGatewayKey(keyID string, costUSD float64, now time.Time) error
+	TouchGatewayKeyInFlight(keyID string, ttl time.Duration) error
 }
 
 type providerRuntimeStore interface {
 	AcquireProvider(provider model.Provider, now time.Time) error
 	ReleaseProvider(providerID string, costUSD float64, now time.Time) error
 	LoadProviderRuntime(provider model.Provider, now time.Time) (ProviderRuntimeStatus, bool, error)
+	TouchProviderInFlight(providerID string, ttl time.Duration) error
 }
 
 type sessionRuntimeStore interface {

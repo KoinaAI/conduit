@@ -934,6 +934,22 @@ func (r *runtimeState) touchSession(requestID string, now time.Time, ttl time.Du
 	}
 }
 
+func (r *runtimeState) touchInFlightLeases(gatewayKeyID, providerID string, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	if store, ok := r.stickyStore.(gatewayKeyRuntimeStore); ok && store != nil && strings.TrimSpace(gatewayKeyID) != "" {
+		if err := store.TouchGatewayKeyInFlight(gatewayKeyID, ttl); err != nil {
+			slog.Warn("gateway key inflight heartbeat failed", "gateway_key_id", gatewayKeyID, "error", err)
+		}
+	}
+	if store, ok := r.stickyStore.(providerRuntimeStore); ok && store != nil && strings.TrimSpace(providerID) != "" {
+		if err := store.TouchProviderInFlight(providerID, ttl); err != nil {
+			slog.Warn("provider inflight heartbeat failed", "provider_id", providerID, "error", err)
+		}
+	}
+}
+
 func (r *runtimeState) endSession(requestID string) {
 	requestID = strings.TrimSpace(requestID)
 	if requestID == "" {

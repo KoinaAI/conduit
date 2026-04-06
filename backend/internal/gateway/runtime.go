@@ -236,6 +236,11 @@ func (r *runtimeState) localProviderUsage(provider model.Provider, now time.Time
 		r.mu.Unlock()
 		return ProviderRuntimeStatus{}, false
 	}
+	minuteBucket := now.UTC().Truncate(time.Minute)
+	if window.MinuteBucket.IsZero() || !window.MinuteBucket.Equal(minuteBucket) {
+		window.MinuteBucket = minuteBucket
+		window.RequestCount = 0
+	}
 	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
 	hourlyCost, dailyCost, weeklyCost, monthlyCost := gatewaySpendTotals(window.SpendEvents, now)
 	status := ProviderRuntimeStatus{

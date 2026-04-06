@@ -251,6 +251,35 @@ func TestReleaseProviderAppendsRollingSpendEvent(t *testing.T) {
 	}
 }
 
+func TestLocalProviderUsageResetsStaleMinuteBucketOnRead(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	now := time.Date(2026, time.April, 6, 12, 5, 30, 0, time.UTC)
+	provider := model.Provider{
+		ID:   "provider-1",
+		Name: "Provider One",
+	}
+	runtime.providerWindows[provider.ID] = &gatewayKeyWindow{
+		MinuteBucket: now.Add(-time.Minute).Truncate(time.Minute),
+		RequestCount: 7,
+	}
+
+	status, active := runtime.localProviderUsage(provider, now)
+	if active {
+		t.Fatalf("expected stale minute-only usage to be inactive, got %+v", status)
+	}
+	if status.CurrentMinuteRequests != 0 {
+		t.Fatalf("expected stale minute bucket to reset request count, got %+v", status)
+	}
+	if !status.MinuteBucketStartedAt.Equal(now.Truncate(time.Minute)) {
+		t.Fatalf("expected minute bucket to advance to current minute, got %+v", status)
+	}
+	if runtime.providerWindows[provider.ID].RequestCount != 0 {
+		t.Fatalf("expected runtime window request count to be reset, got %+v", runtime.providerWindows[provider.ID])
+	}
+}
+
 func TestRuntimeReadPathsDoNotAllocateState(t *testing.T) {
 	t.Parallel()
 

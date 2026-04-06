@@ -275,9 +275,6 @@ func (s *redisStickyStore) AcquireEndpoint(candidate resolvedCandidate, now time
 }
 
 func (s *redisStickyStore) ReportEndpointSuccess(candidate resolvedCandidate, now time.Time, halfOpen bool) error {
-	if !candidate.provider.CircuitBreaker.IsEnabled() {
-		return nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
 
@@ -321,10 +318,6 @@ func (s *redisStickyStore) ReportEndpointSuccess(candidate resolvedCandidate, no
 }
 
 func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, now time.Time, statusCode int, errMessage string, halfOpen bool) error {
-	if !candidate.provider.CircuitBreaker.IsEnabled() {
-		return nil
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
 
@@ -335,14 +328,14 @@ func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, no
 			if err != nil {
 				return err
 			}
-			if halfOpen {
+			if halfOpen && candidate.provider.CircuitBreaker.IsEnabled() {
 				state.Failures = max(candidate.provider.CircuitBreaker.FailureThreshold, 1)
 				state.HalfOpenInFlight = 0
 				state.OpenUntilUnixMS = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second).UTC().UnixMilli()
 			} else {
 				state.Failures++
 				state.HalfOpenInFlight = 0
-				if state.Failures >= candidate.provider.CircuitBreaker.FailureThreshold {
+				if candidate.provider.CircuitBreaker.IsEnabled() && state.Failures >= candidate.provider.CircuitBreaker.FailureThreshold {
 					state.OpenUntilUnixMS = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second).UTC().UnixMilli()
 				}
 			}

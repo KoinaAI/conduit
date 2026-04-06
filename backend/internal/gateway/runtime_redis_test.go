@@ -455,3 +455,41 @@ func TestRedisCircuitStatusPreservesDiagnosticsAcrossRuntimeInstances(t *testing
 		t.Fatalf("expected success diagnostics to replicate, got %+v", recovered)
 	}
 }
+
+func TestRedisCircuitStatusPersistsDiagnosticsWhenCircuitBreakerDisabled(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	candidate := resolvedCandidate{
+		provider:   model.Provider{ID: "provider-1"},
+		endpoint:   model.ProviderEndpoint{ID: "endpoint-1"},
+		credential: model.ProviderCredential{ID: "credential-1", APIKey: "provider-key"},
+	}
+
+	runtimeA.reportFailure(candidate, 503, "transient", 0, false)
+
+	failed, ok := runtimeB.endpointStatus(candidate, time.Now().UTC())
+	if !ok {
+		t.Fatal("expected runtime diagnostics to persist even when circuit breaker is disabled")
+	}
+	if failed.LastStatusCode != 503 || failed.LastError != "transient" || failed.LastCheckedAt.IsZero() {
+		t.Fatalf("expected disabled-circuit diagnostics to replicate, got %+v", failed)
+	}
+
+	runtimeA.reportSuccess(candidate, 3*time.Millisecond, false)
+
+	recovered, ok := runtimeB.endpointStatus(candidate, time.Now().UTC())
+	if !ok {
+		t.Fatal("expected success diagnostics to remain queryable when circuit breaker is disabled")
+	}
+	if recovered.ConsecutiveFailures != 0 || recovered.LastStatusCode != 200 || recovered.LastError != "" || recovered.LastCheckedAt.IsZero() {
+		t.Fatalf("expected disabled-circuit success diagnostics to replicate, got %+v", recovered)
+	}
+}

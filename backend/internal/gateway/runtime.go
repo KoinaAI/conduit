@@ -1369,6 +1369,7 @@ func (r *runtimeState) nextRoundRobinOffset(key string, size int) int {
 }
 
 func (r *runtimeState) sweepRuntimeStateLocked(now time.Time) {
+	currentMinute := now.UTC().Truncate(time.Minute)
 	for key, state := range r.endpoints {
 		if state == nil {
 			delete(r.endpoints, key)
@@ -1398,6 +1399,31 @@ func (r *runtimeState) sweepRuntimeStateLocked(now time.Time) {
 		}
 		delete(r.credentials, key)
 	}
+	for key, window := range r.providerWindows {
+		if gatewayWindowSweep(window, currentMinute, now) {
+			delete(r.providerWindows, key)
+		}
+	}
+	for key, window := range r.keyWindows {
+		if gatewayWindowSweep(window, currentMinute, now) {
+			delete(r.keyWindows, key)
+		}
+	}
+}
+
+func gatewayWindowSweep(window *gatewayKeyWindow, currentMinute, now time.Time) bool {
+	if window == nil {
+		return true
+	}
+	if window.InFlight > 0 {
+		return false
+	}
+	if window.MinuteBucket.IsZero() || !window.MinuteBucket.Equal(currentMinute) {
+		window.MinuteBucket = currentMinute
+		window.RequestCount = 0
+	}
+	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
+	return window.RequestCount == 0 && len(window.SpendEvents) == 0
 }
 
 func (r *runtimeState) endpointOpenLocked(candidate resolvedCandidate, now time.Time) bool {

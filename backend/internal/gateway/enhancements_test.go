@@ -338,6 +338,48 @@ func TestRuntimeSweepRemovesStaleEndpointAndCredentialState(t *testing.T) {
 	}
 }
 
+func TestRuntimeSweepRemovesIdleGatewayAndProviderWindows(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	now := time.Now().UTC().Truncate(time.Minute)
+	runtime.providerWindows["stale-provider"] = &gatewayKeyWindow{
+		MinuteBucket: now.Add(-time.Minute),
+		RequestCount: 4,
+	}
+	runtime.keyWindows["stale-key"] = &gatewayKeyWindow{
+		MinuteBucket: now.Add(-time.Minute),
+		RequestCount: 3,
+	}
+	runtime.providerWindows["active-provider"] = &gatewayKeyWindow{
+		MinuteBucket: now,
+		InFlight:     1,
+	}
+	runtime.keyWindows["budget-key"] = &gatewayKeyWindow{
+		MinuteBucket: now.Add(-time.Minute),
+		SpendEvents: []gatewaySpendEvent{
+			{At: now.Add(-time.Hour), CostUSD: 1},
+		},
+	}
+
+	runtime.mu.Lock()
+	runtime.sweepRuntimeStateLocked(now)
+	runtime.mu.Unlock()
+
+	if _, ok := runtime.providerWindows["stale-provider"]; ok {
+		t.Fatalf("expected idle stale provider window to be swept, got %+v", runtime.providerWindows)
+	}
+	if _, ok := runtime.keyWindows["stale-key"]; ok {
+		t.Fatalf("expected idle stale gateway key window to be swept, got %+v", runtime.keyWindows)
+	}
+	if _, ok := runtime.providerWindows["active-provider"]; !ok {
+		t.Fatalf("expected inflight provider window to be retained, got %+v", runtime.providerWindows)
+	}
+	if _, ok := runtime.keyWindows["budget-key"]; !ok {
+		t.Fatalf("expected gateway key window with recent spend to be retained, got %+v", runtime.keyWindows)
+	}
+}
+
 func TestBuildCandidatePlanWeightedRoutingPrefersHeaviestCredential(t *testing.T) {
 	t.Parallel()
 

@@ -221,6 +221,34 @@ func TestRedisProviderWindowsAreSharedAcrossRuntimeInstances(t *testing.T) {
 	}
 }
 
+func TestRedisGatewayMonthlyBudgetKeepsBoundarySpendEvent(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	recordedAt := time.Date(2026, time.April, 6, 12, 0, 0, 0, time.UTC)
+	now := recordedAt.Add(30 * 24 * time.Hour)
+	key := model.GatewayKey{
+		ID:               "gk-boundary",
+		MonthlyBudgetUSD: 1,
+	}
+
+	if err := runtimeA.acquireGatewayKey(key, recordedAt); err != nil {
+		t.Fatalf("acquire gateway key at boundary seed time: %v", err)
+	}
+	runtimeA.releaseGatewayKey(key.ID, 1)
+
+	if err := runtimeB.acquireGatewayKey(key, now); err != errMonthlyBudget {
+		t.Fatalf("expected exact 30-day spend event to remain in monthly budget window, got %v", err)
+	}
+}
+
 func TestRedisProviderUsageListingReflectsSharedRuntimeWindows(t *testing.T) {
 	t.Parallel()
 
@@ -252,6 +280,41 @@ func TestRedisProviderUsageListingReflectsSharedRuntimeWindows(t *testing.T) {
 	items = runtimeB.ProviderUsage(state, now, 10)
 	if len(items) != 1 || items[0].InFlight != 0 || items[0].HourlyCostUSD != 1.5 {
 		t.Fatalf("expected shared provider usage after release, got %+v", items)
+	}
+}
+
+func TestRedisProviderMonthlyWindowKeepsBoundarySpendEvent(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	recordedAt := time.Date(2026, time.April, 6, 12, 0, 0, 0, time.UTC)
+	now := recordedAt.Add(30 * 24 * time.Hour)
+	provider := model.Provider{
+		ID:               "provider-boundary",
+		Name:             "Provider Boundary",
+		MonthlyBudgetUSD: 1,
+	}
+	state := model.RoutingState{Providers: []model.Provider{provider}}
+
+	if err := runtimeA.acquireProvider(provider, recordedAt); err != nil {
+		t.Fatalf("acquire provider at boundary seed time: %v", err)
+	}
+	runtimeA.releaseProvider(provider.ID, 1)
+
+	if err := runtimeB.acquireProvider(provider, now); err != errProviderMonthlyBudget {
+		t.Fatalf("expected exact 30-day spend event to remain in provider monthly budget window, got %v", err)
+	}
+
+	items := runtimeB.ProviderUsage(state, now, 10)
+	if len(items) != 1 || items[0].MonthlyCostUSD != 1 {
+		t.Fatalf("expected provider runtime usage to retain exact 30-day spend event, got %+v", items)
 	}
 }
 

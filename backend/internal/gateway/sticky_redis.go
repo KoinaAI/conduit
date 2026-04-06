@@ -563,7 +563,7 @@ func (s *redisStickyStore) LoadProviderRuntime(provider model.Provider, now time
 
 	spendKey := s.providerSpendKey(provider.ID)
 	cutoff := strconv.FormatInt(now.Add(-30*24*time.Hour).UTC().UnixMilli(), 10)
-	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", cutoff).Err(); err != nil {
+	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", redisExclusiveUpperBound(cutoff)).Err(); err != nil {
 		return ProviderRuntimeStatus{}, false, err
 	}
 	entries, err := s.client.ZRangeByScoreWithScores(ctx, spendKey, &redis.ZRangeBy{
@@ -776,7 +776,7 @@ func (s *redisStickyStore) enforceGatewayBudgets(ctx context.Context, key model.
 	}
 	spendKey := s.gatewaySpendKey(key.ID)
 	cutoff := strconv.FormatInt(now.Add(-30*24*time.Hour).UTC().UnixMilli(), 10)
-	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", cutoff).Err(); err != nil {
+	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", redisExclusiveUpperBound(cutoff)).Err(); err != nil {
 		return err
 	}
 	entries, err := s.client.ZRangeByScoreWithScores(ctx, spendKey, &redis.ZRangeBy{
@@ -827,7 +827,7 @@ func (s *redisStickyStore) enforceProviderBudgets(ctx context.Context, provider 
 	}
 	spendKey := s.providerSpendKey(provider.ID)
 	cutoff := strconv.FormatInt(now.Add(-30*24*time.Hour).UTC().UnixMilli(), 10)
-	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", cutoff).Err(); err != nil {
+	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", redisExclusiveUpperBound(cutoff)).Err(); err != nil {
 		return err
 	}
 	entries, err := s.client.ZRangeByScoreWithScores(ctx, spendKey, &redis.ZRangeBy{
@@ -932,6 +932,10 @@ func parseRedisInt(value string) int {
 func parseRedisInt64(value string) int64 {
 	number, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	return number
+}
+
+func redisExclusiveUpperBound(value string) string {
+	return "(" + strings.TrimSpace(value)
 }
 
 func (s *redisStickyStore) Close() error {

@@ -27,6 +27,9 @@ type redisEndpointCircuitState struct {
 	Failures         int
 	OpenUntilUnixMS  int64
 	HalfOpenInFlight int
+	LastStatusCode   int
+	LastError        string
+	LastCheckedAtMS  int64
 }
 
 func newRedisStickyStore(cfg config.Config) stickyBindingStore {
@@ -250,6 +253,9 @@ func (s *redisStickyStore) AcquireEndpoint(candidate resolvedCandidate, now time
 					"failures":           state.Failures,
 					"open_until_unixms":  state.OpenUntilUnixMS,
 					"half_open_inflight": state.HalfOpenInFlight,
+					"last_status_code":   state.LastStatusCode,
+					"last_error":         state.LastError,
+					"last_checked_atms":  state.LastCheckedAtMS,
 				}
 				pipe.HSet(ctx, key, fields)
 				pipe.Expire(ctx, key, redisEndpointRuntimeTTL)
@@ -274,10 +280,47 @@ func (s *redisStickyStore) ReportEndpointSuccess(candidate resolvedCandidate, no
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
-	return s.client.Del(ctx, s.endpointCircuitKey(candidate)).Err()
+
+	key := s.endpointCircuitKey(candidate)
+	for attempt := 0; attempt < 3; attempt++ {
+		err := s.client.Watch(ctx, func(tx *redis.Tx) error {
+			state, err := s.loadEndpointCircuitState(ctx, key)
+			if err != nil {
+				return err
+			}
+			if halfOpen && state.HalfOpenInFlight > 0 {
+				state.HalfOpenInFlight--
+			}
+			state.Failures = 0
+			state.OpenUntilUnixMS = 0
+			state.HalfOpenInFlight = 0
+			state.LastStatusCode = 200
+			state.LastError = ""
+			state.LastCheckedAtMS = now.UTC().UnixMilli()
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				fields := map[string]any{
+					"failures":           state.Failures,
+					"open_until_unixms":  state.OpenUntilUnixMS,
+					"half_open_inflight": state.HalfOpenInFlight,
+					"last_status_code":   state.LastStatusCode,
+					"last_error":         state.LastError,
+					"last_checked_atms":  state.LastCheckedAtMS,
+				}
+				pipe.HSet(ctx, key, fields)
+				pipe.Expire(ctx, key, redisEndpointRuntimeTTL)
+				return nil
+			})
+			return err
+		}, key)
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		return err
+	}
+	return redis.TxFailedErr
 }
 
-func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, now time.Time, halfOpen bool) error {
+func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, now time.Time, statusCode int, errMessage string, halfOpen bool) error {
 	if !candidate.provider.CircuitBreaker.IsEnabled() {
 		return nil
 	}
@@ -303,11 +346,17 @@ func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, no
 					state.OpenUntilUnixMS = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second).UTC().UnixMilli()
 				}
 			}
+			state.LastStatusCode = statusCode
+			state.LastError = strings.TrimSpace(errMessage)
+			state.LastCheckedAtMS = now.UTC().UnixMilli()
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				fields := map[string]any{
 					"failures":           state.Failures,
 					"open_until_unixms":  state.OpenUntilUnixMS,
 					"half_open_inflight": state.HalfOpenInFlight,
+					"last_status_code":   state.LastStatusCode,
+					"last_error":         state.LastError,
+					"last_checked_atms":  state.LastCheckedAtMS,
 				}
 				pipe.HSet(ctx, key, fields)
 				pipe.Expire(ctx, key, redisEndpointRuntimeTTL)
@@ -331,15 +380,26 @@ func (s *redisStickyStore) LoadEndpointState(candidate resolvedCandidate) (endpo
 	if err != nil {
 		return endpointRuntimeState{}, false, err
 	}
-	if state.Failures == 0 && state.OpenUntilUnixMS == 0 && state.HalfOpenInFlight == 0 {
-		return endpointRuntimeState{}, false, nil
-	}
 	runtimeState := endpointRuntimeState{
 		ConsecutiveFailures: state.Failures,
 		HalfOpenInFlight:    state.HalfOpenInFlight,
+		LastStatusCode:      state.LastStatusCode,
+		LastError:           state.LastError,
 	}
 	if state.OpenUntilUnixMS > 0 {
 		runtimeState.OpenUntil = time.UnixMilli(state.OpenUntilUnixMS).UTC()
+	}
+	if state.LastCheckedAtMS > 0 {
+		runtimeState.LastCheckedAt = time.UnixMilli(state.LastCheckedAtMS).UTC()
+	}
+	exists := state.Failures > 0 ||
+		state.OpenUntilUnixMS > 0 ||
+		state.HalfOpenInFlight > 0 ||
+		state.LastStatusCode > 0 ||
+		strings.TrimSpace(state.LastError) != "" ||
+		state.LastCheckedAtMS > 0
+	if !exists {
+		return endpointRuntimeState{}, false, nil
 	}
 	return runtimeState, true, nil
 }
@@ -435,34 +495,27 @@ func (s *redisStickyStore) AcquireProvider(provider model.Provider, now time.Tim
 		return err
 	}
 
-	rateKey := ""
-	if provider.RateLimitRPM > 0 {
-		rateKey = s.providerRateKey(provider.ID, now)
-		count, err := s.client.Incr(ctx, rateKey).Result()
-		if err != nil {
-			return err
-		}
-		_ = s.client.Expire(ctx, rateKey, 2*time.Minute).Err()
-		if count > int64(provider.RateLimitRPM) {
-			_, _ = s.client.Decr(ctx, rateKey).Result()
-			return errProviderRateLimit
-		}
+	rateKey := s.providerRateKey(provider.ID, now)
+	count, err := s.client.Incr(ctx, rateKey).Result()
+	if err != nil {
+		return err
+	}
+	_ = s.client.Expire(ctx, rateKey, 2*time.Minute).Err()
+	if provider.RateLimitRPM > 0 && count > int64(provider.RateLimitRPM) {
+		_, _ = s.client.Decr(ctx, rateKey).Result()
+		return errProviderRateLimit
 	}
 
 	inflightKey := s.providerInFlightKey(provider.ID)
-	count, err := s.client.Incr(ctx, inflightKey).Result()
+	count, err = s.client.Incr(ctx, inflightKey).Result()
 	if err != nil {
-		if rateKey != "" {
-			_, _ = s.client.Decr(ctx, rateKey).Result()
-		}
+		_, _ = s.client.Decr(ctx, rateKey).Result()
 		return err
 	}
 	_ = s.client.Expire(ctx, inflightKey, time.Hour).Err()
 	if provider.MaxConcurrency > 0 && count > int64(provider.MaxConcurrency) {
 		_, _ = s.client.Decr(ctx, inflightKey).Result()
-		if rateKey != "" {
-			_, _ = s.client.Decr(ctx, rateKey).Result()
-		}
+		_, _ = s.client.Decr(ctx, rateKey).Result()
 		return errProviderConcurrencyLimit
 	}
 
@@ -854,6 +907,9 @@ func (s *redisStickyStore) loadEndpointCircuitState(ctx context.Context, key str
 		Failures:         parseRedisInt(values["failures"]),
 		OpenUntilUnixMS:  parseRedisInt64(values["open_until_unixms"]),
 		HalfOpenInFlight: parseRedisInt(values["half_open_inflight"]),
+		LastStatusCode:   parseRedisInt(values["last_status_code"]),
+		LastError:        values["last_error"],
+		LastCheckedAtMS:  parseRedisInt64(values["last_checked_atms"]),
 	}, nil
 }
 

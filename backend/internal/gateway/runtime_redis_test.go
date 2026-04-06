@@ -255,6 +255,34 @@ func TestRedisProviderUsageListingReflectsSharedRuntimeWindows(t *testing.T) {
 	}
 }
 
+func TestRedisProviderUsageTracksRequestsWithoutRPMLimit(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	now := time.Now().UTC()
+	provider := model.Provider{
+		ID:   "provider-1",
+		Name: "Provider One",
+	}
+	state := model.RoutingState{Providers: []model.Provider{provider}}
+
+	if err := runtimeA.acquireProvider(provider, now); err != nil {
+		t.Fatalf("acquire provider without rpm limit: %v", err)
+	}
+
+	items := runtimeB.ProviderUsage(state, now, 10)
+	if len(items) != 1 || items[0].CurrentMinuteRequests != 1 {
+		t.Fatalf("expected provider usage to track requests without rpm limit, got %+v", items)
+	}
+}
+
 func TestRedisInflightHeartbeatKeepsDistributedConcurrencyAlive(t *testing.T) {
 	t.Parallel()
 
@@ -379,5 +407,51 @@ func TestRedisCircuitBreakerHalfOpenStateIsSharedAcrossRuntimeInstances(t *testi
 	runtimeA.reportSuccess(candidate, 5*time.Millisecond, halfOpen)
 	if runtimeB.endpointOpen(candidate, probeAt) {
 		t.Fatal("expected successful shared half-open probe to close the circuit")
+	}
+}
+
+func TestRedisCircuitStatusPreservesDiagnosticsAcrossRuntimeInstances(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	})
+
+	runtimeA := newRuntimeState(store)
+	runtimeB := newRuntimeState(store)
+	enabled := true
+	candidate := resolvedCandidate{
+		provider: model.Provider{
+			ID: "provider-1",
+			CircuitBreaker: model.CircuitBreakerConfig{
+				Enabled:          &enabled,
+				FailureThreshold: 1,
+				CooldownSeconds:  1,
+			},
+		},
+		endpoint:   model.ProviderEndpoint{ID: "endpoint-1"},
+		credential: model.ProviderCredential{ID: "credential-1", APIKey: "provider-key"},
+	}
+
+	runtimeA.reportFailure(candidate, 502, "boom", 0, false)
+
+	failed, ok := runtimeB.endpointStatus(candidate, time.Now().UTC())
+	if !ok {
+		t.Fatal("expected shared circuit status after failure")
+	}
+	if failed.LastStatusCode != 502 || failed.LastError != "boom" || failed.LastCheckedAt.IsZero() {
+		t.Fatalf("expected failure diagnostics to replicate, got %+v", failed)
+	}
+
+	runtimeA.reportSuccess(candidate, 5*time.Millisecond, false)
+
+	recovered, ok := runtimeB.endpointStatus(candidate, time.Now().UTC())
+	if !ok {
+		t.Fatal("expected closed circuit status to retain last health metadata")
+	}
+	if recovered.ConsecutiveFailures != 0 || recovered.LastStatusCode != 200 || recovered.LastError != "" || recovered.LastCheckedAt.IsZero() {
+		t.Fatalf("expected success diagnostics to replicate, got %+v", recovered)
 	}
 }

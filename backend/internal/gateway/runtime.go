@@ -695,7 +695,7 @@ func (r *runtimeState) persistStickyWrite(write stickyWrite) {
 func (r *runtimeState) reportFailure(candidate resolvedCandidate, statusCode int, errMessage string, retryAfter time.Duration, halfOpen bool) {
 	now := time.Now().UTC()
 	if store, ok := r.stickyStore.(endpointRuntimeStore); ok && store != nil {
-		if err := store.ReportEndpointFailure(candidate, now, halfOpen); err != nil {
+		if err := store.ReportEndpointFailure(candidate, now, statusCode, errMessage, halfOpen); err != nil {
 			slog.Warn("endpoint runtime cache failure update failed", "provider_id", candidate.provider.ID, "endpoint_id", candidate.endpoint.ID, "error", err)
 		}
 	}

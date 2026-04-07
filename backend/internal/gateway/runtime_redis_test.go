@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/model"
@@ -383,6 +386,56 @@ func TestRedisInflightHeartbeatKeepsDistributedConcurrencyAlive(t *testing.T) {
 	}
 	if err := runtimeB.acquireProvider(provider, now); err != errProviderConcurrencyLimit {
 		t.Fatalf("expected provider concurrency to remain enforced after heartbeat, got %v", err)
+	}
+}
+
+func TestRedisReleaseDoesNotUnderflowInFlightCounters(t *testing.T) {
+	t.Parallel()
+
+	redisServer := miniredis.RunT(t)
+	store := newRedisStickyStore(config.Config{
+		RedisAddr:      redisServer.Addr(),
+		RedisKeyPrefix: "conduit-test",
+	}).(*redisStickyStore)
+
+	runtime := newRuntimeState(store)
+	now := time.Now().UTC()
+	gatewayKey := model.GatewayKey{
+		ID: "gk-1",
+	}
+	provider := model.Provider{
+		ID:   "provider-1",
+		Name: "Provider One",
+	}
+
+	if err := runtime.acquireGatewayKey(gatewayKey, now); err != nil {
+		t.Fatalf("acquire gateway key without concurrency limit: %v", err)
+	}
+	runtime.releaseGatewayKey(gatewayKey.ID, 0)
+
+	if err := runtime.acquireProvider(provider, now); err != nil {
+		t.Fatalf("acquire provider: %v", err)
+	}
+	runtime.releaseProvider(provider.ID, 0)
+	runtime.releaseProvider(provider.ID, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	gatewayInFlight, err := store.client.Get(ctx, store.gatewayInFlightKey(gatewayKey.ID)).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		t.Fatalf("get gateway inflight counter: %v", err)
+	}
+	if err == nil && gatewayInFlight != 0 {
+		t.Fatalf("expected gateway inflight counter to floor at zero, got %d", gatewayInFlight)
+	}
+
+	providerInFlight, err := store.client.Get(ctx, store.providerInFlightKey(provider.ID)).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		t.Fatalf("get provider inflight counter: %v", err)
+	}
+	if err == nil && providerInFlight != 0 {
+		t.Fatalf("expected provider inflight counter to floor at zero, got %d", providerInFlight)
 	}
 }
 

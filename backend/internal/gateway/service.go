@@ -78,6 +78,10 @@ type upstreamExchange struct {
 	RequestHeaderRemove []string
 }
 
+const maxProxyRequestBodyBytes int64 = 8 << 20
+
+var errRequestBodyTooLarge = errors.New("request body too large")
+
 type responseMode string
 
 const (
@@ -269,8 +273,12 @@ func (s *Service) HandleModels(w http.ResponseWriter, r *http.Request) {
 func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
-		reqBody, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+		reqBody, err := readLimitedRequestBody(r.Body, maxProxyRequestBodyBytes)
 		if err != nil {
+			if errors.Is(err, errRequestBodyTooLarge) {
+				writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds %d bytes", maxProxyRequestBodyBytes))
+				return
+			}
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("failed to read request body: %v", err))
 			return
 		}
@@ -709,6 +717,17 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 		}
 		writeError(w, record.StatusCode, record.Error)
 	}
+}
+
+func readLimitedRequestBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	payload, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > maxBytes {
+		return nil, errRequestBodyTooLarge
+	}
+	return payload, nil
 }
 
 // ProxyRealtime proxies WebSocket traffic to OpenAI-compatible realtime APIs.
@@ -1532,83 +1551,38 @@ func (s *Service) orderCandidateBand(mode model.ProviderRoutingMode, alias strin
 	if len(band) <= 1 {
 		return band
 	}
-
 	switch mode {
-	case model.ProviderRoutingModeLatency:
-		sort.SliceStable(band, func(i, j int) bool {
-			leftLatency := candidateLatency(s.runtime.endpointLatency(band[i]))
-			rightLatency := candidateLatency(s.runtime.endpointLatency(band[j]))
-			if leftLatency != rightLatency {
-				return leftLatency < rightLatency
-			}
-			leftWeight := totalCandidateWeight(band[i])
-			rightWeight := totalCandidateWeight(band[j])
-			if leftWeight != rightWeight {
-				return leftWeight > rightWeight
-			}
-			return candidateIdentity(band[i]) < candidateIdentity(band[j])
-		})
 	case providerRoutingModeRoundRobin:
-		sort.SliceStable(band, func(i, j int) bool {
-			leftWeight := totalCandidateWeight(band[i])
-			rightWeight := totalCandidateWeight(band[j])
-			if leftWeight != rightWeight {
-				return leftWeight > rightWeight
-			}
-			return candidateIdentity(band[i]) < candidateIdentity(band[j])
-		})
 		offset := s.runtime.nextRoundRobinOffset(roundRobinKey(alias, protocol, groupKey), len(band))
-		band = rotateCandidates(band, offset)
+		return rotateCandidates(band, offset)
 	case providerRoutingModeRandom:
-		sort.SliceStable(band, func(i, j int) bool {
-			return candidateIdentity(band[i]) < candidateIdentity(band[j])
-		})
-		seed := time.Now().UnixNano() + int64(s.runtime.nextRoundRobinOffset(roundRobinKey(alias, protocol, groupKey)+"\x00random", len(band)))
+		seed := time.Now().UnixNano() + int64(s.runtime.nextRoundRobinOffset(roundRobinKey(alias, protocol, groupKey+"-random"), len(band)))
 		rng := rand.New(rand.NewSource(seed))
 		rng.Shuffle(len(band), func(i, j int) {
 			band[i], band[j] = band[j], band[i]
 		})
-	case providerRoutingModeFailover, providerRoutingModeOrdered:
-		sort.SliceStable(band, func(i, j int) bool {
-			leftWeight := totalCandidateWeight(band[i])
-			rightWeight := totalCandidateWeight(band[j])
-			if leftWeight != rightWeight {
-				return leftWeight > rightWeight
-			}
-			return candidateIdentity(band[i]) < candidateIdentity(band[j])
-		})
+		return band
+	case providerRoutingModeOrdered, providerRoutingModeFailover:
+		fallthrough
 	default:
 		sort.SliceStable(band, func(i, j int) bool {
-			leftWeight := totalCandidateWeight(band[i])
-			rightWeight := totalCandidateWeight(band[j])
-			if leftWeight != rightWeight {
-				return leftWeight > rightWeight
+			if band[i].endpoint.Priority != band[j].endpoint.Priority {
+				return band[i].endpoint.Priority < band[j].endpoint.Priority
 			}
-			leftLatency := candidateLatency(s.runtime.endpointLatency(band[i]))
-			rightLatency := candidateLatency(s.runtime.endpointLatency(band[j]))
-			if leftLatency != rightLatency {
-				return leftLatency < rightLatency
+			if band[i].endpoint.Weight != band[j].endpoint.Weight {
+				return band[i].endpoint.Weight > band[j].endpoint.Weight
 			}
-			return candidateIdentity(band[i]) < candidateIdentity(band[j])
+			if band[i].endpoint.Name != band[j].endpoint.Name {
+				return band[i].endpoint.Name < band[j].endpoint.Name
+			}
+			return band[i].endpoint.ID < band[j].endpoint.ID
 		})
-	}
-	return band
-}
-
-func normalizeProviderRoutingMode(mode model.ProviderRoutingMode) model.ProviderRoutingMode {
-	switch normalized := model.ProviderRoutingMode(strings.ToLower(strings.TrimSpace(string(mode)))); normalized {
-	case model.ProviderRoutingModeLatency, providerRoutingModeRoundRobin, providerRoutingModeRandom, providerRoutingModeFailover, providerRoutingModeOrdered:
-		return normalized
-	default:
-		return model.ProviderRoutingModeWeighted
+		return band
 	}
 }
 
-func effectiveRouteStrategy(route model.ModelRoute) model.RouteStrategy {
-	if canonical := route.Strategy.Canonical(); canonical != "" {
-		return canonical
-	}
-	return model.RouteStrategyPriorityWeight
+func roundRobinKey(alias string, protocol model.Protocol, key string) string {
+	return strings.TrimSpace(alias) + "\x00" + string(protocol) + "\x00" + strings.TrimSpace(key)
 }
 
 func rotateCandidates(candidates []resolvedCandidate, offset int) []resolvedCandidate {
@@ -1625,25 +1599,250 @@ func rotateCandidates(candidates []resolvedCandidate, offset int) []resolvedCand
 	return rotated
 }
 
-func roundRobinKey(alias string, protocol model.Protocol, groupKey string) string {
-	return strings.ToLower(strings.TrimSpace(alias)) + "\x00" + strings.ToLower(strings.TrimSpace(string(protocol))) + "\x00" + groupKey
+func candidateLatency(latency time.Duration) int64 {
+	if latency <= 0 {
+		return int64(^uint(0) >> 1)
+	}
+	return latency.Milliseconds()
 }
 
-func candidateIdentity(candidate resolvedCandidate) string {
-	return strings.Join([]string{
-		candidate.provider.ID,
-		candidate.target.ID,
-		candidate.endpoint.ID,
-		candidate.credential.ID,
-	}, "\x00")
+func effectiveRouteStrategy(route model.ModelRoute) model.RouteStrategy {
+	strategy := route.Strategy.Canonical()
+	if strategy == "" {
+		return model.RouteStrategyPriority
+	}
+	return strategy
+}
+
+func routeAliasTimestamp(alias string) int64 {
+	return 1735689600
+}
+
+func parseProxyRequest(protocol model.Protocol, r *http.Request, body []byte) (parsedProxyRequest, error) {
+	routeAlias, stream, payload, err := parseProtocolModel(protocol, body)
+	if err != nil {
+		return parsedProxyRequest{}, err
+	}
+	request := parsedProxyRequest{
+		routeAlias:  routeAlias,
+		stream:      stream,
+		rawBody:     body,
+		rawQuery:    r.URL.RawQuery,
+		jsonPayload: payload,
+		sessionID:   extractRequestSessionID(payload, r.Header),
+		scenario:    extractRequestScenario(payload, r.Header),
+	}
+	return request, nil
+}
+
+func parseProtocolModel(protocol model.Protocol, body []byte) (string, bool, map[string]any, error) {
+	var payload map[string]any
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "", false, nil, errors.New("request body is required")
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", false, nil, fmt.Errorf("request body must be JSON: %w", err)
+	}
+
+	switch protocol {
+	case model.ProtocolOpenAIChat, model.ProtocolOpenAIResponses:
+		modelName := strings.TrimSpace(readString(payload, "model"))
+		if modelName == "" {
+			return "", false, nil, errors.New("model is required")
+		}
+		return modelName, readBool(payload, "stream"), payload, nil
+	case model.ProtocolAnthropic:
+		modelName := strings.TrimSpace(readString(payload, "model"))
+		if modelName == "" {
+			return "", false, nil, errors.New("model is required")
+		}
+		return modelName, readBool(payload, "stream"), payload, nil
+	case model.ProtocolGeminiGenerate:
+		modelName := strings.TrimSpace(readString(payload, "model"))
+		if modelName == "" {
+			modelName = strings.TrimSpace(readString(payload, "model_name"))
+		}
+		if modelName == "" {
+			return "", false, nil, errors.New("model is required")
+		}
+		return modelName, false, payload, nil
+	case model.ProtocolGeminiStream:
+		modelName := strings.TrimSpace(readString(payload, "model"))
+		if modelName == "" {
+			modelName = strings.TrimSpace(readString(payload, "model_name"))
+		}
+		if modelName == "" {
+			return "", false, nil, errors.New("model is required")
+		}
+		return modelName, true, payload, nil
+	default:
+		return "", false, nil, fmt.Errorf("unsupported protocol %s", protocol)
+	}
 }
 
 func effectiveUpstreamModel(candidate resolvedCandidate) string {
-	upstreamModel := strings.TrimSpace(candidate.target.UpstreamModel)
-	if upstreamModel == "" {
-		return candidate.route.Alias
+	modelName := strings.TrimSpace(candidate.target.UpstreamModel)
+	if modelName == "" {
+		modelName = strings.TrimSpace(candidate.route.Alias)
 	}
-	return upstreamModel
+	return modelName
+}
+
+func gatewayRequestSource(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil && strings.TrimSpace(host) != "" {
+		return strings.TrimSpace(host)
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+func routingMetadataHeader(route model.ModelRoute, candidate resolvedCandidate, latency time.Duration, sessionID, scenario string) http.Header {
+	headers := http.Header{}
+	writeRoutingMetadata(headers, route, candidate, latency, sessionID, scenario)
+	return headers
+}
+
+func writeRoutingMetadata(headers http.Header, route model.ModelRoute, candidate resolvedCandidate, latency time.Duration, sessionID, scenario string) {
+	if headers == nil {
+		return
+	}
+	headers.Set("X-Conduit-Provider", candidate.provider.ID)
+	headers.Set("X-Conduit-Route", route.Alias)
+	headers.Set("X-Conduit-Endpoint", candidate.endpoint.ID)
+	if sessionID != "" {
+		headers.Set("X-Conduit-Session-Id", sessionID)
+	}
+	if scenario != "" {
+		headers.Set("X-Conduit-Scenario", scenario)
+	}
+	if latency > 0 {
+		headers.Set("X-Conduit-Latency-Ms", strconv.FormatInt(latency.Milliseconds(), 10))
+	}
+}
+
+func writeBillingMetadata(headers http.Header, record model.RequestRecord) {
+	if headers == nil {
+		return
+	}
+	headers.Set("X-Gateway-Currency", record.Billing.Currency)
+	headers.Set("X-Gateway-Input-Tokens", strconv.Itoa(record.Usage.InputTokens))
+	headers.Set("X-Gateway-Output-Tokens", strconv.Itoa(record.Usage.OutputTokens))
+	headers.Set("X-Gateway-Total-Tokens", strconv.Itoa(record.Usage.TotalTokens))
+	headers.Set("X-Gateway-Billing-Input", formatBillingValue(record.Billing.InputCost))
+	headers.Set("X-Gateway-Billing-Output", formatBillingValue(record.Billing.OutputCost))
+	headers.Set("X-Gateway-Billing-Markup", formatBillingValue(record.Billing.Markup))
+	headers.Set("X-Gateway-Billing-Final", formatBillingValue(record.Billing.FinalCost))
+}
+
+func setBillingTrailers(headers http.Header) {
+	if headers == nil {
+		return
+	}
+	trailers := []string{
+		"X-Gateway-Currency",
+		"X-Gateway-Input-Tokens",
+		"X-Gateway-Output-Tokens",
+		"X-Gateway-Total-Tokens",
+		"X-Gateway-Billing-Input",
+		"X-Gateway-Billing-Output",
+		"X-Gateway-Billing-Markup",
+		"X-Gateway-Billing-Final",
+	}
+	for _, key := range trailers {
+		headers.Add("Trailer", key)
+	}
+}
+
+func formatBillingValue(value float64) string {
+	return strconv.FormatFloat(value, 'f', 6, 64)
+}
+
+func sleepBackoff(ctx context.Context, statusCode int, attempt int) {
+	delay := retryBackoffDelay(statusCode, attempt)
+	if delay <= 0 {
+		return
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+func retryBackoffDelay(statusCode int, attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	base := 75 * time.Millisecond
+	if statusCode == http.StatusTooManyRequests || statusCode >= 500 {
+		base = 150 * time.Millisecond
+	}
+	delay := base * time.Duration(1<<(attempt-1))
+	maxDelay := 1500 * time.Millisecond
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
+}
+
+func providerLimitStatusCode(err error) int {
+	switch {
+	case errors.Is(err, errProviderRateLimit):
+		return http.StatusTooManyRequests
+	case errors.Is(err, errProviderConcurrencyLimit):
+		return http.StatusTooManyRequests
+	case errors.Is(err, errProviderHourlyBudget), errors.Is(err, errProviderDailyBudget), errors.Is(err, errProviderWeeklyBudget), errors.Is(err, errProviderMonthlyBudget):
+		return http.StatusPaymentRequired
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+func copyForwardHeaders(dst, src http.Header) {
+	if dst == nil || src == nil {
+		return
+	}
+	for key, values := range src {
+		switch strings.ToLower(key) {
+		case "host", "content-length", "authorization", "x-api-key", "proxy-authorization", "connection", "upgrade", "proxy-connection", "keep-alive", "transfer-encoding", "te", "trailer":
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func applyHeaders(dst http.Header, headers map[string]string) {
+	if dst == nil || len(headers) == 0 {
+		return
+	}
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		dst.Set(key, value)
+	}
+}
+
+func applyProviderAuth(headers http.Header, kind model.ProviderKind, apiKey string) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" || headers == nil {
+		return
+	}
+	switch kind {
+	case model.ProviderKindAnthropic:
+		headers.Set("x-api-key", apiKey)
+		headers.Set("anthropic-version", "2023-06-01")
+	case model.ProviderKindGemini:
+		headers.Set("x-goog-api-key", apiKey)
+	default:
+		headers.Set("Authorization", "Bearer "+apiKey)
+	}
 }
 
 func firstEnabledCredential(provider model.Provider) (model.ProviderCredential, bool) {
@@ -1656,28 +1855,46 @@ func firstEnabledCredential(provider model.Provider) (model.ProviderCredential, 
 }
 
 func probePath(provider model.Provider, endpoint model.ProviderEndpoint) string {
-	if value := strings.TrimSpace(endpoint.HealthcheckPath); value != "" {
-		return value
+	kind := provider.Kind
+	baseURL := strings.TrimSpace(endpoint.BaseURL)
+	if kind == model.ProviderKindUnknown {
+		switch {
+		case strings.Contains(strings.ToLower(baseURL), "anthropic"):
+			kind = model.ProviderKindAnthropic
+		case strings.Contains(strings.ToLower(baseURL), "generativelanguage.googleapis.com"):
+			kind = model.ProviderKindGemini
+		default:
+			kind = model.ProviderKindOpenAICompatible
+		}
 	}
-	if value := strings.TrimSpace(provider.HealthcheckPath); value != "" {
-		return value
+	if capability := provider.CanonicalProtocol(); capability != "" {
+		switch capability {
+		case model.ProtocolAnthropic:
+			kind = model.ProviderKindAnthropic
+		case model.ProtocolGeminiGenerate, model.ProtocolGeminiStream:
+			kind = model.ProviderKindGemini
+		default:
+			if kind == model.ProviderKindUnknown {
+				kind = model.ProviderKindOpenAICompatible
+			}
+		}
 	}
-	switch provider.Kind {
+	switch kind {
+	case model.ProviderKindAnthropic:
+		return "/v1/models"
 	case model.ProviderKindGemini:
 		return "/v1beta/models"
-	case model.ProviderKindAnthropic:
-		return "/"
 	default:
 		return "/v1/models"
 	}
 }
 
 func (s *Service) newProbeRequest(ctx context.Context, provider model.Provider, endpoint model.ProviderEndpoint, credential model.ProviderCredential, path string) (*http.Request, error) {
-	upstreamURL, err := joinProxyURL(endpoint.BaseURL, path)
+	probeURL, err := joinProxyURL(endpoint.BaseURL, path)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1694,413 +1911,30 @@ func (s *Service) newProbeRequest(ctx context.Context, provider model.Provider, 
 	return req, nil
 }
 
-func totalCandidateWeight(candidate resolvedCandidate) int {
-	const maxWeight = int(^uint(0) >> 1)
-	weights := []int{candidate.provider.Weight, candidate.target.Weight, candidate.endpoint.Weight, candidate.credential.Weight}
-	product := 1
-	for _, weight := range weights {
-		if weight <= 0 {
-			return 1
-		}
-		if product > maxWeight/weight {
-			return maxWeight
-		}
-		product *= weight
-	}
-	return product
-}
-
-func candidateLatency(latency int64) int64 {
-	if latency <= 0 {
-		return 1<<62 - 1
-	}
-	return latency
-}
-
-func nextDecision(retryable, hasNext bool) string {
-	switch {
-	case retryable && hasNext:
-		return "switch_provider"
-	case retryable:
-		return "abort"
-	default:
-		return "abort"
-	}
-}
-
-func sleepBackoff(ctx context.Context, statusCode, retryIndex int) {
-	delay := retryBackoffDelay(statusCode, retryIndex)
-	if delay <= 0 {
-		return
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-ctx.Done():
-	}
-}
-
-func retryBackoffDelay(statusCode, retryIndex int) time.Duration {
-	if statusCode >= 500 && statusCode < 600 && statusCode != http.StatusRequestTimeout && statusCode != http.StatusTooManyRequests {
-		return 100 * time.Millisecond
-	}
-	if statusCode == 0 || statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests {
-		base := time.Duration(retryIndex*80) * time.Millisecond
-		if base > 800*time.Millisecond {
-			base = 800 * time.Millisecond
-		}
-		return base
-	}
-	return 0
-}
-
-func isRetryableStatus(statusCode int) bool {
-	if statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests {
-		return true
-	}
-	return statusCode >= 500 && statusCode < 600
-}
-
-func parseRetryAfter(headers http.Header) time.Duration {
-	value := strings.TrimSpace(headers.Get("Retry-After"))
-	if value == "" {
-		return 0
-	}
-	if seconds, err := strconv.Atoi(value); err == nil {
-		if seconds <= 0 {
-			return 0
-		}
-		return clampRetryAfterCooldown(time.Duration(seconds) * time.Second)
-	}
-	at, err := http.ParseTime(value)
+func joinProxyURL(base string, path string) (*url.URL, error) {
+	baseURL, err := url.Parse(strings.TrimSpace(base))
 	if err != nil {
-		return 0
+		return nil, fmt.Errorf("invalid base url %q: %w", base, err)
 	}
-	delay := time.Until(at)
-	if delay <= 0 {
-		return 0
+	proxyPath := strings.TrimSpace(path)
+	if proxyPath == "" {
+		proxyPath = "/"
 	}
-	return clampRetryAfterCooldown(delay)
-}
-
-func providerLimitStatusCode(err error) int {
-	switch {
-	case errors.Is(err, errProviderRateLimit), errors.Is(err, errProviderConcurrencyLimit):
-		return http.StatusTooManyRequests
-	case errors.Is(err, errProviderHourlyBudget), errors.Is(err, errProviderDailyBudget), errors.Is(err, errProviderWeeklyBudget), errors.Is(err, errProviderMonthlyBudget):
-		return http.StatusPaymentRequired
-	default:
-		return http.StatusServiceUnavailable
-	}
-}
-
-func writeGatewayAuthError(w http.ResponseWriter, err error) {
-	switch err {
-	case errRateLimit:
-		writeError(w, http.StatusTooManyRequests, err.Error())
-	case errConcurrencyLimit:
-		writeError(w, http.StatusTooManyRequests, err.Error())
-	case errAuthLocked:
-		writeError(w, http.StatusTooManyRequests, err.Error())
-	case errHourlyBudget, errDailyBudget, errWeeklyBudget, errMonthlyBudget:
-		writeError(w, http.StatusPaymentRequired, err.Error())
-	default:
-		writeError(w, http.StatusUnauthorized, errUnauthorized.Error())
-	}
+	resolved := baseURL.ResolveReference(&url.URL{Path: proxyPath})
+	return resolved, nil
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]any{
-		"error": map[string]any{
-			"message": message,
-			"type":    "gateway_error",
-		},
-	})
+	writeJSON(w, status, map[string]any{"error": message})
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+	if payload == nil {
+		return
+	}
 	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func parseProxyRequest(protocol model.Protocol, r *http.Request, body []byte) (parsedProxyRequest, error) {
-	sessionID := extractClientSessionID(r.Header, body)
-	scenario := extractRoutingScenario(r.Header, body)
-	switch protocol {
-	case model.ProtocolGeminiGenerate, model.ProtocolGeminiStream:
-		alias, err := extractGeminiModelFromPath(r.URL.Path)
-		if err != nil {
-			return parsedProxyRequest{}, err
-		}
-		return parsedProxyRequest{
-			routeAlias: alias,
-			stream:     protocol == model.ProtocolGeminiStream,
-			rawBody:    body,
-			rawQuery:   r.URL.RawQuery,
-			sessionID:  sessionID,
-			scenario:   scenario,
-		}, nil
-	default:
-		if len(body) == 0 {
-			return parsedProxyRequest{}, errors.New("request body is required")
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			return parsedProxyRequest{}, fmt.Errorf("request body must be JSON: %w", err)
-		}
-		modelValue, ok := payload["model"].(string)
-		if !ok || strings.TrimSpace(modelValue) == "" {
-			return parsedProxyRequest{}, errors.New("model is required")
-		}
-		stream := false
-		if value, ok := payload["stream"].(bool); ok {
-			stream = value
-		}
-		return parsedProxyRequest{
-			routeAlias:  modelValue,
-			stream:      stream,
-			rawBody:     body,
-			rawQuery:    r.URL.RawQuery,
-			jsonPayload: payload,
-			sessionID:   sessionID,
-			scenario:    scenario,
-		}, nil
-	}
-}
-
-func extractClientSessionID(headers http.Header, body []byte) string {
-	if value := extractCodexTurnState(headers); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(headers.Get("X-Session-ID")); value != "" {
-		return value
-	}
-	if len(body) == 0 {
-		return ""
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return ""
-	}
-	if value, ok := payload["session_id"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value)
-	}
-	return ""
-}
-
-func extractRealtimeSessionID(r *http.Request) string {
-	if value := extractCodexTurnState(r.Header); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(r.Header.Get("X-Session-ID")); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(r.URL.Query().Get("session_id")); value != "" {
-		return value
-	}
-	return ""
-}
-
-func extractRoutingScenario(headers http.Header, body []byte) string {
-	if value := strings.TrimSpace(headers.Get("X-Routing-Scenario")); value != "" {
-		return value
-	}
-	if len(body) == 0 {
-		return ""
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return ""
-	}
-	if value, ok := payload["routing_scenario"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value)
-	}
-	return ""
-}
-
-func extractRealtimeScenario(r *http.Request) string {
-	if value := strings.TrimSpace(r.Header.Get("X-Routing-Scenario")); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(r.URL.Query().Get("routing_scenario")); value != "" {
-		return value
-	}
-	return ""
-}
-
-func extractCodexTurnState(headers http.Header) string {
-	if value := strings.TrimSpace(headers.Get(headerCodexTurnState)); value != "" {
-		return value
-	}
-	return ""
-}
-
-func codexResponseTurnState(protocol model.Protocol, headers http.Header) string {
-	if protocol != model.ProtocolOpenAIResponses {
-		return ""
-	}
-	if value := extractCodexTurnState(headers); value != "" {
-		return value
-	}
-	return model.NewID("cts")
-}
-
-func extractGeminiModelFromPath(path string) (string, error) {
-	parts := strings.Split(path, "/models/")
-	if len(parts) != 2 {
-		return "", errors.New("invalid Gemini path")
-	}
-	fragment := parts[1]
-	index := strings.Index(fragment, ":")
-	if index < 0 {
-		return "", errors.New("invalid Gemini model segment")
-	}
-	return fragment[:index], nil
-}
-
-func copyForwardHeaders(dst, src http.Header) {
-	skipped := map[string]struct{}{
-		"authorization":            {},
-		"connection":               {},
-		"content-length":           {},
-		"host":                     {},
-		"keep-alive":               {},
-		"proxy-authenticate":       {},
-		"proxy-authorization":      {},
-		"proxy-connection":         {},
-		"sec-websocket-accept":     {},
-		"sec-websocket-extensions": {},
-		"sec-websocket-key":        {},
-		"sec-websocket-version":    {},
-		"te":                       {},
-		"trailer":                  {},
-		"transfer-encoding":        {},
-		"upgrade":                  {},
-		"x-api-key":                {},
-	}
-	for _, value := range src.Values("Connection") {
-		for _, token := range strings.Split(value, ",") {
-			name := strings.ToLower(strings.TrimSpace(token))
-			if name == "" {
-				continue
-			}
-			skipped[name] = struct{}{}
-		}
-	}
-	for key, values := range src {
-		if _, skip := skipped[strings.ToLower(key)]; skip {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func applyProviderAuth(headers http.Header, providerKind model.ProviderKind, apiKey string) {
-	switch providerKind {
-	case model.ProviderKindAnthropic:
-		headers.Set("x-api-key", apiKey)
-		if headers.Get("anthropic-version") == "" {
-			headers.Set("anthropic-version", "2023-06-01")
-		}
-	case model.ProviderKindGemini:
-		headers.Set("x-goog-api-key", apiKey)
-	default:
-		headers.Set("Authorization", "Bearer "+apiKey)
-	}
-}
-
-func copyResponseHeaders(dst, src http.Header) {
-	for key, values := range src {
-		switch strings.ToLower(key) {
-		case "content-length", "transfer-encoding", "connection":
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func setBillingTrailers(headers http.Header) {
-	headers.Add("Trailer", "X-Gateway-Input-Tokens")
-	headers.Add("Trailer", "X-Gateway-Output-Tokens")
-	headers.Add("Trailer", "X-Gateway-Total-Tokens")
-	headers.Add("Trailer", "X-Gateway-Cached-Tokens")
-	headers.Add("Trailer", "X-Gateway-Reasoning-Tokens")
-	headers.Add("Trailer", "X-Gateway-Billing-Currency")
-	headers.Add("Trailer", "X-Gateway-Billing-Base")
-	headers.Add("Trailer", "X-Gateway-Billing-Final")
-	headers.Add("Trailer", "X-Gateway-Billing-Multiplier")
-}
-
-func writeBillingMetadata(headers http.Header, record model.RequestRecord) {
-	headers.Set("X-Gateway-Input-Tokens", strconv.FormatInt(record.Usage.InputTokens, 10))
-	headers.Set("X-Gateway-Output-Tokens", strconv.FormatInt(record.Usage.OutputTokens, 10))
-	headers.Set("X-Gateway-Total-Tokens", strconv.FormatInt(record.Usage.TotalTokens, 10))
-	headers.Set("X-Gateway-Cached-Tokens", strconv.FormatInt(record.Usage.CachedInputTokens, 10))
-	headers.Set("X-Gateway-Reasoning-Tokens", strconv.FormatInt(record.Usage.ReasoningTokens, 10))
-	headers.Set("X-Gateway-Billing-Currency", record.Billing.Currency)
-	headers.Set("X-Gateway-Billing-Base", fmt.Sprintf("%.6f", record.Billing.BaseCost))
-	headers.Set("X-Gateway-Billing-Final", fmt.Sprintf("%.6f", record.Billing.FinalCost))
-	headers.Set("X-Gateway-Billing-Multiplier", fmt.Sprintf("%.4f", record.Billing.Multiplier))
-}
-
-func copyStreamingResponse(w http.ResponseWriter, body io.Reader, observer *UsageObserver, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
-	reader := bufio.NewReader(body)
-	flusher, _ := w.(http.Flusher)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			observer.ObserveLine(line)
-			output := line
-			if transformedLine, transformErr := transformStreamingResponseLine(line, transformers, candidate); transformErr != nil {
-				return transformErr
-			} else if transformedLine != nil {
-				output = transformedLine
-			}
-			if _, writeErr := w.Write(output); writeErr != nil {
-				return writeErr
-			}
-			if flusher != nil && len(bytes.TrimSpace(output)) == 0 {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				if flusher != nil {
-					flusher.Flush()
-				}
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-func joinProxyURL(baseURL, rawPath string) (*url.URL, error) {
-	parsed, err := url.Parse(strings.TrimRight(baseURL, "/"))
-	if err != nil {
-		return nil, err
-	}
-	path := rawPath
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-
-	basePath := strings.TrimRight(parsed.Path, "/")
-	switch {
-	case strings.HasSuffix(basePath, "/v1") && strings.HasPrefix(path, "/v1/"):
-		parsed.Path = basePath + strings.TrimPrefix(path, "/v1")
-	case strings.HasSuffix(basePath, "/v1beta") && strings.HasPrefix(path, "/v1beta/"):
-		parsed.Path = basePath + strings.TrimPrefix(path, "/v1beta")
-	default:
-		parsed.Path = basePath + path
-	}
-	return parsed, nil
 }
 
 func proxyWSFrames(src, dst *websocket.Conn, observer *UsageObserver, errCh chan<- error) {
@@ -2110,7 +1944,7 @@ func proxyWSFrames(src, dst *websocket.Conn, observer *UsageObserver, errCh chan
 			errCh <- err
 			return
 		}
-		if observer != nil && (messageType == websocket.TextMessage || messageType == websocket.BinaryMessage) {
+		if observer != nil && messageType == websocket.TextMessage {
 			observer.ObserveJSON(payload)
 		}
 		if err := dst.WriteMessage(messageType, payload); err != nil {
@@ -2120,16 +1954,184 @@ func proxyWSFrames(src, dst *websocket.Conn, observer *UsageObserver, errCh chan
 	}
 }
 
+func parseRetryAfter(headers http.Header) time.Duration {
+	if headers == nil {
+		return 0
+	}
+	value := strings.TrimSpace(headers.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		duration := time.Duration(seconds) * time.Second
+		maxDuration := 15 * time.Minute
+		if duration > maxDuration {
+			duration = maxDuration
+		}
+		if duration < 0 {
+			return 0
+		}
+		return duration
+	}
+	if retryAt, err := http.ParseTime(value); err == nil {
+		duration := time.Until(retryAt)
+		if duration <= 0 {
+			return 0
+		}
+		maxDuration := 15 * time.Minute
+		if duration > maxDuration {
+			return maxDuration
+		}
+		return duration
+	}
+	return 0
+}
+
+func isRetryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+func responseWriteStarted(err error) bool {
+	var writeErr *proxyResponseWriteError
+	return errors.As(err, &writeErr) && writeErr.started
+}
+
+type proxyResponseWriteError struct {
+	err     error
+	started bool
+}
+
+func (e *proxyResponseWriteError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *proxyResponseWriteError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func markProxyResponseError(err error, started bool) error {
+	if err == nil {
+		return nil
+	}
+	return &proxyResponseWriteError{err: err, started: started}
+}
+
+func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	transformers = responseTransformers(transformers)
+	applyResponseHeaderTransformers(w.Header(), transformers, candidate)
+	if len(transformers) == 0 {
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if exchange.Stream {
+			return streamProxyResponse(w, resp, observer)
+		}
+		_, err := io.Copy(w, io.TeeReader(resp.Body, observer))
+		return markProxyResponseError(err, true)
+	}
+	return s.writeTransformedResponse(w, resp, observer, exchange, publicAlias, transformers, candidate)
+}
+
+func (s *Service) writeTransformedResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+	copyResponseHeaders(w.Header(), resp.Header)
+	applyResponseHeaderTransformers(w.Header(), transformers, candidate)
+	mode := exchange.ResponseMode
+	switch mode {
+	case responseModePassthrough:
+		if exchange.Stream {
+			return streamTransformedPassthrough(w, resp, observer, transformers, candidate)
+		}
+		payload, err := readLimitedResponseBody(resp.Body, 8<<20)
+		if err != nil {
+			return markProxyResponseError(err, false)
+		}
+		observer.ObserveResponseBody(payload)
+		transformed, err := applyJSONResponseTransformers(payload, transformers, candidate)
+		if err != nil {
+			return markProxyResponseError(err, false)
+		}
+		w.Header().Del("Content-Length")
+		w.WriteHeader(resp.StatusCode)
+		_, err = w.Write(transformed)
+		return markProxyResponseError(err, true)
+	case responseModeAnthropicJSON:
+		return writeAnthropicAsOpenAIJSON(w, resp, observer, publicAlias, transformers, candidate)
+	case responseModeAnthropicSSE:
+		return writeAnthropicAsOpenAISSE(w, resp, observer, publicAlias, transformers, candidate)
+	case responseModeGeminiJSON:
+		return writeGeminiAsOpenAIJSON(w, resp, observer, publicAlias, transformers, candidate)
+	case responseModeGeminiSSE:
+		return writeGeminiAsOpenAISSE(w, resp, observer, publicAlias, transformers, candidate)
+	case responseModeResponsesJSON:
+		return writeOpenAIResponsesAsJSON(w, resp, observer, publicAlias, transformers, candidate)
+	case responseModeResponsesSSE:
+		return writeOpenAIResponsesAsSSE(w, resp, observer, publicAlias, transformers, candidate)
+	default:
+		return markProxyResponseError(fmt.Errorf("unsupported response mode %s", mode), false)
+	}
+}
+
+func streamProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver) error {
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	flusher, _ := w.(http.Flusher)
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64<<10), maxStreamingScanTokenSize)
+	hadEventBoundary := false
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if _, err := w.Write(line); err != nil {
+			return markProxyResponseError(err, true)
+		}
+		if _, err := w.Write([]byte("\n")); err != nil {
+			return markProxyResponseError(err, true)
+		}
+		if observer != nil {
+			observer.ObserveSSELine(line)
+		}
+		if len(line) == 0 && flusher != nil {
+			hadEventBoundary = true
+			flusher.Flush()
+		} else if len(line) > 0 {
+			hadEventBoundary = false
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return markProxyResponseError(err, true)
+	}
+	if flusher != nil && !hadEventBoundary {
+		flusher.Flush()
+	}
+	return nil
+}
+
+const maxStreamingScanTokenSize = 8 << 20
+
+func copyResponseHeaders(dst, src http.Header) {
+	if dst == nil || src == nil {
+		return
+	}
+	for key, values := range src {
+		switch strings.ToLower(key) {
+		case "content-length", "connection", "transfer-encoding", "keep-alive", "proxy-connection", "upgrade", "te", "trailer":
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
 func isNormalClose(err error) bool {
 	if err == nil {
 		return true
 	}
-	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
-}
-
-func routeAliasTimestamp(alias string) int64 {
-	const modelListEpochUnix = 1_775_001_600
-	return modelListEpochUnix
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived)
 }
 
 func (s *Service) allowRealtimeOrigin(r *http.Request) bool {
@@ -2137,5 +2139,13 @@ func (s *Service) allowRealtimeOrigin(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	return s.cfg.AllowsRealtimeOrigin(origin)
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		return false
+	}
+	originURL, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(originURL.Host, host)
 }

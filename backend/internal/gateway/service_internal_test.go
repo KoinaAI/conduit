@@ -1203,6 +1203,24 @@ func TestWriteResponsesSSEFromAnthropicStream(t *testing.T) {
 	}
 }
 
+func TestWriteResponsesSSEFromAnthropicStreamReturnsErrorOnEmptyStream(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	resp := &http.Response{
+		Body: io.NopCloser(strings.NewReader("")),
+	}
+	err := writeResponsesSSE(recorder, resp, NewUsageObserver(model.ProtocolOpenAIResponses), "gpt-5.4", nil, resolvedCandidate{
+		provider: model.Provider{Kind: model.ProviderKindAnthropic},
+	})
+	if err == nil || !responseWriteStarted(err) {
+		t.Fatalf("expected empty anthropic responses stream to fail after write start, got %v", err)
+	}
+	if strings.Contains(recorder.Body.String(), "response.completed") {
+		t.Fatalf("did not expect empty upstream stream to fabricate responses events, got %q", recorder.Body.String())
+	}
+}
+
 func parseResponsesSSEMetadata(t *testing.T, body string) (string, string, string, int64, int64) {
 	t.Helper()
 

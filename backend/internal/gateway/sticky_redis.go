@@ -15,7 +15,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
-const redisStickyOperationTimeout = 200 * time.Millisecond
+const redisStickyOperationTimeout = time.Second
 const redisEndpointRuntimeTTL = 24 * time.Hour
 
 type redisStickyStore struct {

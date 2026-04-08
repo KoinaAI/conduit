@@ -2088,6 +2088,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 	messageID := model.NewID("msg")
 	createdAt := time.Now().UTC().Unix()
 	createdWritten := false
+	sawPayload := false
 	var textBuilder strings.Builder
 	toolCalls := make([]responsesFunctionCall, 0)
 
@@ -2114,6 +2115,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 					}
 					goto readNextAnthropicLine
 				}
+				sawPayload = true
 				var body map[string]any
 				if err := json.Unmarshal([]byte(payload), &body); err != nil {
 					return proxyResponseWriteError{err: err}
@@ -2168,6 +2170,9 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 			}
 			return proxyResponseWriteError{err: err}
 		}
+	}
+	if !sawPayload {
+		return proxyResponseWriteError{err: errors.New("upstream stream ended before first response event")}
 	}
 
 	if !createdWritten {

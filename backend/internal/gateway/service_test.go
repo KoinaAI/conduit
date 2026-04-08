@@ -974,6 +974,141 @@ func TestResponsesCodexTurnStatePinsSubsequentRequests(t *testing.T) {
 	}
 }
 
+func TestResponsesPreviousResponseIDPinsSubsequentRequests(t *testing.T) {
+	t.Parallel()
+
+	providerOneRequests := make(chan observedRequest, 2)
+	providerTwoRequests := make(chan observedRequest, 2)
+
+	newResponsesServer := func(requests chan observedRequest) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			requests <- observedRequest{
+				Path:          r.URL.Path,
+				Authorization: r.Header.Get("Authorization"),
+				Body:          string(body),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_1","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+		}))
+	}
+
+	serverOne := newResponsesServer(providerOneRequests)
+	defer serverOne.Close()
+	serverTwo := newResponsesServer(providerTwoRequests)
+	defer serverTwo.Close()
+
+	state := model.DefaultState()
+	state.PricingProfiles = []model.PricingProfile{{
+		ID:               "standard",
+		Name:             "standard",
+		Currency:         "USD",
+		InputPerMillion:  1,
+		OutputPerMillion: 1,
+	}}
+	state.Providers = []model.Provider{
+		{
+			ID:             "provider-one",
+			Name:           "provider-one",
+			Kind:           model.ProviderKindOpenAICompatible,
+			Enabled:        true,
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
+			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-one",
+				BaseURL: serverOne.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-one",
+				APIKey:  "provider-one-key",
+				Enabled: true,
+			}},
+		},
+		{
+			ID:             "provider-two",
+			Name:           "provider-two",
+			Kind:           model.ProviderKindOpenAICompatible,
+			Enabled:        true,
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIResponses},
+			TimeoutSeconds: 30,
+			Endpoints: []model.ProviderEndpoint{{
+				ID:      "endpoint-two",
+				BaseURL: serverTwo.URL + "/v1",
+				Enabled: true,
+			}},
+			Credentials: []model.ProviderCredential{{
+				ID:      "credential-two",
+				APIKey:  "provider-two-key",
+				Enabled: true,
+			}},
+		},
+	}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias:            "gpt-5.4",
+		Strategy:         model.RouteStrategyRoundRobin,
+		PricingProfileID: "standard",
+		Targets: []model.RouteTarget{
+			{ID: "target-1", AccountID: "provider-one", UpstreamModel: "up-one", Weight: 1, Enabled: true, MarkupMultiplier: 1},
+			{ID: "target-2", AccountID: "provider-two", UpstreamModel: "up-two", Weight: 1, Enabled: true, MarkupMultiplier: 1},
+		},
+	}}
+
+	gatewayServer := startGatewayServer(t, state)
+	defer gatewayServer.Close()
+
+	doRequest := func(previousResponseID string) *http.Response {
+		payload := `{"model":"gpt-5.4","input":"hello","previous_response_id":"` + previousResponseID + `"}`
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, gatewayServer.URL+"/v1/responses", bytes.NewBufferString(payload))
+		if err != nil {
+			t.Fatalf("new responses request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", testGatewaySecret)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("responses request failed: %v", err)
+		}
+		return res
+	}
+
+	first := doRequest("resp-sticky-1")
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(first.Body)
+		t.Fatalf("unexpected first status: %d body=%s", first.StatusCode, string(body))
+	}
+	if got := first.Header.Get("X-Codex-Turn-State"); got != "resp-sticky-1" {
+		t.Fatalf("expected previous_response_id to become Codex turn-state, got %q", got)
+	}
+
+	var firstSeen observedRequest
+	select {
+	case firstSeen = <-providerOneRequests:
+	case firstSeen = <-providerTwoRequests:
+	}
+	firstProviderAuth := firstSeen.Authorization
+
+	second := doRequest("resp-sticky-1")
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(second.Body)
+		t.Fatalf("unexpected second status: %d body=%s", second.StatusCode, string(body))
+	}
+	if got := second.Header.Get("X-Codex-Turn-State"); got != "resp-sticky-1" {
+		t.Fatalf("expected previous_response_id to remain the emitted turn-state, got %q", got)
+	}
+
+	var secondSeen observedRequest
+	select {
+	case secondSeen = <-providerOneRequests:
+	case secondSeen = <-providerTwoRequests:
+	}
+	if secondSeen.Authorization != firstProviderAuth {
+		t.Fatalf("expected previous_response_id to keep requests pinned to %q, got %q", firstProviderAuth, secondSeen.Authorization)
+	}
+}
+
 func TestGatewayRejectsNonBearerAuthorizationHeader(t *testing.T) {
 	t.Parallel()
 

@@ -289,7 +289,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		responseTurnState := codexResponseTurnState(protocol, r.Header)
+		responseTurnState := codexResponseTurnState(protocol, r.Header, parsedRequest.sessionID)
 		ctx, requestSpan := gatewayTracer.Start(r.Context(), "gateway.proxy_http",
 			trace.WithAttributes(
 				attribute.String("gateway.protocol", string(protocol)),
@@ -1888,6 +1888,11 @@ func parseProxyRequest(protocol model.Protocol, r *http.Request, body []byte) (p
 		if value, ok := payload["stream"].(bool); ok {
 			stream = value
 		}
+		if sessionID == "" && protocol == model.ProtocolOpenAIResponses {
+			if value, ok := payload["previous_response_id"].(string); ok && strings.TrimSpace(value) != "" {
+				sessionID = strings.TrimSpace(value)
+			}
+		}
 		return parsedProxyRequest{
 			routeAlias:  modelValue,
 			stream:      stream,
@@ -1967,11 +1972,14 @@ func extractCodexTurnState(headers http.Header) string {
 	return ""
 }
 
-func codexResponseTurnState(protocol model.Protocol, headers http.Header) string {
+func codexResponseTurnState(protocol model.Protocol, headers http.Header, fallback string) string {
 	if protocol != model.ProtocolOpenAIResponses {
 		return ""
 	}
 	if value := extractCodexTurnState(headers); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(fallback); value != "" {
 		return value
 	}
 	return model.NewID("cts")

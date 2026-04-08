@@ -64,6 +64,10 @@ type DailyCheckinResult struct {
 	Result        CheckinResult
 }
 
+const maxIntegrationResponseBodyBytes int64 = 4 << 20
+
+var errIntegrationResponseTooLarge = errors.New("integration response too large")
+
 var integrationTracer = otel.Tracer("github.com/KoinaAI/conduit/backend/internal/integration")
 
 func NewService(options ...Option) *Service {
@@ -662,8 +666,11 @@ func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath st
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	data, err := readLimitedResponseBody(resp.Body, maxIntegrationResponseBodyBytes)
 	if err != nil {
+		if errors.Is(err, errIntegrationResponseTooLarge) {
+			return nil, fmt.Errorf("integration response exceeds %d bytes", maxIntegrationResponseBodyBytes)
+		}
 		return nil, err
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
@@ -678,6 +685,20 @@ func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath st
 		return nil, errors.New(readString(payload, "message"))
 	}
 	return payload, nil
+}
+
+func readLimitedResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errIntegrationResponseTooLarge
+	}
+	return data, nil
 }
 
 func (s *Service) clientForResolved(resolved resolvedBaseURL) *http.Client {

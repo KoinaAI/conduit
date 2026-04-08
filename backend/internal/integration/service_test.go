@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -763,5 +764,29 @@ func TestResolveBaseURLPinsResolvedAddress(t *testing.T) {
 	}
 	if resolved.DialAddress != "203.0.113.10:443" {
 		t.Fatalf("expected dial address to pin resolved IP, got %+v", resolved)
+	}
+}
+
+func TestDoJSONRequestRejectsOversizedResponses(t *testing.T) {
+	t.Parallel()
+
+	oversized := `{"success":true,"data":"` + strings.Repeat("a", int(maxIntegrationResponseBodyBytes)) + `"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/user/models" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(oversized))
+	}))
+	defer server.Close()
+
+	service := NewService(WithAllowPrivateBaseURLForTests())
+	_, err := service.doJSONRequest(context.Background(), http.MethodGet, server.URL, "/api/user/models", nil, nil)
+	if err == nil {
+		t.Fatalf("expected oversized response to be rejected")
+	}
+	expected := fmt.Sprintf("integration response exceeds %d bytes", maxIntegrationResponseBodyBytes)
+	if !strings.Contains(err.Error(), expected) {
+		t.Fatalf("expected %q, got %v", expected, err)
 	}
 }

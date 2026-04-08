@@ -3,7 +3,9 @@ package pricing
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -13,6 +15,9 @@ import (
 )
 
 const managedCatalogProfilePrefix = "pricing-catalog-models-dev-"
+const maxCatalogResponseBodyBytes int64 = 4 << 20
+
+var errCatalogResponseTooLarge = errors.New("pricing catalog response too large")
 
 type Service struct {
 	sourceURL string
@@ -81,8 +86,16 @@ func (s *Service) FetchProfiles(ctx context.Context) ([]model.PricingProfile, er
 		return nil, fmt.Errorf("pricing catalog returned status %d", resp.StatusCode)
 	}
 
+	body, err := readLimitedCatalogResponseBody(resp.Body, maxCatalogResponseBodyBytes)
+	if err != nil {
+		if errors.Is(err, errCatalogResponseTooLarge) {
+			return nil, fmt.Errorf("pricing catalog response exceeds %d bytes", maxCatalogResponseBodyBytes)
+		}
+		return nil, err
+	}
+
 	var payload map[string]catalogProvider
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
 
@@ -115,6 +128,20 @@ func (s *Service) FetchProfiles(ctx context.Context) ([]model.PricingProfile, er
 		return profiles[i].ID < profiles[j].ID
 	})
 	return profiles, nil
+}
+
+func readLimitedCatalogResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errCatalogResponseTooLarge
+	}
+	return data, nil
 }
 
 func ApplySyncResult(state *model.State, result SyncResult) int {

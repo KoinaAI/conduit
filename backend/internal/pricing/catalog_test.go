@@ -3,8 +3,10 @@ package pricing
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/KoinaAI/conduit/backend/internal/model"
@@ -121,5 +123,28 @@ func TestApplySyncResultRemovesStaleManagedCatalogProfilesAndRouteBindings(t *te
 	}
 	if state.ModelRoutes[0].PricingProfileID != "pricing-catalog-models-dev-openai-gpt-5-4" {
 		t.Fatalf("expected valid managed route binding to remain, got %+v", state.ModelRoutes[0])
+	}
+}
+
+func TestFetchProfilesRejectsOversizedCatalogResponses(t *testing.T) {
+	t.Parallel()
+
+	oversized := `{"openai":{"models":{"gpt-5.4":{"cost":{"input":1,"output":2}},"blob":{"cost":{"input":1},"padding":"` +
+		strings.Repeat("a", int(maxCatalogResponseBodyBytes)) +
+		`"}}}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(oversized))
+	}))
+	defer server.Close()
+
+	service := NewService(server.URL, server.Client())
+	_, err := service.FetchProfiles(context.Background())
+	if err == nil {
+		t.Fatalf("expected oversized catalog response to be rejected")
+	}
+	expected := fmt.Sprintf("pricing catalog response exceeds %d bytes", maxCatalogResponseBodyBytes)
+	if !strings.Contains(err.Error(), expected) {
+		t.Fatalf("expected %q, got %v", expected, err)
 	}
 }

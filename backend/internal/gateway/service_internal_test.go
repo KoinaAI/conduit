@@ -270,6 +270,7 @@ func TestCopyForwardHeadersDropsHopByHopAndProxyCredentials(t *testing.T) {
 
 	src := http.Header{}
 	src.Set("Connection", "Keep-Alive, X-Connection-Token")
+	src.Set("Accept-Encoding", "gzip")
 	src.Set("Keep-Alive", "timeout=5")
 	src.Set("Proxy-Authorization", "Basic abc123")
 	src.Set("Transfer-Encoding", "chunked")
@@ -281,7 +282,7 @@ func TestCopyForwardHeadersDropsHopByHopAndProxyCredentials(t *testing.T) {
 	dst := http.Header{}
 	copyForwardHeaders(dst, src)
 
-	if dst.Get("Proxy-Authorization") != "" || dst.Get("Transfer-Encoding") != "" || dst.Get("Keep-Alive") != "" || dst.Get("X-Connection-Token") != "" {
+	if dst.Get("Accept-Encoding") != "" || dst.Get("Proxy-Authorization") != "" || dst.Get("Transfer-Encoding") != "" || dst.Get("Keep-Alive") != "" || dst.Get("X-Connection-Token") != "" {
 		t.Fatalf("expected hop-by-hop and proxy headers to be stripped, got %+v", dst)
 	}
 	if dst.Get("X-Trace-ID") != "trace-1" {

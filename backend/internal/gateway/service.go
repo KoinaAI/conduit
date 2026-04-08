@@ -1981,6 +1981,7 @@ func extractGeminiModelFromPath(path string) (string, error) {
 
 func copyForwardHeaders(dst, src http.Header) {
 	skipped := map[string]struct{}{
+		"accept-encoding":          {},
 		"authorization":            {},
 		"connection":               {},
 		"content-length":           {},

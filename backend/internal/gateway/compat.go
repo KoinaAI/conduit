@@ -244,6 +244,7 @@ type responsesFunctionCall struct {
 type responsesEnvelope struct {
 	ID        string
 	MessageID string
+	CreatedAt int64
 	Text      string
 	ToolCalls []responsesFunctionCall
 	Usage     model.UsageSummary
@@ -1976,8 +1977,9 @@ func anthropicPayloadToResponsesEnvelope(payload []byte, usage model.UsageSummar
 		return responsesEnvelope{}, err
 	}
 	envelope := responsesEnvelope{
-		ID:    fallbackID(stringValue(body["id"]), "resp"),
-		Usage: usage,
+		ID:        fallbackID(stringValue(body["id"]), "resp"),
+		CreatedAt: time.Now().UTC().Unix(),
+		Usage:     usage,
 	}
 	if content, ok := body["content"].([]any); ok {
 		envelope.Text = flattenAnthropicTextBlocks(content)
@@ -2010,8 +2012,9 @@ func geminiPayloadToResponsesEnvelope(payload []byte, usage model.UsageSummary) 
 		return responsesEnvelope{}, err
 	}
 	envelope := responsesEnvelope{
-		ID:    fallbackID(stringValue(body["responseId"]), "resp"),
-		Usage: usage,
+		ID:        fallbackID(stringValue(body["responseId"]), "resp"),
+		CreatedAt: time.Now().UTC().Unix(),
+		Usage:     usage,
 	}
 	if candidates, ok := body["candidates"].([]any); ok && len(candidates) > 0 {
 		if candidate, ok := candidates[0].(map[string]any); ok {
@@ -2066,6 +2069,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 	lastEvent := ""
 	responseID := model.NewID("resp")
 	messageID := model.NewID("msg")
+	createdAt := time.Now().UTC().Unix()
 	createdWritten := false
 	var textBuilder strings.Builder
 	toolCalls := make([]responsesFunctionCall, 0)
@@ -2120,7 +2124,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 						text := stringValue(delta["text"])
 						if text != "" {
 							if !createdWritten {
-								if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+								if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 									return proxyResponseWriteError{err: err}
 								}
 								createdWritten = true
@@ -2134,7 +2138,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 					}
 				}
 				if !createdWritten {
-					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 						return proxyResponseWriteError{err: err}
 					}
 					createdWritten = true
@@ -2151,13 +2155,14 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 	}
 
 	if !createdWritten {
-		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 			return proxyResponseWriteError{err: err}
 		}
 	}
 	if err := writeResponsesCompletedEvent(w, responsesEnvelope{
 		ID:        responseID,
 		MessageID: messageID,
+		CreatedAt: createdAt,
 		Text:      textBuilder.String(),
 		ToolCalls: toolCalls,
 		Usage:     observer.Summary(),
@@ -2182,6 +2187,7 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 	flusher, _ := w.(http.Flusher)
 	responseID := model.NewID("resp")
 	messageID := model.NewID("msg")
+	createdAt := time.Now().UTC().Unix()
 	createdWritten := false
 	var textBuilder strings.Builder
 	toolCalls := make([]responsesFunctionCall, 0)
@@ -2217,7 +2223,7 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 					return proxyResponseWriteError{err: err}
 				}
 				if !createdWritten {
-					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 						return proxyResponseWriteError{err: err}
 					}
 					createdWritten = true
@@ -2248,13 +2254,14 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 	}
 
 	if !createdWritten {
-		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 			return proxyResponseWriteError{err: err}
 		}
 	}
 	if err := writeResponsesCompletedEvent(w, responsesEnvelope{
 		ID:        responseID,
 		MessageID: messageID,
+		CreatedAt: createdAt,
 		Text:      textBuilder.String(),
 		ToolCalls: toolCalls,
 		Usage:     observer.Summary(),
@@ -2265,13 +2272,13 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 	return nil
 }
 
-func writeResponsesCreatedEvent(w http.ResponseWriter, responseID, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+func writeResponsesCreatedEvent(w http.ResponseWriter, responseID, publicAlias string, createdAt int64, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	return writeResponseSSEEvent(w, "response.created", map[string]any{
 		"type": "response.created",
 		"response": map[string]any{
 			"id":         fallbackID(responseID, "resp"),
 			"object":     "response",
-			"created_at": time.Now().UTC().Unix(),
+			"created_at": fallbackUnixTimestamp(createdAt),
 			"status":     "in_progress",
 			"model":      publicAlias,
 			"output":     []any{},
@@ -2326,7 +2333,7 @@ func responsesBodyFromEnvelope(envelope responsesEnvelope, publicAlias string) m
 	return map[string]any{
 		"id":          responseID,
 		"object":      "response",
-		"created_at":  time.Now().UTC().Unix(),
+		"created_at":  fallbackUnixTimestamp(envelope.CreatedAt),
 		"status":      "completed",
 		"model":       publicAlias,
 		"output":      output,
@@ -2337,6 +2344,13 @@ func responsesBodyFromEnvelope(envelope responsesEnvelope, publicAlias string) m
 			"total_tokens":  envelope.Usage.TotalTokens,
 		},
 	}
+}
+
+func fallbackUnixTimestamp(value int64) int64 {
+	if value > 0 {
+		return value
+	}
+	return time.Now().UTC().Unix()
 }
 
 func usageSummaryMap(summary model.UsageSummary) map[string]any {

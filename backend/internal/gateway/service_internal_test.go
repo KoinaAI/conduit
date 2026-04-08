@@ -1127,22 +1127,30 @@ func TestWriteResponsesSSEFromAnthropicStream(t *testing.T) {
 		t.Fatalf("expected response.completed event, got %q", body)
 	}
 
-	deltaItemID, completedItemID := parseResponsesSSEItemIDs(t, body)
+	deltaItemID, completedItemID, createdAt, completedAt := parseResponsesSSEMetadata(t, body)
 	if deltaItemID == "" || completedItemID == "" {
 		t.Fatalf("expected both delta and completed item ids, got delta=%q completed=%q body=%q", deltaItemID, completedItemID, body)
 	}
 	if deltaItemID != completedItemID {
 		t.Fatalf("expected response.completed output item id to match delta item id, got delta=%q completed=%q", deltaItemID, completedItemID)
 	}
+	if createdAt == 0 || completedAt == 0 {
+		t.Fatalf("expected created_at in both response.created and response.completed, got created=%d completed=%d body=%q", createdAt, completedAt, body)
+	}
+	if createdAt != completedAt {
+		t.Fatalf("expected response.created and response.completed to share created_at, got created=%d completed=%d", createdAt, completedAt)
+	}
 }
 
-func parseResponsesSSEItemIDs(t *testing.T, body string) (string, string) {
+func parseResponsesSSEMetadata(t *testing.T, body string) (string, string, int64, int64) {
 	t.Helper()
 
 	lines := strings.Split(body, "\n")
 	currentEvent := ""
 	deltaItemID := ""
 	completedItemID := ""
+	createdAt := int64(0)
+	completedAt := int64(0)
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "event:") {
@@ -1161,10 +1169,14 @@ func parseResponsesSSEItemIDs(t *testing.T, body string) (string, string) {
 			t.Fatalf("decode sse payload for event %q: %v", currentEvent, err)
 		}
 		switch currentEvent {
+		case "response.created":
+			response, _ := decoded["response"].(map[string]any)
+			createdAt = int64(numberValue(response["created_at"]))
 		case "response.output_text.delta":
 			deltaItemID = strings.TrimSpace(stringValue(decoded["item_id"]))
 		case "response.completed":
 			response, _ := decoded["response"].(map[string]any)
+			completedAt = int64(numberValue(response["created_at"]))
 			output, _ := response["output"].([]any)
 			if len(output) > 0 {
 				item, _ := output[0].(map[string]any)
@@ -1172,5 +1184,20 @@ func parseResponsesSSEItemIDs(t *testing.T, body string) (string, string) {
 			}
 		}
 	}
-	return deltaItemID, completedItemID
+	return deltaItemID, completedItemID, createdAt, completedAt
+}
+
+func numberValue(value any) float64 {
+	switch current := value.(type) {
+	case float64:
+		return current
+	case float32:
+		return float64(current)
+	case int:
+		return float64(current)
+	case int64:
+		return float64(current)
+	default:
+		return 0
+	}
 }

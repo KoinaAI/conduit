@@ -1091,6 +1091,9 @@ func TestWriteResponsesJSONFromAnthropicPayload(t *testing.T) {
 	if len(output) != 2 {
 		t.Fatalf("expected assistant message plus tool call output, got %+v", output)
 	}
+	if strings.TrimSpace(stringValue(body["id"])) == strings.TrimSpace(stringValue(output[0].(map[string]any)["id"])) {
+		t.Fatalf("expected response id and output item id to be distinct, got body=%+v", body)
+	}
 	if output[1].(map[string]any)["type"] != "function_call" {
 		t.Fatalf("expected tool_use to map to function_call output item, got %+v", output[1])
 	}
@@ -1128,12 +1131,18 @@ func TestWriteResponsesSSEFromAnthropicStream(t *testing.T) {
 		t.Fatalf("expected response.completed event, got %q", body)
 	}
 
-	deltaItemID, completedItemID, createdAt, completedAt := parseResponsesSSEMetadata(t, body)
+	responseID, deltaItemID, completedItemID, createdAt, completedAt := parseResponsesSSEMetadata(t, body)
 	if deltaItemID == "" || completedItemID == "" {
 		t.Fatalf("expected both delta and completed item ids, got delta=%q completed=%q body=%q", deltaItemID, completedItemID, body)
 	}
 	if deltaItemID != completedItemID {
 		t.Fatalf("expected response.completed output item id to match delta item id, got delta=%q completed=%q", deltaItemID, completedItemID)
+	}
+	if responseID == "" {
+		t.Fatalf("expected response id in response.created, got body=%q", body)
+	}
+	if responseID == completedItemID {
+		t.Fatalf("expected response id and output item id to remain distinct, got response=%q item=%q", responseID, completedItemID)
 	}
 	if createdAt == 0 || completedAt == 0 {
 		t.Fatalf("expected created_at in both response.created and response.completed, got created=%d completed=%d body=%q", createdAt, completedAt, body)
@@ -1143,11 +1152,12 @@ func TestWriteResponsesSSEFromAnthropicStream(t *testing.T) {
 	}
 }
 
-func parseResponsesSSEMetadata(t *testing.T, body string) (string, string, int64, int64) {
+func parseResponsesSSEMetadata(t *testing.T, body string) (string, string, string, int64, int64) {
 	t.Helper()
 
 	lines := strings.Split(body, "\n")
 	currentEvent := ""
+	responseID := ""
 	deltaItemID := ""
 	completedItemID := ""
 	createdAt := int64(0)
@@ -1172,6 +1182,7 @@ func parseResponsesSSEMetadata(t *testing.T, body string) (string, string, int64
 		switch currentEvent {
 		case "response.created":
 			response, _ := decoded["response"].(map[string]any)
+			responseID = strings.TrimSpace(stringValue(response["id"]))
 			createdAt = int64(numberValue(response["created_at"]))
 		case "response.output_text.delta":
 			deltaItemID = strings.TrimSpace(stringValue(decoded["item_id"]))
@@ -1185,7 +1196,7 @@ func parseResponsesSSEMetadata(t *testing.T, body string) (string, string, int64
 			}
 		}
 	}
-	return deltaItemID, completedItemID, createdAt, completedAt
+	return responseID, deltaItemID, completedItemID, createdAt, completedAt
 }
 
 func numberValue(value any) float64 {

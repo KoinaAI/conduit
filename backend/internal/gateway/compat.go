@@ -1977,7 +1977,8 @@ func anthropicPayloadToResponsesEnvelope(payload []byte, usage model.UsageSummar
 		return responsesEnvelope{}, err
 	}
 	envelope := responsesEnvelope{
-		ID:        fallbackID(stringValue(body["id"]), "resp"),
+		ID:        model.NewID("resp"),
+		MessageID: fallbackID(stringValue(body["id"]), "msg"),
 		CreatedAt: time.Now().UTC().Unix(),
 		Usage:     usage,
 	}
@@ -2105,7 +2106,6 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 				case "message_start":
 					if message, ok := body["message"].(map[string]any); ok {
 						messageID = fallbackID(stringValue(message["id"]), "msg")
-						responseID = messageID
 					}
 				case "content_block_start":
 					if block, ok := body["content_block"].(map[string]any); ok && strings.TrimSpace(stringValue(block["type"])) == "tool_use" {

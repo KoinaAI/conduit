@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -289,7 +290,7 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 
 	t.Run("gemini stream", func(t *testing.T) {
 		payload := `{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`
-		res, body := postJSON(t, gatewayServer.URL+"/v1beta/models/gemini-2.5:streamGenerateContent", payload)
+		res, body := postJSON(t, gatewayServer.URL+"/v1beta/models/gemini-2.5:streamGenerateContent?trace=1", payload)
 		defer res.Body.Close()
 
 		if res.StatusCode != http.StatusOK {
@@ -305,8 +306,12 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		if seen.APIKey != "gemini-key" {
 			t.Fatalf("expected gemini api key header, got: %s", seen.APIKey)
 		}
-		if seen.Query != "" {
-			t.Fatalf("expected gemini request query to stay empty, got: %s", seen.Query)
+		query, err := url.ParseQuery(seen.Query)
+		if err != nil {
+			t.Fatalf("parse gemini query: %v", err)
+		}
+		if query.Get("alt") != "sse" || query.Get("trace") != "1" {
+			t.Fatalf("expected gemini request query to include alt=sse and preserve client query, got %q", seen.Query)
 		}
 		if res.Trailer.Get("X-Gateway-Total-Tokens") != "14" {
 			t.Fatalf("expected gemini usage trailer, got %+v", res.Trailer)

@@ -69,6 +69,20 @@ func TestRewriteProxyRequestGeminiPreservesBody(t *testing.T) {
 	}
 }
 
+func TestPrepareUpstreamExchangeGeminiStreamForcesSSEQuery(t *testing.T) {
+	t.Parallel()
+
+	exchange, err := prepareUpstreamExchange(model.ProtocolGeminiStream, model.ProviderKindGemini, "/v1beta/models/gemini-2.5:streamGenerateContent", parsedProxyRequest{
+		rawBody: []byte(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`),
+	}, "gem-up")
+	if err != nil {
+		t.Fatalf("prepare upstream exchange: %v", err)
+	}
+	if exchange.QuerySet.Get("alt") != "sse" {
+		t.Fatalf("expected gemini stream exchange to force alt=sse, got %+v", exchange.QuerySet)
+	}
+}
+
 func TestAnthropicToOpenAIChatPreservesToolAndImageContext(t *testing.T) {
 	t.Parallel()
 
@@ -232,6 +246,40 @@ func TestWriteAnthropicSSEReturnsErrorOnEmptyStream(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "message_start") {
 		t.Fatalf("did not expect empty upstream stream to fabricate anthropic events, got %q", recorder.Body.String())
+	}
+}
+
+func TestWriteGeminiSSEReturnsErrorOnEmptyStream(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	resp := &http.Response{
+		Body: io.NopCloser(strings.NewReader("")),
+	}
+	err := writeGeminiSSE(recorder, resp, NewUsageObserver(model.ProtocolGeminiStream), "gemini-2.5", nil, resolvedCandidate{})
+	if err == nil || !responseWriteStarted(err) {
+		t.Fatalf("expected empty gemini SSE stream to fail after write start, got %v", err)
+	}
+	if strings.Contains(recorder.Body.String(), "usageMetadata") {
+		t.Fatalf("did not expect empty upstream stream to fabricate gemini events, got %q", recorder.Body.String())
+	}
+}
+
+func TestWriteResponsesSSEFromGeminiStreamReturnsErrorOnEmptyStream(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	resp := &http.Response{
+		Body: io.NopCloser(strings.NewReader("")),
+	}
+	err := writeResponsesSSE(recorder, resp, NewUsageObserver(model.ProtocolOpenAIResponses), "gpt-5.4", nil, resolvedCandidate{
+		provider: model.Provider{Kind: model.ProviderKindGemini},
+	})
+	if err == nil || !responseWriteStarted(err) {
+		t.Fatalf("expected empty gemini responses stream to fail after write start, got %v", err)
+	}
+	if strings.Contains(recorder.Body.String(), "response.completed") {
+		t.Fatalf("did not expect empty upstream stream to fabricate responses events, got %q", recorder.Body.String())
 	}
 }
 
@@ -999,6 +1047,9 @@ func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
 	}
 	if exchange.ResponseMode != responseModeGeminiSSE {
 		t.Fatalf("unexpected response mode: %s", exchange.ResponseMode)
+	}
+	if exchange.QuerySet.Get("alt") != "sse" {
+		t.Fatalf("expected gemini chat stream exchange to force alt=sse, got %+v", exchange.QuerySet)
 	}
 
 	var payload map[string]any

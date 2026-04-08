@@ -74,6 +74,7 @@ type upstreamExchange struct {
 	ResponseMode        responseMode
 	UpstreamModel       string
 	PublicAlias         string
+	QuerySet            url.Values
 	RequestHeaderSet    http.Header
 	RequestHeaderRemove []string
 }
@@ -967,6 +968,16 @@ func (s *Service) doProxyRequest(ctx context.Context, candidate resolvedCandidat
 	}
 	if strings.TrimSpace(rawQuery) != "" {
 		upstreamURL.RawQuery = rawQuery
+	}
+	if len(exchange.QuerySet) > 0 {
+		query := upstreamURL.Query()
+		for key, values := range exchange.QuerySet {
+			query.Del(key)
+			for _, value := range values {
+				query.Add(key, value)
+			}
+		}
+		upstreamURL.RawQuery = query.Encode()
 	}
 
 	timeout := time.Duration(candidate.provider.TimeoutSeconds) * time.Second

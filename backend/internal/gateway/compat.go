@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -84,6 +85,7 @@ func prepareUpstreamExchange(protocol model.Protocol, providerKind model.Provide
 				ResponseMode:  chooseResponseMode(request.stream, responseModeGeminiJSON, responseModeGeminiSSE),
 				UpstreamModel: upstreamModel,
 				PublicAlias:   request.routeAlias,
+				QuerySet:      geminiStreamQuery(request.stream),
 			}, nil
 		default:
 			return upstreamExchange{}, fmt.Errorf("provider kind %s does not support protocol %s", providerKind, protocol)
@@ -130,6 +132,7 @@ func prepareUpstreamExchange(protocol model.Protocol, providerKind model.Provide
 				ResponseMode:  chooseResponseMode(stream, responseModeResponsesJSON, responseModeResponsesSSE),
 				UpstreamModel: upstreamModel,
 				PublicAlias:   request.routeAlias,
+				QuerySet:      geminiStreamQuery(stream),
 			}, nil
 		default:
 			return upstreamExchange{}, fmt.Errorf("provider kind %s does not support protocol %s", providerKind, protocol)
@@ -184,6 +187,7 @@ func prepareUpstreamExchange(protocol model.Protocol, providerKind model.Provide
 				ResponseMode:  responseModePassthrough,
 				UpstreamModel: upstreamModel,
 				PublicAlias:   request.routeAlias,
+				QuerySet:      geminiStreamQuery(protocol == model.ProtocolGeminiStream),
 			}, nil
 		}
 		if providerKind == model.ProviderKindOpenAICompatible {
@@ -225,6 +229,13 @@ func chooseResponseMode(stream bool, nonStream, streaming responseMode) response
 		return streaming
 	}
 	return nonStream
+}
+
+func geminiStreamQuery(stream bool) url.Values {
+	if !stream {
+		return nil
+	}
+	return url.Values{"alt": []string{"sse"}}
 }
 
 func cloneJSONMap(value map[string]any) map[string]any {
@@ -1850,6 +1861,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 	reader := bufio.NewReader(resp.Body)
 	flusher, _ := w.(http.Flusher)
 	finishReason := "STOP"
+	sawPayload := false
 
 	flush := func() {
 		if flusher != nil {
@@ -1877,6 +1889,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 			} else if payload == "[DONE]" {
 				break
 			} else {
+				sawPayload = true
 				var upstream openAIChatResponse
 				if err := json.Unmarshal([]byte(payload), &upstream); err != nil {
 					return proxyResponseWriteError{err: err}
@@ -1909,6 +1922,9 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 			}
 			return proxyResponseWriteError{err: err}
 		}
+	}
+	if !sawPayload {
+		return proxyResponseWriteError{err: errors.New("upstream stream ended before first response event")}
 	}
 
 	if err := writeResponseSSEData(w, map[string]any{
@@ -2189,6 +2205,7 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 	messageID := model.NewID("msg")
 	createdAt := time.Now().UTC().Unix()
 	createdWritten := false
+	sawPayload := false
 	var textBuilder strings.Builder
 	toolCalls := make([]responsesFunctionCall, 0)
 
@@ -2218,6 +2235,7 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 					break
 				}
 			} else {
+				sawPayload = true
 				var body map[string]any
 				if err := json.Unmarshal([]byte(payload), &body); err != nil {
 					return proxyResponseWriteError{err: err}
@@ -2251,6 +2269,9 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 			}
 			return proxyResponseWriteError{err: err}
 		}
+	}
+	if !sawPayload {
+		return proxyResponseWriteError{err: errors.New("upstream stream ended before first response event")}
 	}
 
 	if !createdWritten {

@@ -1015,6 +1015,49 @@ func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatContentToGeminiPartsSkipsRemoteImageURLs(t *testing.T) {
+	t.Parallel()
+
+	parts := openAIChatContentToGeminiParts([]any{
+		map[string]any{"type": "text", "text": "look"},
+		map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": "https://example.com/cat.png",
+			},
+		},
+	})
+	if len(parts) != 1 {
+		t.Fatalf("expected remote image URL to be skipped for gemini inlineData conversion, got %+v", parts)
+	}
+	if parts[0]["text"] != "look" {
+		t.Fatalf("expected text part to remain, got %+v", parts)
+	}
+}
+
+func TestOpenAIChatContentToGeminiPartsPreservesDataURLImages(t *testing.T) {
+	t.Parallel()
+
+	parts := openAIChatContentToGeminiParts([]any{
+		map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": "data:image/png;base64,ZmFrZQ==",
+			},
+		},
+	})
+	if len(parts) != 1 {
+		t.Fatalf("expected one gemini inlineData image part, got %+v", parts)
+	}
+	inlineData, ok := parts[0]["inlineData"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected inlineData image part, got %+v", parts[0])
+	}
+	if inlineData["mimeType"] != "image/png" || inlineData["data"] != "ZmFrZQ==" {
+		t.Fatalf("unexpected inlineData payload: %+v", inlineData)
+	}
+}
+
 func TestWriteResponsesJSONFromAnthropicPayload(t *testing.T) {
 	t.Parallel()
 
@@ -1083,4 +1126,51 @@ func TestWriteResponsesSSEFromAnthropicStream(t *testing.T) {
 	if !strings.Contains(body, "event: response.completed") {
 		t.Fatalf("expected response.completed event, got %q", body)
 	}
+
+	deltaItemID, completedItemID := parseResponsesSSEItemIDs(t, body)
+	if deltaItemID == "" || completedItemID == "" {
+		t.Fatalf("expected both delta and completed item ids, got delta=%q completed=%q body=%q", deltaItemID, completedItemID, body)
+	}
+	if deltaItemID != completedItemID {
+		t.Fatalf("expected response.completed output item id to match delta item id, got delta=%q completed=%q", deltaItemID, completedItemID)
+	}
+}
+
+func parseResponsesSSEItemIDs(t *testing.T, body string) (string, string) {
+	t.Helper()
+
+	lines := strings.Split(body, "\n")
+	currentEvent := ""
+	deltaItemID := ""
+	completedItemID := ""
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "event:") {
+			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" {
+			continue
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+			t.Fatalf("decode sse payload for event %q: %v", currentEvent, err)
+		}
+		switch currentEvent {
+		case "response.output_text.delta":
+			deltaItemID = strings.TrimSpace(stringValue(decoded["item_id"]))
+		case "response.completed":
+			response, _ := decoded["response"].(map[string]any)
+			output, _ := response["output"].([]any)
+			if len(output) > 0 {
+				item, _ := output[0].(map[string]any)
+				completedItemID = strings.TrimSpace(stringValue(item["id"]))
+			}
+		}
+	}
+	return deltaItemID, completedItemID
 }

@@ -243,6 +243,7 @@ type responsesFunctionCall struct {
 
 type responsesEnvelope struct {
 	ID        string
+	MessageID string
 	Text      string
 	ToolCalls []responsesFunctionCall
 	Usage     model.UsageSummary
@@ -891,17 +892,35 @@ func openAIChatContentToGeminiParts(value any) []map[string]any {
 				}
 			case "image_url":
 				if image := normalizeResponsesImagePart(block); image != nil {
-					parts = append(parts, map[string]any{
-						"inlineData": map[string]any{
-							"mimeType": detectGeminiImageMimeType(image),
-							"data":     detectGeminiImageData(image),
-						},
-					})
+					if part, ok := geminiImagePartFromOpenAI(image); ok {
+						parts = append(parts, part)
+					}
 				}
 			}
 		}
 		return parts
 	}
+}
+
+func geminiImagePartFromOpenAI(part map[string]any) (map[string]any, bool) {
+	imageURL, _ := part["image_url"].(map[string]any)
+	if imageURL == nil {
+		return nil, false
+	}
+	rawURL := strings.TrimSpace(stringValue(imageURL["url"]))
+	if rawURL == "" {
+		return nil, false
+	}
+	mediaType, data, ok := splitDataURL(rawURL)
+	if !ok || strings.TrimSpace(data) == "" {
+		return nil, false
+	}
+	return map[string]any{
+		"inlineData": map[string]any{
+			"mimeType": mediaType,
+			"data":     data,
+		},
+	}, true
 }
 
 func openAIChatToolCallToGemini(call map[string]any, toolNames map[string]string) map[string]any {
@@ -967,29 +986,6 @@ func splitDataURL(value string) (string, string, bool) {
 		return "", "", false
 	}
 	return strings.TrimSpace(mediaType), strings.TrimSpace(rawData), true
-}
-
-func detectGeminiImageMimeType(part map[string]any) string {
-	imageURL, _ := part["image_url"].(map[string]any)
-	if imageURL == nil {
-		return "image/png"
-	}
-	if mediaType, _, ok := splitDataURL(strings.TrimSpace(stringValue(imageURL["url"]))); ok {
-		return mediaType
-	}
-	return "image/png"
-}
-
-func detectGeminiImageData(part map[string]any) string {
-	imageURL, _ := part["image_url"].(map[string]any)
-	if imageURL == nil {
-		return ""
-	}
-	_, data, ok := splitDataURL(strings.TrimSpace(stringValue(imageURL["url"])))
-	if !ok {
-		return ""
-	}
-	return data
 }
 
 func parseJSONObjectString(raw string) any {
@@ -2161,6 +2157,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 	}
 	if err := writeResponsesCompletedEvent(w, responsesEnvelope{
 		ID:        responseID,
+		MessageID: messageID,
 		Text:      textBuilder.String(),
 		ToolCalls: toolCalls,
 		Usage:     observer.Summary(),
@@ -2257,6 +2254,7 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 	}
 	if err := writeResponsesCompletedEvent(w, responsesEnvelope{
 		ID:        responseID,
+		MessageID: messageID,
 		Text:      textBuilder.String(),
 		ToolCalls: toolCalls,
 		Usage:     observer.Summary(),
@@ -2302,8 +2300,9 @@ func responsesBodyFromEnvelope(envelope responsesEnvelope, publicAlias string) m
 	responseID := fallbackID(envelope.ID, "resp")
 	output := make([]map[string]any, 0, 1+len(envelope.ToolCalls))
 	if strings.TrimSpace(envelope.Text) != "" {
+		messageID := fallbackID(envelope.MessageID, "msg")
 		output = append(output, map[string]any{
-			"id":     model.NewID("msg"),
+			"id":     messageID,
 			"type":   "message",
 			"status": "completed",
 			"role":   "assistant",

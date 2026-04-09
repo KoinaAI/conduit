@@ -862,6 +862,12 @@ func TestPrepareUpstreamExchangeResponsesToAnthropic(t *testing.T) {
 					"parameters":  map[string]any{"type": "object"},
 				},
 			},
+			"tool_choice": map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": "search",
+				},
+			},
 		},
 	}, "claude-3-7-sonnet")
 	if err != nil {
@@ -901,6 +907,10 @@ func TestPrepareUpstreamExchangeResponsesToAnthropic(t *testing.T) {
 	if toolResult["role"] != "user" {
 		t.Fatalf("expected function output to become user tool_result message, got %+v", toolResult)
 	}
+	toolChoice := payload["tool_choice"].(map[string]any)
+	if toolChoice["type"] != "tool" || toolChoice["name"] != "search" {
+		t.Fatalf("expected responses tool_choice to become anthropic tool selector, got %+v", payload["tool_choice"])
+	}
 }
 
 func TestPrepareUpstreamExchangeChatToAnthropic(t *testing.T) {
@@ -922,6 +932,7 @@ func TestPrepareUpstreamExchangeChatToAnthropic(t *testing.T) {
 					},
 				},
 			},
+			"tool_choice": "required",
 		},
 	}, "claude-3-7-sonnet")
 	if err != nil {
@@ -950,6 +961,10 @@ func TestPrepareUpstreamExchangeChatToAnthropic(t *testing.T) {
 	}
 	if len(payload["tools"].([]any)) != 1 {
 		t.Fatalf("expected tool definitions to be preserved, got %+v", payload["tools"])
+	}
+	toolChoice := payload["tool_choice"].(map[string]any)
+	if toolChoice["type"] != "any" {
+		t.Fatalf("expected required tool_choice to become anthropic any selector, got %+v", payload["tool_choice"])
 	}
 }
 
@@ -984,6 +999,12 @@ func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
 					"parameters": map[string]any{"type": "object"},
 				},
 			},
+			"tool_choice": map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": "search",
+				},
+			},
 		},
 	}, "gemini-2.5-pro")
 	if err != nil {
@@ -1013,6 +1034,15 @@ func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
 	if len(declarations) != 1 {
 		t.Fatalf("expected one gemini function declaration, got %+v", tools)
 	}
+	toolConfig := payload["toolConfig"].(map[string]any)
+	functionCallingConfig := toolConfig["functionCallingConfig"].(map[string]any)
+	if functionCallingConfig["mode"] != "ANY" {
+		t.Fatalf("expected responses tool_choice to become gemini ANY mode, got %+v", payload["toolConfig"])
+	}
+	allowed := functionCallingConfig["allowedFunctionNames"].([]any)
+	if len(allowed) != 1 || allowed[0] != "search" {
+		t.Fatalf("expected responses tool_choice to preserve target function, got %+v", payload["toolConfig"])
+	}
 }
 
 func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
@@ -1037,6 +1067,7 @@ func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
 					},
 				},
 			},
+			"tool_choice": "required",
 		},
 	}, "gemini-2.5-pro")
 	if err != nil {
@@ -1064,6 +1095,11 @@ func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
 	contents := payload["contents"].([]any)
 	if len(contents) != 1 || contents[0].(map[string]any)["role"] != "user" {
 		t.Fatalf("expected user chat message to remain in contents, got %+v", payload["contents"])
+	}
+	toolConfig := payload["toolConfig"].(map[string]any)
+	functionCallingConfig := toolConfig["functionCallingConfig"].(map[string]any)
+	if functionCallingConfig["mode"] != "ANY" {
+		t.Fatalf("expected required tool_choice to become gemini ANY mode, got %+v", payload["toolConfig"])
 	}
 }
 

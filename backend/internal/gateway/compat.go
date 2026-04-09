@@ -336,6 +336,9 @@ func responsesToOpenAIChatPayload(payload map[string]any, upstreamModel string) 
 	if tools, ok := normalizeResponsesToolDefinitions(payload["tools"]); ok {
 		out["tools"] = tools
 	}
+	if toolChoice, ok := payload["tool_choice"]; ok {
+		out["tool_choice"] = toolChoice
+	}
 	return out, stream, nil
 }
 
@@ -605,7 +608,49 @@ func openAIChatPayloadToAnthropic(payload map[string]any) ([]byte, error) {
 	if tools := openAIChatToolsToAnthropic(payload["tools"]); len(tools) > 0 {
 		out["tools"] = tools
 	}
+	if toolChoice := openAIChatToolChoiceToAnthropic(payload["tool_choice"]); toolChoice != nil {
+		out["tool_choice"] = toolChoice
+	}
 	return json.Marshal(out)
+}
+
+func openAIChatToolChoiceToAnthropic(value any) map[string]any {
+	switch current := value.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(current)) {
+		case "none":
+			return map[string]any{"type": "none"}
+		case "required":
+			return map[string]any{"type": "any"}
+		case "auto":
+			return map[string]any{"type": "auto"}
+		default:
+			return nil
+		}
+	case map[string]any:
+		choiceType := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		switch choiceType {
+		case "auto", "any", "none":
+			return map[string]any{"type": choiceType}
+		case "tool":
+			name := strings.TrimSpace(stringValue(current["name"]))
+			if name == "" {
+				return nil
+			}
+			return map[string]any{"type": "tool", "name": name}
+		case "function":
+			function, _ := current["function"].(map[string]any)
+			name := strings.TrimSpace(stringValue(function["name"]))
+			if name == "" {
+				return nil
+			}
+			return map[string]any{"type": "tool", "name": name}
+		default:
+			return nil
+		}
+	default:
+		return nil
+	}
 }
 
 func openAIChatMessageToAnthropic(message map[string]any) map[string]any {
@@ -780,6 +825,9 @@ func openAIChatPayloadToGemini(payload map[string]any) ([]byte, error) {
 	if tools := openAIChatToolsToGemini(payload["tools"]); len(tools) > 0 {
 		out["tools"] = tools
 	}
+	if toolConfig := openAIChatToolChoiceToGemini(payload["tool_choice"]); toolConfig != nil {
+		out["toolConfig"] = toolConfig
+	}
 
 	systemParts := make([]map[string]any, 0, 2)
 	contents := make([]map[string]any, 0, 8)
@@ -812,6 +860,51 @@ func openAIChatPayloadToGemini(payload map[string]any) ([]byte, error) {
 	}
 	out["contents"] = contents
 	return json.Marshal(out)
+}
+
+func openAIChatToolChoiceToGemini(value any) map[string]any {
+	config := map[string]any{}
+	functionCallingConfig := map[string]any{}
+	switch current := value.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(current)) {
+		case "none":
+			functionCallingConfig["mode"] = "NONE"
+		case "required":
+			functionCallingConfig["mode"] = "ANY"
+		case "auto":
+			functionCallingConfig["mode"] = "AUTO"
+		default:
+			return nil
+		}
+	case map[string]any:
+		choiceType := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		switch choiceType {
+		case "none":
+			functionCallingConfig["mode"] = "NONE"
+		case "required", "any":
+			functionCallingConfig["mode"] = "ANY"
+		case "auto":
+			functionCallingConfig["mode"] = "AUTO"
+		case "function":
+			function, _ := current["function"].(map[string]any)
+			name := strings.TrimSpace(stringValue(function["name"]))
+			if name == "" {
+				return nil
+			}
+			functionCallingConfig["mode"] = "ANY"
+			functionCallingConfig["allowedFunctionNames"] = []string{name}
+		default:
+			return nil
+		}
+	default:
+		return nil
+	}
+	if len(functionCallingConfig) == 0 {
+		return nil
+	}
+	config["functionCallingConfig"] = functionCallingConfig
+	return config
 }
 
 func openAIChatGenerationConfig(payload map[string]any) map[string]any {

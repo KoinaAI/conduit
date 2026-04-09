@@ -338,6 +338,80 @@ func TestCopyForwardHeadersDropsHopByHopAndProxyCredentials(t *testing.T) {
 	}
 }
 
+func TestCopyResponseHeadersDropsHopByHopHeaders(t *testing.T) {
+	t.Parallel()
+
+	src := http.Header{}
+	src.Set("Connection", "keep-alive, X-Upstream-Hop")
+	src.Set("Keep-Alive", "timeout=5")
+	src.Set("Proxy-Authenticate", "Basic realm=test")
+	src.Set("Proxy-Authorization", "Basic abc123")
+	src.Set("Proxy-Connection", "keep-alive")
+	src.Set("TE", "trailers")
+	src.Set("Trailer", "X-Test")
+	src.Set("Transfer-Encoding", "chunked")
+	src.Set("Upgrade", "websocket")
+	src.Set("Sec-WebSocket-Accept", "token")
+	src.Set("X-Upstream-Hop", "secret")
+	src.Set("X-Upstream-Trace", "trace-1")
+
+	dst := http.Header{}
+	copyResponseHeaders(dst, src)
+
+	for _, key := range []string{
+		"Connection",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Proxy-Connection",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+		"Sec-WebSocket-Accept",
+		"X-Upstream-Hop",
+	} {
+		if value := dst.Get(key); value != "" {
+			t.Fatalf("expected response hop-by-hop header %s to be stripped, got %+v", key, dst)
+		}
+	}
+	if dst.Get("X-Upstream-Trace") != "trace-1" {
+		t.Fatalf("expected end-to-end response header to be preserved, got %+v", dst)
+	}
+}
+
+func TestOpenAIChatToolChoiceToGeminiAcceptsCanonicalToolSelector(t *testing.T) {
+	t.Parallel()
+
+	config := openAIChatToolChoiceToGemini(map[string]any{
+		"type": "tool",
+		"name": "search",
+	})
+	if config == nil {
+		t.Fatal("expected canonical tool selector to be preserved for gemini")
+	}
+	functionCallingConfig := config["functionCallingConfig"].(map[string]any)
+	if functionCallingConfig["mode"] != "ANY" {
+		t.Fatalf("expected canonical tool selector to map to ANY mode, got %+v", config)
+	}
+	allowed := functionCallingConfig["allowedFunctionNames"].([]string)
+	if len(allowed) != 1 || allowed[0] != "search" {
+		t.Fatalf("expected canonical tool selector to preserve allowed function name, got %+v", config)
+	}
+}
+
+func TestOpenAIChatToolChoiceToAnthropicAcceptsCanonicalAnySelector(t *testing.T) {
+	t.Parallel()
+
+	config := openAIChatToolChoiceToAnthropic("any")
+	if config == nil {
+		t.Fatal("expected canonical any selector to be preserved for anthropic")
+	}
+	if config["type"] != "any" {
+		t.Fatalf("expected canonical any selector to map to anthropic any type, got %+v", config)
+	}
+}
+
 func TestBuildCandidatePlanRespectsPerProviderMaxAttempts(t *testing.T) {
 	t.Parallel()
 
@@ -999,6 +1073,11 @@ func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
 					"parameters": map[string]any{"type": "object"},
 				},
 			},
+			"text": map[string]any{
+				"format": map[string]any{
+					"type": "json_object",
+				},
+			},
 			"tool_choice": map[string]any{
 				"type": "function",
 				"function": map[string]any{
@@ -1034,6 +1113,10 @@ func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
 	if len(declarations) != 1 {
 		t.Fatalf("expected one gemini function declaration, got %+v", tools)
 	}
+	generationConfig := payload["generationConfig"].(map[string]any)
+	if generationConfig["responseMimeType"] != "application/json" {
+		t.Fatalf("expected responses text.format to become gemini JSON response mime type, got %+v", generationConfig)
+	}
 	toolConfig := payload["toolConfig"].(map[string]any)
 	functionCallingConfig := toolConfig["functionCallingConfig"].(map[string]any)
 	if functionCallingConfig["mode"] != "ANY" {
@@ -1067,6 +1150,19 @@ func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
 					},
 				},
 			},
+			"response_format": map[string]any{
+				"type": "json_schema",
+				"json_schema": map[string]any{
+					"name": "weather",
+					"schema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"forecast": map[string]any{"type": "string"},
+						},
+						"required": []any{"forecast"},
+					},
+				},
+			},
 			"tool_choice": "required",
 		},
 	}, "gemini-2.5-pro")
@@ -1091,6 +1187,14 @@ func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
 	systemParts := systemInstruction["parts"].([]any)
 	if len(systemParts) != 1 || systemParts[0].(map[string]any)["text"] != "be concise" {
 		t.Fatalf("expected system chat message to become systemInstruction, got %+v", payload["systemInstruction"])
+	}
+	generationConfig := payload["generationConfig"].(map[string]any)
+	if generationConfig["responseMimeType"] != "application/json" {
+		t.Fatalf("expected chat response_format to become gemini JSON response mime type, got %+v", generationConfig)
+	}
+	responseSchema := generationConfig["responseJsonSchema"].(map[string]any)
+	if responseSchema["type"] != "object" {
+		t.Fatalf("expected chat response_format schema to be preserved, got %+v", generationConfig)
 	}
 	contents := payload["contents"].([]any)
 	if len(contents) != 1 || contents[0].(map[string]any)["role"] != "user" {

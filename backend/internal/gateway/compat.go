@@ -339,7 +339,25 @@ func responsesToOpenAIChatPayload(payload map[string]any, upstreamModel string) 
 	if toolChoice, ok := payload["tool_choice"]; ok {
 		out["tool_choice"] = toolChoice
 	}
+	if responseFormat, ok := normalizeResponsesResponseFormat(payload); ok {
+		out["response_format"] = responseFormat
+	}
 	return out, stream, nil
+}
+
+func normalizeResponsesResponseFormat(payload map[string]any) (any, bool) {
+	if responseFormat, ok := payload["response_format"]; ok && responseFormat != nil {
+		return responseFormat, true
+	}
+	textConfig, ok := payload["text"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	responseFormat, ok := textConfig["format"]
+	if !ok || responseFormat == nil {
+		return nil, false
+	}
+	return responseFormat, true
 }
 
 func responseInputItemsToOpenAIMessages(items []any) ([]map[string]any, error) {
@@ -620,7 +638,7 @@ func openAIChatToolChoiceToAnthropic(value any) map[string]any {
 		switch strings.ToLower(strings.TrimSpace(current)) {
 		case "none":
 			return map[string]any{"type": "none"}
-		case "required":
+		case "required", "any":
 			return map[string]any{"type": "any"}
 		case "auto":
 			return map[string]any{"type": "auto"}
@@ -870,7 +888,7 @@ func openAIChatToolChoiceToGemini(value any) map[string]any {
 		switch strings.ToLower(strings.TrimSpace(current)) {
 		case "none":
 			functionCallingConfig["mode"] = "NONE"
-		case "required":
+		case "required", "any":
 			functionCallingConfig["mode"] = "ANY"
 		case "auto":
 			functionCallingConfig["mode"] = "AUTO"
@@ -886,6 +904,13 @@ func openAIChatToolChoiceToGemini(value any) map[string]any {
 			functionCallingConfig["mode"] = "ANY"
 		case "auto":
 			functionCallingConfig["mode"] = "AUTO"
+		case "tool":
+			name := strings.TrimSpace(stringValue(current["name"]))
+			if name == "" {
+				return nil
+			}
+			functionCallingConfig["mode"] = "ANY"
+			functionCallingConfig["allowedFunctionNames"] = []string{name}
 		case "function":
 			function, _ := current["function"].(map[string]any)
 			name := strings.TrimSpace(stringValue(function["name"]))
@@ -918,10 +943,44 @@ func openAIChatGenerationConfig(payload map[string]any) map[string]any {
 	if topP, ok := payload["top_p"]; ok {
 		config["topP"] = topP
 	}
+	for key, value := range openAIChatResponseFormatToGemini(payload["response_format"]) {
+		config[key] = value
+	}
 	if len(config) == 0 {
 		return nil
 	}
 	return config
+}
+
+func openAIChatResponseFormatToGemini(value any) map[string]any {
+	switch current := value.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(current)) {
+		case "json_object", "json_schema":
+			return map[string]any{"responseMimeType": "application/json"}
+		default:
+			return nil
+		}
+	case map[string]any:
+		formatType := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		switch formatType {
+		case "json_object":
+			return map[string]any{"responseMimeType": "application/json"}
+		case "json_schema":
+			config := map[string]any{"responseMimeType": "application/json"}
+			schemaContainer, _ := current["json_schema"].(map[string]any)
+			if schema, ok := schemaContainer["schema"]; ok && schema != nil {
+				config["responseJsonSchema"] = schema
+			} else if schema, ok := current["schema"]; ok && schema != nil {
+				config["responseJsonSchema"] = schema
+			}
+			return config
+		default:
+			return nil
+		}
+	default:
+		return nil
+	}
 }
 
 func openAIChatMessageToGemini(message map[string]any, toolNames map[string]string) map[string]any {

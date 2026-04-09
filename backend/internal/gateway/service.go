@@ -2053,9 +2053,30 @@ func applyProviderAuth(headers http.Header, providerKind model.ProviderKind, api
 }
 
 func copyResponseHeaders(dst, src http.Header) {
+	skipped := map[string]struct{}{
+		"connection":           {},
+		"content-length":       {},
+		"keep-alive":           {},
+		"proxy-authenticate":   {},
+		"proxy-authorization":  {},
+		"proxy-connection":     {},
+		"te":                   {},
+		"trailer":              {},
+		"transfer-encoding":    {},
+		"upgrade":              {},
+		"sec-websocket-accept": {},
+	}
+	for _, value := range src.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			name := strings.ToLower(strings.TrimSpace(token))
+			if name == "" {
+				continue
+			}
+			skipped[name] = struct{}{}
+		}
+	}
 	for key, values := range src {
-		switch strings.ToLower(key) {
-		case "content-length", "transfer-encoding", "connection":
+		if _, skip := skipped[strings.ToLower(key)]; skip {
 			continue
 		}
 		for _, value := range values {

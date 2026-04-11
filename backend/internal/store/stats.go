@@ -255,8 +255,8 @@ func (s *FileStore) scanStatsRows(window StatsWindow, visit func(statsRecord) er
 
 	rows, err := db.Query(
 		s.rebind(`SELECT route_alias, gateway_key_id, account_id, provider_name, status_code, stream, payload FROM request_records WHERE started_at >= ? AND started_at <= ? ORDER BY started_at DESC`),
-		window.StartAt.UTC().Format(time.RFC3339Nano),
-		window.EndAt.UTC().Format(time.RFC3339Nano),
+		formatStoreTime(window.StartAt),
+		formatStoreTime(window.EndAt),
 	)
 	if err != nil {
 		return err
@@ -310,7 +310,7 @@ func (s *FileStore) gatewayKeyNameMap() map[string]string {
 
 func (m *StatsMetrics) addRecord(record statsRecord) {
 	m.RequestCount++
-	if record.statusCode >= httpStatusSuccessMin && record.statusCode < httpStatusSuccessMax {
+	if statsStatusCountsAsSuccess(record.statusCode) {
 		m.SuccessCount++
 	} else {
 		m.ErrorCount++
@@ -337,7 +337,13 @@ func roundStat(value float64) float64 {
 	return math.Round(value*1_000_000) / 1_000_000
 }
 
+func statsStatusCountsAsSuccess(statusCode int) bool {
+	return statusCode == httpStatusSwitchingProtocols ||
+		(statusCode >= httpStatusSuccessMin && statusCode < httpStatusSuccessMax)
+}
+
 const (
-	httpStatusSuccessMin = 200
-	httpStatusSuccessMax = 400
+	httpStatusSwitchingProtocols = 101
+	httpStatusSuccessMin         = 200
+	httpStatusSuccessMax         = 400
 )

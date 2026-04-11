@@ -21,7 +21,8 @@ import (
 )
 
 const (
-	configStateKey = "config_state"
+	configStateKey     = "config_state"
+	storeTimeLayoutUTC = "2006-01-02T15:04:05.000000000Z"
 )
 
 type storageBackend string
@@ -97,6 +98,10 @@ func Open(locator string, options ...OpenOption) (*FileStore, error) {
 		requestHistoryLimit: openCfg.requestHistoryLimit,
 	}
 	if err := store.initSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.normalizeStoredTimestamps(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -305,6 +310,26 @@ func pruneBackups(dir, prefix string, retain int) error {
 	return nil
 }
 
+func formatStoreTime(value time.Time) string {
+	return value.UTC().Format(storeTimeLayoutUTC)
+}
+
+func parseStoreTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, errors.New("store time is empty")
+	}
+	parsed, err := time.Parse(storeTimeLayoutUTC, value)
+	if err == nil {
+		return parsed.UTC(), nil
+	}
+	parsed, err = time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parsed.UTC(), nil
+}
+
 func (s *FileStore) initSchema() error {
 	ddl := sqliteSchemaDDL
 	if s.backend == backendPostgres {
@@ -404,6 +429,110 @@ func rebindQuery(query string) string {
 		builder.WriteRune(char)
 	}
 	return builder.String()
+}
+
+func (s *FileStore) normalizeStoredTimestamps() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return errors.New("store is closed")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if err = normalizeTimestampRows(
+		tx,
+		s.rebind(`SELECT id, started_at FROM request_records`),
+		s.rebind(`UPDATE request_records SET started_at = ? WHERE id = ?`),
+		func(scan func(...any) error) ([]any, string, error) {
+			var id string
+			var startedAt string
+			if err := scan(&id, &startedAt); err != nil {
+				return nil, "", err
+			}
+			return []any{id}, startedAt, nil
+		},
+	); err != nil {
+		return err
+	}
+	if err = normalizeTimestampRows(
+		tx,
+		s.rebind(`SELECT request_id, sequence, started_at FROM request_attempts`),
+		s.rebind(`UPDATE request_attempts SET started_at = ? WHERE request_id = ? AND sequence = ?`),
+		func(scan func(...any) error) ([]any, string, error) {
+			var requestID string
+			var sequence int
+			var startedAt string
+			if err := scan(&requestID, &sequence, &startedAt); err != nil {
+				return nil, "", err
+			}
+			return []any{requestID, sequence}, startedAt, nil
+		},
+	); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func normalizeTimestampRows(
+	tx *sql.Tx,
+	selectQuery string,
+	updateQuery string,
+	scanRow func(scan func(...any) error) ([]any, string, error),
+) error {
+	rows, err := tx.Query(selectQuery)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type updateRow struct {
+		keys      []any
+		startedAt string
+	}
+	updates := make([]updateRow, 0, 16)
+	for rows.Next() {
+		keys, rawStartedAt, err := scanRow(rows.Scan)
+		if err != nil {
+			return err
+		}
+		parsed, err := parseStoreTime(rawStartedAt)
+		if err != nil {
+			continue
+		}
+		normalized := formatStoreTime(parsed)
+		if normalized == rawStartedAt {
+			continue
+		}
+		updates = append(updates, updateRow{
+			keys:      keys,
+			startedAt: normalized,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		args := make([]any, 0, 1+len(update.keys))
+		args = append(args, update.startedAt)
+		args = append(args, update.keys...)
+		if _, err := tx.Exec(updateQuery, args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *FileStore) load() error {
@@ -569,7 +698,7 @@ func (s *FileStore) AppendRequestRecord(record model.RequestRecord, attempts []m
 	if _, err = tx.Exec(
 		s.rebind(recordUpsert),
 		record.ID,
-		record.StartedAt.UTC().Format(time.RFC3339Nano),
+		formatStoreTime(record.StartedAt),
 		record.Protocol,
 		record.RouteAlias,
 		record.StatusCode,
@@ -595,7 +724,7 @@ func (s *FileStore) AppendRequestRecord(record model.RequestRecord, attempts []m
 			s.rebind(`INSERT INTO request_attempts (request_id, sequence, started_at, payload) VALUES (?, ?, ?, ?)`),
 			attempt.RequestID,
 			attempt.Sequence,
-			attempt.StartedAt.UTC().Format(time.RFC3339Nano),
+			formatStoreTime(attempt.StartedAt),
 			payload,
 		); err != nil {
 			return err
@@ -645,11 +774,9 @@ func (s *FileStore) AppendRequestRecord(record model.RequestRecord, attempts []m
 
 // RequestAttempts returns the recorded upstream attempts for one request.
 func (s *FileStore) RequestAttempts(requestID string) ([]model.RequestAttemptRecord, error) {
-	s.mu.RLock()
-	db := s.db
-	s.mu.RUnlock()
-	if db == nil {
-		return nil, errors.New("store is closed")
+	db, err := s.readDB()
+	if err != nil {
+		return nil, err
 	}
 	rows, err := db.Query(s.rebind(`SELECT payload FROM request_attempts WHERE request_id = ? ORDER BY sequence ASC`), requestID)
 	if err != nil {
@@ -703,7 +830,7 @@ func (s *FileStore) persistStateLocked(state model.State, replaceHistory bool) e
 				s.rebind(`INSERT INTO request_records (id, started_at, protocol, route_alias, status_code, stream, provider_name, account_id, gateway_key_id, payload)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
 				record.ID,
-				record.StartedAt.UTC().Format(time.RFC3339Nano),
+				formatStoreTime(record.StartedAt),
 				record.Protocol,
 				record.RouteAlias,
 				record.StatusCode,

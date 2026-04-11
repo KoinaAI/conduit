@@ -15,7 +15,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
-const redisStickyOperationTimeout = 200 * time.Millisecond
+const redisStickyOperationTimeout = time.Second
 const redisEndpointRuntimeTTL = 24 * time.Hour
 
 type redisStickyStore struct {
@@ -27,7 +27,23 @@ type redisEndpointCircuitState struct {
 	Failures         int
 	OpenUntilUnixMS  int64
 	HalfOpenInFlight int
+	LastStatusCode   int
+	LastError        string
+	LastCheckedAtMS  int64
 }
+
+var redisDecrementFloorZeroScript = redis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if not current then
+	return 0
+end
+local value = tonumber(current)
+if not value or value <= 1 then
+	redis.call("DEL", KEYS[1])
+	return 0
+end
+return redis.call("DECR", KEYS[1])
+`)
 
 func newRedisStickyStore(cfg config.Config) stickyBindingStore {
 	if strings.TrimSpace(cfg.RedisAddr) == "" {
@@ -87,6 +103,114 @@ func (s *redisStickyStore) DeleteStickyBinding(key string) error {
 	return s.client.Del(ctx, s.key(key)).Err()
 }
 
+func (s *redisStickyStore) SaveRuntimeSession(key string, session LiveSessionStatus) error {
+	ttl := time.Until(session.ExpiresAt)
+	if ttl <= 0 {
+		return nil
+	}
+	payload, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Set(ctx, s.runtimeSessionKey(key), payload, ttl).Err()
+}
+
+func (s *redisStickyStore) DeleteRuntimeSession(key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Del(ctx, s.runtimeSessionKey(key)).Err()
+}
+
+func (s *redisStickyStore) ListRuntimeSessions(now time.Time) ([]runtimeSessionRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	pattern := s.runtimeSessionPrefix() + "*"
+	cursor := uint64(0)
+	records := make([]runtimeSessionRecord, 0, 16)
+	for {
+		keys, next, err := s.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, redisKey := range keys {
+			payload, err := s.client.Get(ctx, redisKey).Bytes()
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			var session LiveSessionStatus
+			if err := json.Unmarshal(payload, &session); err != nil {
+				_ = s.client.Del(ctx, redisKey).Err()
+				continue
+			}
+			if !session.ExpiresAt.After(now) {
+				_ = s.client.Del(ctx, redisKey).Err()
+				continue
+			}
+
+			records = append(records, runtimeSessionRecord{
+				Key:     strings.TrimPrefix(redisKey, s.runtimeSessionPrefix()),
+				Session: session,
+			})
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return records, nil
+}
+
+func (s *redisStickyStore) ListStickyBindings(now time.Time) ([]stickyBindingRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	pattern := s.stickyPrefix() + "*"
+	cursor := uint64(0)
+	records := make([]stickyBindingRecord, 0, 16)
+	for {
+		keys, next, err := s.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, redisKey := range keys {
+			payload, err := s.client.Get(ctx, redisKey).Bytes()
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			var binding stickyBinding
+			if err := json.Unmarshal(payload, &binding); err != nil {
+				_ = s.client.Del(ctx, redisKey).Err()
+				continue
+			}
+			if !binding.ExpiresAt.After(now) {
+				_ = s.client.Del(ctx, redisKey).Err()
+				continue
+			}
+
+			records = append(records, stickyBindingRecord{
+				Key:     strings.TrimPrefix(redisKey, s.stickyPrefix()),
+				Binding: binding,
+			})
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return records, nil
+}
+
 func (s *redisStickyStore) NextRoundRobinValue(key string) (uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
@@ -142,6 +266,9 @@ func (s *redisStickyStore) AcquireEndpoint(candidate resolvedCandidate, now time
 					"failures":           state.Failures,
 					"open_until_unixms":  state.OpenUntilUnixMS,
 					"half_open_inflight": state.HalfOpenInFlight,
+					"last_status_code":   state.LastStatusCode,
+					"last_error":         state.LastError,
+					"last_checked_atms":  state.LastCheckedAtMS,
 				}
 				pipe.HSet(ctx, key, fields)
 				pipe.Expire(ctx, key, redisEndpointRuntimeTTL)
@@ -161,19 +288,6 @@ func (s *redisStickyStore) AcquireEndpoint(candidate resolvedCandidate, now time
 }
 
 func (s *redisStickyStore) ReportEndpointSuccess(candidate resolvedCandidate, now time.Time, halfOpen bool) error {
-	if !candidate.provider.CircuitBreaker.IsEnabled() {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
-	defer cancel()
-	return s.client.Del(ctx, s.endpointCircuitKey(candidate)).Err()
-}
-
-func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, now time.Time, halfOpen bool) error {
-	if !candidate.provider.CircuitBreaker.IsEnabled() {
-		return nil
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
 	defer cancel()
 
@@ -184,22 +298,23 @@ func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, no
 			if err != nil {
 				return err
 			}
-			if halfOpen {
-				state.Failures = max(candidate.provider.CircuitBreaker.FailureThreshold, 1)
-				state.HalfOpenInFlight = 0
-				state.OpenUntilUnixMS = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second).UTC().UnixMilli()
-			} else {
-				state.Failures++
-				state.HalfOpenInFlight = 0
-				if state.Failures >= candidate.provider.CircuitBreaker.FailureThreshold {
-					state.OpenUntilUnixMS = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second).UTC().UnixMilli()
-				}
+			if halfOpen && state.HalfOpenInFlight > 0 {
+				state.HalfOpenInFlight--
 			}
+			state.Failures = 0
+			state.OpenUntilUnixMS = 0
+			state.HalfOpenInFlight = 0
+			state.LastStatusCode = 200
+			state.LastError = ""
+			state.LastCheckedAtMS = now.UTC().UnixMilli()
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				fields := map[string]any{
 					"failures":           state.Failures,
 					"open_until_unixms":  state.OpenUntilUnixMS,
 					"half_open_inflight": state.HalfOpenInFlight,
+					"last_status_code":   state.LastStatusCode,
+					"last_error":         state.LastError,
+					"last_checked_atms":  state.LastCheckedAtMS,
 				}
 				pipe.HSet(ctx, key, fields)
 				pipe.Expire(ctx, key, redisEndpointRuntimeTTL)
@@ -213,6 +328,92 @@ func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, no
 		return err
 	}
 	return redis.TxFailedErr
+}
+
+func (s *redisStickyStore) ReportEndpointFailure(candidate resolvedCandidate, now time.Time, statusCode int, errMessage string, halfOpen bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	key := s.endpointCircuitKey(candidate)
+	for attempt := 0; attempt < 3; attempt++ {
+		err := s.client.Watch(ctx, func(tx *redis.Tx) error {
+			state, err := s.loadEndpointCircuitState(ctx, key)
+			if err != nil {
+				return err
+			}
+			if halfOpen && candidate.provider.CircuitBreaker.IsEnabled() {
+				state.Failures = max(candidate.provider.CircuitBreaker.FailureThreshold, 1)
+				state.HalfOpenInFlight = 0
+				state.OpenUntilUnixMS = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second).UTC().UnixMilli()
+			} else {
+				state.Failures++
+				state.HalfOpenInFlight = 0
+				if candidate.provider.CircuitBreaker.IsEnabled() && state.Failures >= candidate.provider.CircuitBreaker.FailureThreshold {
+					state.OpenUntilUnixMS = now.Add(time.Duration(candidate.provider.CircuitBreaker.CooldownSeconds) * time.Second).UTC().UnixMilli()
+				}
+			}
+			state.LastStatusCode = statusCode
+			state.LastError = strings.TrimSpace(errMessage)
+			state.LastCheckedAtMS = now.UTC().UnixMilli()
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				fields := map[string]any{
+					"failures":           state.Failures,
+					"open_until_unixms":  state.OpenUntilUnixMS,
+					"half_open_inflight": state.HalfOpenInFlight,
+					"last_status_code":   state.LastStatusCode,
+					"last_error":         state.LastError,
+					"last_checked_atms":  state.LastCheckedAtMS,
+				}
+				pipe.HSet(ctx, key, fields)
+				pipe.Expire(ctx, key, redisEndpointRuntimeTTL)
+				return nil
+			})
+			return err
+		}, key)
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		return err
+	}
+	return redis.TxFailedErr
+}
+
+func (s *redisStickyStore) LoadEndpointState(candidate resolvedCandidate) (endpointRuntimeState, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	state, err := s.loadEndpointCircuitState(ctx, s.endpointCircuitKey(candidate))
+	if err != nil {
+		return endpointRuntimeState{}, false, err
+	}
+	runtimeState := endpointRuntimeState{
+		ConsecutiveFailures: state.Failures,
+		HalfOpenInFlight:    state.HalfOpenInFlight,
+		LastStatusCode:      state.LastStatusCode,
+		LastError:           state.LastError,
+	}
+	if state.OpenUntilUnixMS > 0 {
+		runtimeState.OpenUntil = time.UnixMilli(state.OpenUntilUnixMS).UTC()
+	}
+	if state.LastCheckedAtMS > 0 {
+		runtimeState.LastCheckedAt = time.UnixMilli(state.LastCheckedAtMS).UTC()
+	}
+	exists := state.Failures > 0 ||
+		state.OpenUntilUnixMS > 0 ||
+		state.HalfOpenInFlight > 0 ||
+		state.LastStatusCode > 0 ||
+		strings.TrimSpace(state.LastError) != "" ||
+		state.LastCheckedAtMS > 0
+	if !exists {
+		return endpointRuntimeState{}, false, nil
+	}
+	return runtimeState, true, nil
+}
+
+func (s *redisStickyStore) ResetEndpoint(candidate resolvedCandidate) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Del(ctx, s.endpointCircuitKey(candidate)).Err()
 }
 
 func (s *redisStickyStore) AcquireGatewayKey(key model.GatewayKey, now time.Time) error {
@@ -266,7 +467,7 @@ func (s *redisStickyStore) ReleaseGatewayKey(keyID string, costUSD float64, now 
 	if strings.TrimSpace(keyID) == "" {
 		return nil
 	}
-	if _, err := s.client.Decr(ctx, s.gatewayInFlightKey(keyID)).Result(); err != nil && !errors.Is(err, redis.Nil) {
+	if err := s.decrementCounterFloorZero(ctx, s.gatewayInFlightKey(keyID)); err != nil {
 		return err
 	}
 	if costUSD <= 0 {
@@ -281,6 +482,151 @@ func (s *redisStickyStore) ReleaseGatewayKey(keyID string, costUSD float64, now 
 	}
 	_ = s.client.Expire(ctx, s.gatewaySpendKey(keyID), 31*24*time.Hour).Err()
 	return nil
+}
+
+func (s *redisStickyStore) TouchGatewayKeyInFlight(keyID string, ttl time.Duration) error {
+	if strings.TrimSpace(keyID) == "" || ttl <= 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Expire(ctx, s.gatewayInFlightKey(keyID), ttl).Err()
+}
+
+func (s *redisStickyStore) AcquireProvider(provider model.Provider, now time.Time) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	if err := s.enforceProviderBudgets(ctx, provider, now); err != nil {
+		return err
+	}
+
+	rateKey := s.providerRateKey(provider.ID, now)
+	count, err := s.client.Incr(ctx, rateKey).Result()
+	if err != nil {
+		return err
+	}
+	_ = s.client.Expire(ctx, rateKey, 2*time.Minute).Err()
+	if provider.RateLimitRPM > 0 && count > int64(provider.RateLimitRPM) {
+		_, _ = s.client.Decr(ctx, rateKey).Result()
+		return errProviderRateLimit
+	}
+
+	inflightKey := s.providerInFlightKey(provider.ID)
+	count, err = s.client.Incr(ctx, inflightKey).Result()
+	if err != nil {
+		_, _ = s.client.Decr(ctx, rateKey).Result()
+		return err
+	}
+	_ = s.client.Expire(ctx, inflightKey, time.Hour).Err()
+	if provider.MaxConcurrency > 0 && count > int64(provider.MaxConcurrency) {
+		_, _ = s.client.Decr(ctx, inflightKey).Result()
+		_, _ = s.client.Decr(ctx, rateKey).Result()
+		return errProviderConcurrencyLimit
+	}
+
+	return nil
+}
+
+func (s *redisStickyStore) ReleaseProvider(providerID string, costUSD float64, now time.Time) error {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	if strings.TrimSpace(providerID) == "" {
+		return nil
+	}
+	if err := s.decrementCounterFloorZero(ctx, s.providerInFlightKey(providerID)); err != nil {
+		return err
+	}
+	if costUSD <= 0 {
+		return nil
+	}
+	member := s.gatewaySpendMember(now, costUSD)
+	if err := s.client.ZAdd(ctx, s.providerSpendKey(providerID), redis.Z{
+		Score:  float64(now.UTC().UnixMilli()),
+		Member: member,
+	}).Err(); err != nil {
+		return err
+	}
+	_ = s.client.Expire(ctx, s.providerSpendKey(providerID), 31*24*time.Hour).Err()
+	return nil
+}
+
+func (s *redisStickyStore) TouchProviderInFlight(providerID string, ttl time.Duration) error {
+	if strings.TrimSpace(providerID) == "" || ttl <= 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+	return s.client.Expire(ctx, s.providerInFlightKey(providerID), ttl).Err()
+}
+
+func (s *redisStickyStore) LoadProviderRuntime(provider model.Provider, now time.Time) (ProviderRuntimeStatus, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisStickyOperationTimeout)
+	defer cancel()
+
+	minuteRequests, err := s.client.Get(ctx, s.providerRateKey(provider.ID, now)).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return ProviderRuntimeStatus{}, false, err
+	}
+	inFlight, err := s.client.Get(ctx, s.providerInFlightKey(provider.ID)).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return ProviderRuntimeStatus{}, false, err
+	}
+
+	spendKey := s.providerSpendKey(provider.ID)
+	cutoff := strconv.FormatInt(now.Add(-30*24*time.Hour).UTC().UnixMilli(), 10)
+	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", redisExclusiveUpperBound(cutoff)).Err(); err != nil {
+		return ProviderRuntimeStatus{}, false, err
+	}
+	entries, err := s.client.ZRangeByScoreWithScores(ctx, spendKey, &redis.ZRangeBy{
+		Min: cutoff,
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return ProviderRuntimeStatus{}, false, err
+	}
+
+	var hourlyCost, dailyCost, weeklyCost, monthlyCost float64
+	for _, entry := range entries {
+		recordedAt := time.UnixMilli(int64(entry.Score)).UTC()
+		cost, ok := parseGatewaySpendMember(entry.Member)
+		if !ok {
+			continue
+		}
+		age := now.Sub(recordedAt)
+		if age <= time.Hour {
+			hourlyCost += cost
+		}
+		if age <= 24*time.Hour {
+			dailyCost += cost
+		}
+		if age <= 7*24*time.Hour {
+			weeklyCost += cost
+		}
+		if age <= 30*24*time.Hour {
+			monthlyCost += cost
+		}
+	}
+
+	status := ProviderRuntimeStatus{
+		ProviderID:            provider.ID,
+		ProviderName:          provider.Name,
+		RateLimitRPM:          provider.RateLimitRPM,
+		MaxConcurrency:        provider.MaxConcurrency,
+		HourlyBudgetUSD:       provider.HourlyBudgetUSD,
+		DailyBudgetUSD:        provider.DailyBudgetUSD,
+		WeeklyBudgetUSD:       provider.WeeklyBudgetUSD,
+		MonthlyBudgetUSD:      provider.MonthlyBudgetUSD,
+		CurrentMinuteRequests: minuteRequests,
+		InFlight:              inFlight,
+		HourlyCostUSD:         hourlyCost,
+		DailyCostUSD:          dailyCost,
+		WeeklyCostUSD:         weeklyCost,
+		MonthlyCostUSD:        monthlyCost,
+		MinuteBucketStartedAt: now.UTC().Truncate(time.Minute),
+	}
+	return status, providerRuntimeActive(status), nil
 }
 
 func (s *redisStickyStore) GatewayAuthSourceLocked(source string, _ time.Time) (bool, error) {
@@ -346,11 +692,27 @@ func (s *redisStickyStore) ClearGatewayAuthFailures(source, lookupHash string) e
 }
 
 func (s *redisStickyStore) key(key string) string {
+	return s.stickyPrefix() + key
+}
+
+func (s *redisStickyStore) stickyPrefix() string {
 	prefix := strings.TrimSpace(s.prefix)
 	if prefix == "" {
 		prefix = "conduit"
 	}
-	return prefix + ":sticky:" + key
+	return prefix + ":sticky:"
+}
+
+func (s *redisStickyStore) runtimeSessionKey(key string) string {
+	return s.runtimeSessionPrefix() + strings.TrimSpace(key)
+}
+
+func (s *redisStickyStore) runtimeSessionPrefix() string {
+	prefix := strings.TrimSpace(s.prefix)
+	if prefix == "" {
+		prefix = "conduit"
+	}
+	return prefix + ":session:"
 }
 
 func (s *redisStickyStore) roundRobinKey(key string) string {
@@ -365,6 +727,10 @@ func (s *redisStickyStore) gatewayRateKey(keyID string, now time.Time) string {
 	return s.prefixedKey("gateway:rate", strings.TrimSpace(keyID), strconv.FormatInt(now.UTC().Truncate(time.Minute).Unix(), 10))
 }
 
+func (s *redisStickyStore) providerRateKey(providerID string, now time.Time) string {
+	return s.prefixedKey("provider:rate", strings.TrimSpace(providerID), strconv.FormatInt(now.UTC().Truncate(time.Minute).Unix(), 10))
+}
+
 func (s *redisStickyStore) endpointCircuitKey(candidate resolvedCandidate) string {
 	return s.prefixedKey("endpoint:circuit", endpointRuntimeKey(candidate))
 }
@@ -373,8 +739,16 @@ func (s *redisStickyStore) gatewayInFlightKey(keyID string) string {
 	return s.prefixedKey("gateway:inflight", strings.TrimSpace(keyID))
 }
 
+func (s *redisStickyStore) providerInFlightKey(providerID string) string {
+	return s.prefixedKey("provider:inflight", strings.TrimSpace(providerID))
+}
+
 func (s *redisStickyStore) gatewaySpendKey(keyID string) string {
 	return s.prefixedKey("gateway:spend", strings.TrimSpace(keyID))
+}
+
+func (s *redisStickyStore) providerSpendKey(providerID string) string {
+	return s.prefixedKey("provider:spend", strings.TrimSpace(providerID))
 }
 
 func (s *redisStickyStore) gatewaySpendMember(now time.Time, costUSD float64) string {
@@ -415,7 +789,7 @@ func (s *redisStickyStore) enforceGatewayBudgets(ctx context.Context, key model.
 	}
 	spendKey := s.gatewaySpendKey(key.ID)
 	cutoff := strconv.FormatInt(now.Add(-30*24*time.Hour).UTC().UnixMilli(), 10)
-	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", cutoff).Err(); err != nil {
+	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", redisExclusiveUpperBound(cutoff)).Err(); err != nil {
 		return err
 	}
 	entries, err := s.client.ZRangeByScoreWithScores(ctx, spendKey, &redis.ZRangeBy{
@@ -460,6 +834,57 @@ func (s *redisStickyStore) enforceGatewayBudgets(ctx context.Context, key model.
 	}
 }
 
+func (s *redisStickyStore) enforceProviderBudgets(ctx context.Context, provider model.Provider, now time.Time) error {
+	if provider.HourlyBudgetUSD <= 0 && provider.DailyBudgetUSD <= 0 && provider.WeeklyBudgetUSD <= 0 && provider.MonthlyBudgetUSD <= 0 {
+		return nil
+	}
+	spendKey := s.providerSpendKey(provider.ID)
+	cutoff := strconv.FormatInt(now.Add(-30*24*time.Hour).UTC().UnixMilli(), 10)
+	if err := s.client.ZRemRangeByScore(ctx, spendKey, "-inf", redisExclusiveUpperBound(cutoff)).Err(); err != nil {
+		return err
+	}
+	entries, err := s.client.ZRangeByScoreWithScores(ctx, spendKey, &redis.ZRangeBy{
+		Min: cutoff,
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return err
+	}
+	var hourlyCost, dailyCost, weeklyCost, monthlyCost float64
+	for _, entry := range entries {
+		recordedAt := time.UnixMilli(int64(entry.Score)).UTC()
+		cost, ok := parseGatewaySpendMember(entry.Member)
+		if !ok {
+			continue
+		}
+		age := now.Sub(recordedAt)
+		if age <= time.Hour {
+			hourlyCost += cost
+		}
+		if age <= 24*time.Hour {
+			dailyCost += cost
+		}
+		if age <= 7*24*time.Hour {
+			weeklyCost += cost
+		}
+		if age <= 30*24*time.Hour {
+			monthlyCost += cost
+		}
+	}
+	switch {
+	case provider.HourlyBudgetUSD > 0 && hourlyCost >= provider.HourlyBudgetUSD:
+		return errProviderHourlyBudget
+	case provider.DailyBudgetUSD > 0 && dailyCost >= provider.DailyBudgetUSD:
+		return errProviderDailyBudget
+	case provider.WeeklyBudgetUSD > 0 && weeklyCost >= provider.WeeklyBudgetUSD:
+		return errProviderWeeklyBudget
+	case provider.MonthlyBudgetUSD > 0 && monthlyCost >= provider.MonthlyBudgetUSD:
+		return errProviderMonthlyBudget
+	default:
+		return nil
+	}
+}
+
 func parseGatewaySpendMember(member any) (float64, bool) {
 	text, ok := member.(string)
 	if !ok {
@@ -488,6 +913,9 @@ func (s *redisStickyStore) loadEndpointCircuitState(ctx context.Context, key str
 		Failures:         parseRedisInt(values["failures"]),
 		OpenUntilUnixMS:  parseRedisInt64(values["open_until_unixms"]),
 		HalfOpenInFlight: parseRedisInt(values["half_open_inflight"]),
+		LastStatusCode:   parseRedisInt(values["last_status_code"]),
+		LastError:        values["last_error"],
+		LastCheckedAtMS:  parseRedisInt64(values["last_checked_atms"]),
 	}, nil
 }
 
@@ -517,6 +945,18 @@ func parseRedisInt(value string) int {
 func parseRedisInt64(value string) int64 {
 	number, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	return number
+}
+
+func redisExclusiveUpperBound(value string) string {
+	return "(" + strings.TrimSpace(value)
+}
+
+func (s *redisStickyStore) decrementCounterFloorZero(ctx context.Context, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	return redisDecrementFloorZeroScript.Run(ctx, s.client, []string{key}).Err()
 }
 
 func (s *redisStickyStore) Close() error {

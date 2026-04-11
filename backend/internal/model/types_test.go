@@ -192,10 +192,10 @@ func TestStateNormalizeAssignsProviderCapabilitiesByKind(t *testing.T) {
 	if got := state.Providers[0].Capabilities; !slices.Equal(got, []Protocol{ProtocolOpenAIChat, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected openai-compatible capabilities: %+v", got)
 	}
-	if got := state.Providers[1].Capabilities; !slices.Equal(got, []Protocol{ProtocolAnthropic, ProtocolOpenAIResponses}) {
+	if got := state.Providers[1].Capabilities; !slices.Equal(got, []Protocol{ProtocolAnthropic, ProtocolOpenAIChat, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected anthropic capabilities: %+v", got)
 	}
-	if got := state.Providers[2].Capabilities; !slices.Equal(got, []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream, ProtocolOpenAIResponses}) {
+	if got := state.Providers[2].Capabilities; !slices.Equal(got, []Protocol{ProtocolGeminiGenerate, ProtocolGeminiStream, ProtocolOpenAIChat, ProtocolOpenAIResponses}) {
 		t.Fatalf("unexpected gemini capabilities: %+v", got)
 	}
 }
@@ -223,5 +223,37 @@ func TestStateCloneDoesNotNormalizeMissingIdentifiers(t *testing.T) {
 	}
 	if cloned.Providers[0].Credentials[0].ID != "" {
 		t.Fatalf("expected clone to preserve missing credential id, got %q", cloned.Providers[0].Credentials[0].ID)
+	}
+}
+
+func TestResolvePricingProfileFallsBackToAliasRules(t *testing.T) {
+	t.Parallel()
+
+	state := DefaultState()
+	state.PricingProfiles = []PricingProfile{
+		{ID: "standard", Name: "Standard"},
+		{ID: "catalog-gpt-5", Name: "Catalog GPT-5"},
+	}
+	state.PricingAliases = []PricingAliasRule{
+		{
+			Name:             "prefix-match",
+			MatchType:        PricingAliasMatchPrefix,
+			Pattern:          "gpt-5",
+			PricingProfileID: "catalog-gpt-5",
+			Enabled:          true,
+		},
+	}
+
+	profile, ok := state.ResolvePricingProfile("", "gpt-5.4-fast", "openai/gpt-5.4-fast")
+	if !ok {
+		t.Fatal("expected pricing alias rule to resolve a profile")
+	}
+	if profile.ID != "catalog-gpt-5" {
+		t.Fatalf("expected alias rule to resolve catalog-gpt-5, got %+v", profile)
+	}
+
+	explicit, ok := state.ResolvePricingProfile("standard", "gpt-5.4-fast", "openai/gpt-5.4-fast")
+	if !ok || explicit.ID != "standard" {
+		t.Fatalf("expected explicit route pricing profile to win, got %+v ok=%v", explicit, ok)
 	}
 }

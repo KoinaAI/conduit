@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,23 +36,60 @@ func responseWriteStarted(err error) bool {
 func prepareUpstreamExchange(protocol model.Protocol, providerKind model.ProviderKind, currentPath string, request parsedProxyRequest, upstreamModel string) (upstreamExchange, error) {
 	switch protocol {
 	case model.ProtocolOpenAIChat:
-		if providerKind != model.ProviderKindOpenAICompatible {
+		switch providerKind {
+		case model.ProviderKindOpenAICompatible:
+			payload := cloneJSONMap(request.jsonPayload)
+			payload["model"] = upstreamModel
+			body, err := json.Marshal(payload)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			return upstreamExchange{
+				Path:          currentPath,
+				Body:          body,
+				Stream:        request.stream,
+				ResponseMode:  responseModePassthrough,
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+			}, nil
+		case model.ProviderKindAnthropic:
+			payload := cloneJSONMap(request.jsonPayload)
+			payload["model"] = upstreamModel
+			body, err := openAIChatPayloadToAnthropic(payload)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			return upstreamExchange{
+				Path:          "/v1/messages",
+				Body:          body,
+				Stream:        request.stream,
+				ResponseMode:  chooseResponseMode(request.stream, responseModeAnthropicJSON, responseModeAnthropicSSE),
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+			}, nil
+		case model.ProviderKindGemini:
+			payload := cloneJSONMap(request.jsonPayload)
+			payload["model"] = upstreamModel
+			body, err := openAIChatPayloadToGemini(payload)
+			if err != nil {
+				return upstreamExchange{}, err
+			}
+			path := "/v1beta/models/" + upstreamModel + ":generateContent"
+			if request.stream {
+				path = "/v1beta/models/" + upstreamModel + ":streamGenerateContent"
+			}
+			return upstreamExchange{
+				Path:          path,
+				Body:          body,
+				Stream:        request.stream,
+				ResponseMode:  chooseResponseMode(request.stream, responseModeGeminiJSON, responseModeGeminiSSE),
+				UpstreamModel: upstreamModel,
+				PublicAlias:   request.routeAlias,
+				QuerySet:      geminiStreamQuery(request.stream),
+			}, nil
+		default:
 			return upstreamExchange{}, fmt.Errorf("provider kind %s does not support protocol %s", providerKind, protocol)
 		}
-		payload := cloneJSONMap(request.jsonPayload)
-		payload["model"] = upstreamModel
-		body, err := json.Marshal(payload)
-		if err != nil {
-			return upstreamExchange{}, err
-		}
-		return upstreamExchange{
-			Path:          currentPath,
-			Body:          body,
-			Stream:        request.stream,
-			ResponseMode:  responseModePassthrough,
-			UpstreamModel: upstreamModel,
-			PublicAlias:   request.routeAlias,
-		}, nil
 	case model.ProtocolOpenAIResponses:
 		switch providerKind {
 		case model.ProviderKindOpenAICompatible:
@@ -94,6 +132,7 @@ func prepareUpstreamExchange(protocol model.Protocol, providerKind model.Provide
 				ResponseMode:  chooseResponseMode(stream, responseModeResponsesJSON, responseModeResponsesSSE),
 				UpstreamModel: upstreamModel,
 				PublicAlias:   request.routeAlias,
+				QuerySet:      geminiStreamQuery(stream),
 			}, nil
 		default:
 			return upstreamExchange{}, fmt.Errorf("provider kind %s does not support protocol %s", providerKind, protocol)
@@ -148,6 +187,7 @@ func prepareUpstreamExchange(protocol model.Protocol, providerKind model.Provide
 				ResponseMode:  responseModePassthrough,
 				UpstreamModel: upstreamModel,
 				PublicAlias:   request.routeAlias,
+				QuerySet:      geminiStreamQuery(protocol == model.ProtocolGeminiStream),
 			}, nil
 		}
 		if providerKind == model.ProviderKindOpenAICompatible {
@@ -191,6 +231,13 @@ func chooseResponseMode(stream bool, nonStream, streaming responseMode) response
 	return nonStream
 }
 
+func geminiStreamQuery(stream bool) url.Values {
+	if !stream {
+		return nil
+	}
+	return url.Values{"alt": []string{"sse"}}
+}
+
 func cloneJSONMap(value map[string]any) map[string]any {
 	cloned := make(map[string]any, len(value))
 	for key, item := range value {
@@ -207,6 +254,8 @@ type responsesFunctionCall struct {
 
 type responsesEnvelope struct {
 	ID        string
+	MessageID string
+	CreatedAt int64
 	Text      string
 	ToolCalls []responsesFunctionCall
 	Usage     model.UsageSummary
@@ -250,6 +299,9 @@ func responsesToOpenAIChatPayload(payload map[string]any, upstreamModel string) 
 			out[field] = value
 		}
 	}
+	if stopSequences := openAIStopSequences(payload["stop"]); len(stopSequences) > 0 {
+		out["stop"] = payload["stop"]
+	}
 	if maxTokens, ok := payload["max_output_tokens"]; ok {
 		out["max_tokens"] = maxTokens
 	} else if maxTokens, ok := payload["max_tokens"]; ok {
@@ -287,7 +339,28 @@ func responsesToOpenAIChatPayload(payload map[string]any, upstreamModel string) 
 	if tools, ok := normalizeResponsesToolDefinitions(payload["tools"]); ok {
 		out["tools"] = tools
 	}
+	if toolChoice, ok := payload["tool_choice"]; ok {
+		out["tool_choice"] = toolChoice
+	}
+	if responseFormat, ok := normalizeResponsesResponseFormat(payload); ok {
+		out["response_format"] = responseFormat
+	}
 	return out, stream, nil
+}
+
+func normalizeResponsesResponseFormat(payload map[string]any) (any, bool) {
+	if responseFormat, ok := payload["response_format"]; ok && responseFormat != nil {
+		return responseFormat, true
+	}
+	textConfig, ok := payload["text"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	responseFormat, ok := textConfig["format"]
+	if !ok || responseFormat == nil {
+		return nil, false
+	}
+	return responseFormat, true
 }
 
 func responseInputItemsToOpenAIMessages(items []any) ([]map[string]any, error) {
@@ -318,7 +391,7 @@ func responseInputItemToOpenAIMessages(item map[string]any) ([]map[string]any, e
 		message := map[string]any{"role": role}
 		content := responseMessageContentToOpenAIContent(item["content"])
 		if role == "tool" {
-			message["tool_call_id"] = strings.TrimSpace(stringValue(item["tool_call_id"]))
+			message["tool_call_id"] = strings.TrimSpace(firstNonEmptyString(item["tool_call_id"], item["call_id"]))
 			message["content"] = responseContentToText(item["content"])
 			return []map[string]any{message}, nil
 		}
@@ -523,6 +596,9 @@ func openAIChatPayloadToAnthropic(payload map[string]any) ([]byte, error) {
 			out[field] = value
 		}
 	}
+	if stopSequences := openAIStopSequences(payload["stop"]); len(stopSequences) > 0 {
+		out["stop_sequences"] = stopSequences
+	}
 
 	systemBlocks := make([]map[string]any, 0, 2)
 	messages := make([]map[string]any, 0, 8)
@@ -556,7 +632,49 @@ func openAIChatPayloadToAnthropic(payload map[string]any) ([]byte, error) {
 	if tools := openAIChatToolsToAnthropic(payload["tools"]); len(tools) > 0 {
 		out["tools"] = tools
 	}
+	if toolChoice := openAIChatToolChoiceToAnthropic(payload["tool_choice"]); toolChoice != nil {
+		out["tool_choice"] = toolChoice
+	}
 	return json.Marshal(out)
+}
+
+func openAIChatToolChoiceToAnthropic(value any) map[string]any {
+	switch current := value.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(current)) {
+		case "none":
+			return map[string]any{"type": "none"}
+		case "required", "any":
+			return map[string]any{"type": "any"}
+		case "auto":
+			return map[string]any{"type": "auto"}
+		default:
+			return nil
+		}
+	case map[string]any:
+		choiceType := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		switch choiceType {
+		case "auto", "any", "none":
+			return map[string]any{"type": choiceType}
+		case "tool":
+			name := strings.TrimSpace(stringValue(current["name"]))
+			if name == "" {
+				return nil
+			}
+			return map[string]any{"type": "tool", "name": name}
+		case "function":
+			function, _ := current["function"].(map[string]any)
+			name := strings.TrimSpace(stringValue(function["name"]))
+			if name == "" {
+				return nil
+			}
+			return map[string]any{"type": "tool", "name": name}
+		default:
+			return nil
+		}
+	default:
+		return nil
+	}
 }
 
 func openAIChatMessageToAnthropic(message map[string]any) map[string]any {
@@ -731,6 +849,9 @@ func openAIChatPayloadToGemini(payload map[string]any) ([]byte, error) {
 	if tools := openAIChatToolsToGemini(payload["tools"]); len(tools) > 0 {
 		out["tools"] = tools
 	}
+	if toolConfig := openAIChatToolChoiceToGemini(payload["tool_choice"]); toolConfig != nil {
+		out["toolConfig"] = toolConfig
+	}
 
 	systemParts := make([]map[string]any, 0, 2)
 	contents := make([]map[string]any, 0, 8)
@@ -765,6 +886,58 @@ func openAIChatPayloadToGemini(payload map[string]any) ([]byte, error) {
 	return json.Marshal(out)
 }
 
+func openAIChatToolChoiceToGemini(value any) map[string]any {
+	config := map[string]any{}
+	functionCallingConfig := map[string]any{}
+	switch current := value.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(current)) {
+		case "none":
+			functionCallingConfig["mode"] = "NONE"
+		case "required", "any":
+			functionCallingConfig["mode"] = "ANY"
+		case "auto":
+			functionCallingConfig["mode"] = "AUTO"
+		default:
+			return nil
+		}
+	case map[string]any:
+		choiceType := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		switch choiceType {
+		case "none":
+			functionCallingConfig["mode"] = "NONE"
+		case "required", "any":
+			functionCallingConfig["mode"] = "ANY"
+		case "auto":
+			functionCallingConfig["mode"] = "AUTO"
+		case "tool":
+			name := strings.TrimSpace(stringValue(current["name"]))
+			if name == "" {
+				return nil
+			}
+			functionCallingConfig["mode"] = "ANY"
+			functionCallingConfig["allowedFunctionNames"] = []string{name}
+		case "function":
+			function, _ := current["function"].(map[string]any)
+			name := strings.TrimSpace(stringValue(function["name"]))
+			if name == "" {
+				return nil
+			}
+			functionCallingConfig["mode"] = "ANY"
+			functionCallingConfig["allowedFunctionNames"] = []string{name}
+		default:
+			return nil
+		}
+	default:
+		return nil
+	}
+	if len(functionCallingConfig) == 0 {
+		return nil
+	}
+	config["functionCallingConfig"] = functionCallingConfig
+	return config
+}
+
 func openAIChatGenerationConfig(payload map[string]any) map[string]any {
 	config := map[string]any{}
 	if maxTokens := payload["max_tokens"]; maxTokens != nil {
@@ -776,10 +949,47 @@ func openAIChatGenerationConfig(payload map[string]any) map[string]any {
 	if topP, ok := payload["top_p"]; ok {
 		config["topP"] = topP
 	}
+	if stopSequences := openAIStopSequences(payload["stop"]); len(stopSequences) > 0 {
+		config["stopSequences"] = stopSequences
+	}
+	for key, value := range openAIChatResponseFormatToGemini(payload["response_format"]) {
+		config[key] = value
+	}
 	if len(config) == 0 {
 		return nil
 	}
 	return config
+}
+
+func openAIChatResponseFormatToGemini(value any) map[string]any {
+	switch current := value.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(current)) {
+		case "json_object", "json_schema":
+			return map[string]any{"responseMimeType": "application/json"}
+		default:
+			return nil
+		}
+	case map[string]any:
+		formatType := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		switch formatType {
+		case "json_object":
+			return map[string]any{"responseMimeType": "application/json"}
+		case "json_schema":
+			config := map[string]any{"responseMimeType": "application/json"}
+			schemaContainer, _ := current["json_schema"].(map[string]any)
+			if schema, ok := schemaContainer["schema"]; ok && schema != nil {
+				config["responseJsonSchema"] = schema
+			} else if schema, ok := current["schema"]; ok && schema != nil {
+				config["responseJsonSchema"] = schema
+			}
+			return config
+		default:
+			return nil
+		}
+	default:
+		return nil
+	}
 }
 
 func openAIChatMessageToGemini(message map[string]any, toolNames map[string]string) map[string]any {
@@ -819,7 +1029,7 @@ func openAIChatToolMessageToGemini(message map[string]any, toolNames map[string]
 	}
 	name := strings.TrimSpace(toolNames[callID])
 	if name == "" {
-		name = "tool"
+		name = strings.TrimSpace(firstNonEmptyString(message["name"], "tool"))
 	}
 	return map[string]any{
 		"role": "function",
@@ -855,17 +1065,35 @@ func openAIChatContentToGeminiParts(value any) []map[string]any {
 				}
 			case "image_url":
 				if image := normalizeResponsesImagePart(block); image != nil {
-					parts = append(parts, map[string]any{
-						"inlineData": map[string]any{
-							"mimeType": detectGeminiImageMimeType(image),
-							"data":     detectGeminiImageData(image),
-						},
-					})
+					if part, ok := geminiImagePartFromOpenAI(image); ok {
+						parts = append(parts, part)
+					}
 				}
 			}
 		}
 		return parts
 	}
+}
+
+func geminiImagePartFromOpenAI(part map[string]any) (map[string]any, bool) {
+	imageURL, _ := part["image_url"].(map[string]any)
+	if imageURL == nil {
+		return nil, false
+	}
+	rawURL := strings.TrimSpace(stringValue(imageURL["url"]))
+	if rawURL == "" {
+		return nil, false
+	}
+	mediaType, data, ok := splitDataURL(rawURL)
+	if !ok || strings.TrimSpace(data) == "" {
+		return nil, false
+	}
+	return map[string]any{
+		"inlineData": map[string]any{
+			"mimeType": mediaType,
+			"data":     data,
+		},
+	}, true
 }
 
 func openAIChatToolCallToGemini(call map[string]any, toolNames map[string]string) map[string]any {
@@ -933,29 +1161,6 @@ func splitDataURL(value string) (string, string, bool) {
 	return strings.TrimSpace(mediaType), strings.TrimSpace(rawData), true
 }
 
-func detectGeminiImageMimeType(part map[string]any) string {
-	imageURL, _ := part["image_url"].(map[string]any)
-	if imageURL == nil {
-		return "image/png"
-	}
-	if mediaType, _, ok := splitDataURL(strings.TrimSpace(stringValue(imageURL["url"]))); ok {
-		return mediaType
-	}
-	return "image/png"
-}
-
-func detectGeminiImageData(part map[string]any) string {
-	imageURL, _ := part["image_url"].(map[string]any)
-	if imageURL == nil {
-		return ""
-	}
-	_, data, ok := splitDataURL(strings.TrimSpace(stringValue(imageURL["url"])))
-	if !ok {
-		return ""
-	}
-	return data
-}
-
 func parseJSONObjectString(raw string) any {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -1014,6 +1219,9 @@ func anthropicToOpenAIChat(payload map[string]any, upstreamModel string) ([]byte
 	if topP, ok := payload["top_p"]; ok {
 		out["top_p"] = topP
 	}
+	if stop := anthropicStopSequencesToOpenAI(payload["stop_sequences"]); stop != nil {
+		out["stop"] = stop
+	}
 	stream, _ := payload["stream"].(bool)
 	if stream {
 		out["stream"] = true
@@ -1061,9 +1269,52 @@ func anthropicToOpenAIChat(payload map[string]any, upstreamModel string) ([]byte
 			out["tools"] = mapped
 		}
 	}
+	if toolChoice := anthropicToolChoiceToOpenAI(payload["tool_choice"]); toolChoice != nil {
+		out["tool_choice"] = toolChoice
+	}
 
 	body, err := json.Marshal(out)
 	return body, stream, err
+}
+
+func anthropicToolChoiceToOpenAI(value any) any {
+	current, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	switch choiceType := strings.ToLower(strings.TrimSpace(stringValue(current["type"]))); choiceType {
+	case "auto":
+		return "auto"
+	case "none":
+		return "none"
+	case "any":
+		return "required"
+	case "tool":
+		name := strings.TrimSpace(stringValue(current["name"]))
+		if name == "" {
+			return nil
+		}
+		return map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": name,
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+func anthropicStopSequencesToOpenAI(value any) any {
+	sequences := stringList(value)
+	switch len(sequences) {
+	case 0:
+		return nil
+	case 1:
+		return sequences[0]
+	default:
+		return sequences
+	}
 }
 
 func flattenAnthropicSystem(value any) string {
@@ -1128,9 +1379,74 @@ func geminiToOpenAIChat(rawBody []byte, upstreamModel string, stream bool) ([]by
 		if topP, ok := generationConfig["topP"]; ok {
 			out["top_p"] = topP
 		}
+		if stop := geminiStopSequencesToOpenAI(generationConfig["stopSequences"]); stop != nil {
+			out["stop"] = stop
+		}
+		if responseFormat := geminiResponseFormatToOpenAI(generationConfig); responseFormat != nil {
+			out["response_format"] = responseFormat
+		}
+	}
+	if toolConfig, ok := payload["toolConfig"].(map[string]any); ok {
+		if toolChoice := geminiToolChoiceToOpenAI(toolConfig["functionCallingConfig"]); toolChoice != nil {
+			out["tool_choice"] = toolChoice
+		}
 	}
 
 	return json.Marshal(out)
+}
+
+func geminiToolChoiceToOpenAI(value any) any {
+	config, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	switch mode := strings.ToUpper(strings.TrimSpace(stringValue(config["mode"]))); mode {
+	case "NONE":
+		return "none"
+	case "AUTO":
+		return "auto"
+	case "ANY":
+		names := stringList(config["allowedFunctionNames"])
+		if len(names) == 1 {
+			return map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": names[0],
+				},
+			}
+		}
+		return "required"
+	default:
+		return nil
+	}
+}
+
+func geminiStopSequencesToOpenAI(value any) any {
+	sequences := stringList(value)
+	switch len(sequences) {
+	case 0:
+		return nil
+	case 1:
+		return sequences[0]
+	default:
+		return sequences
+	}
+}
+
+func geminiResponseFormatToOpenAI(generationConfig map[string]any) any {
+	mimeType := strings.ToLower(strings.TrimSpace(stringValue(generationConfig["responseMimeType"])))
+	if mimeType != "application/json" {
+		return nil
+	}
+	if schema, ok := generationConfig["responseJsonSchema"]; ok && schema != nil {
+		return map[string]any{
+			"type": "json_schema",
+			"json_schema": map[string]any{
+				"schema": schema,
+			},
+		}
+	}
+	return map[string]any{"type": "json_object"}
 }
 
 func flattenGeminiParts(value any) string {
@@ -1501,6 +1817,43 @@ func stringValue(value any) string {
 	return text
 }
 
+func openAIStopSequences(value any) []string {
+	sequences := stringList(value)
+	if len(sequences) == 0 {
+		return nil
+	}
+	return sequences
+}
+
+func stringList(value any) []string {
+	switch current := value.(type) {
+	case string:
+		text := strings.TrimSpace(current)
+		if text == "" {
+			return nil
+		}
+		return []string{text}
+	case []string:
+		out := make([]string, 0, len(current))
+		for _, item := range current {
+			if text := strings.TrimSpace(item); text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(current))
+		for _, item := range current {
+			if text := strings.TrimSpace(stringValue(item)); text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	switch exchange.ResponseMode {
 	case responseModePassthrough:
@@ -1817,6 +2170,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 	reader := bufio.NewReader(resp.Body)
 	flusher, _ := w.(http.Flusher)
 	finishReason := "STOP"
+	sawPayload := false
 
 	flush := func() {
 		if flusher != nil {
@@ -1844,6 +2198,7 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 			} else if payload == "[DONE]" {
 				break
 			} else {
+				sawPayload = true
 				var upstream openAIChatResponse
 				if err := json.Unmarshal([]byte(payload), &upstream); err != nil {
 					return proxyResponseWriteError{err: err}
@@ -1876,6 +2231,9 @@ func writeGeminiSSE(w http.ResponseWriter, resp *http.Response, observer *UsageO
 			}
 			return proxyResponseWriteError{err: err}
 		}
+	}
+	if !sawPayload {
+		return proxyResponseWriteError{err: errors.New("upstream stream ended before first response event")}
 	}
 
 	if err := writeResponseSSEData(w, map[string]any{
@@ -1944,8 +2302,10 @@ func anthropicPayloadToResponsesEnvelope(payload []byte, usage model.UsageSummar
 		return responsesEnvelope{}, err
 	}
 	envelope := responsesEnvelope{
-		ID:    fallbackID(stringValue(body["id"]), "resp"),
-		Usage: usage,
+		ID:        model.NewID("resp"),
+		MessageID: fallbackID(stringValue(body["id"]), "msg"),
+		CreatedAt: time.Now().UTC().Unix(),
+		Usage:     usage,
 	}
 	if content, ok := body["content"].([]any); ok {
 		envelope.Text = flattenAnthropicTextBlocks(content)
@@ -1978,8 +2338,9 @@ func geminiPayloadToResponsesEnvelope(payload []byte, usage model.UsageSummary) 
 		return responsesEnvelope{}, err
 	}
 	envelope := responsesEnvelope{
-		ID:    fallbackID(stringValue(body["responseId"]), "resp"),
-		Usage: usage,
+		ID:        fallbackID(stringValue(body["responseId"]), "resp"),
+		CreatedAt: time.Now().UTC().Unix(),
+		Usage:     usage,
 	}
 	if candidates, ok := body["candidates"].([]any); ok && len(candidates) > 0 {
 		if candidate, ok := candidates[0].(map[string]any); ok {
@@ -2034,7 +2395,9 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 	lastEvent := ""
 	responseID := model.NewID("resp")
 	messageID := model.NewID("msg")
+	createdAt := time.Now().UTC().Unix()
 	createdWritten := false
+	sawPayload := false
 	var textBuilder strings.Builder
 	toolCalls := make([]responsesFunctionCall, 0)
 
@@ -2061,6 +2424,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 					}
 					goto readNextAnthropicLine
 				}
+				sawPayload = true
 				var body map[string]any
 				if err := json.Unmarshal([]byte(payload), &body); err != nil {
 					return proxyResponseWriteError{err: err}
@@ -2069,7 +2433,6 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 				case "message_start":
 					if message, ok := body["message"].(map[string]any); ok {
 						messageID = fallbackID(stringValue(message["id"]), "msg")
-						responseID = messageID
 					}
 				case "content_block_start":
 					if block, ok := body["content_block"].(map[string]any); ok && strings.TrimSpace(stringValue(block["type"])) == "tool_use" {
@@ -2088,7 +2451,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 						text := stringValue(delta["text"])
 						if text != "" {
 							if !createdWritten {
-								if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+								if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 									return proxyResponseWriteError{err: err}
 								}
 								createdWritten = true
@@ -2102,7 +2465,7 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 					}
 				}
 				if !createdWritten {
-					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 						return proxyResponseWriteError{err: err}
 					}
 					createdWritten = true
@@ -2117,14 +2480,19 @@ func writeResponsesFromAnthropicSSE(w http.ResponseWriter, resp *http.Response, 
 			return proxyResponseWriteError{err: err}
 		}
 	}
+	if !sawPayload {
+		return proxyResponseWriteError{err: errors.New("upstream stream ended before first response event")}
+	}
 
 	if !createdWritten {
-		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 			return proxyResponseWriteError{err: err}
 		}
 	}
 	if err := writeResponsesCompletedEvent(w, responsesEnvelope{
 		ID:        responseID,
+		MessageID: messageID,
+		CreatedAt: createdAt,
 		Text:      textBuilder.String(),
 		ToolCalls: toolCalls,
 		Usage:     observer.Summary(),
@@ -2149,7 +2517,9 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 	flusher, _ := w.(http.Flusher)
 	responseID := model.NewID("resp")
 	messageID := model.NewID("msg")
+	createdAt := time.Now().UTC().Unix()
 	createdWritten := false
+	sawPayload := false
 	var textBuilder strings.Builder
 	toolCalls := make([]responsesFunctionCall, 0)
 
@@ -2179,12 +2549,13 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 					break
 				}
 			} else {
+				sawPayload = true
 				var body map[string]any
 				if err := json.Unmarshal([]byte(payload), &body); err != nil {
 					return proxyResponseWriteError{err: err}
 				}
 				if !createdWritten {
-					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+					if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 						return proxyResponseWriteError{err: err}
 					}
 					createdWritten = true
@@ -2213,14 +2584,19 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 			return proxyResponseWriteError{err: err}
 		}
 	}
+	if !sawPayload {
+		return proxyResponseWriteError{err: errors.New("upstream stream ended before first response event")}
+	}
 
 	if !createdWritten {
-		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, transformers, candidate); err != nil {
+		if err := writeResponsesCreatedEvent(w, responseID, publicAlias, createdAt, transformers, candidate); err != nil {
 			return proxyResponseWriteError{err: err}
 		}
 	}
 	if err := writeResponsesCompletedEvent(w, responsesEnvelope{
 		ID:        responseID,
+		MessageID: messageID,
+		CreatedAt: createdAt,
 		Text:      textBuilder.String(),
 		ToolCalls: toolCalls,
 		Usage:     observer.Summary(),
@@ -2231,13 +2607,13 @@ func writeResponsesFromGeminiSSE(w http.ResponseWriter, resp *http.Response, obs
 	return nil
 }
 
-func writeResponsesCreatedEvent(w http.ResponseWriter, responseID, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
+func writeResponsesCreatedEvent(w http.ResponseWriter, responseID, publicAlias string, createdAt int64, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	return writeResponseSSEEvent(w, "response.created", map[string]any{
 		"type": "response.created",
 		"response": map[string]any{
 			"id":         fallbackID(responseID, "resp"),
 			"object":     "response",
-			"created_at": time.Now().UTC().Unix(),
+			"created_at": fallbackUnixTimestamp(createdAt),
 			"status":     "in_progress",
 			"model":      publicAlias,
 			"output":     []any{},
@@ -2266,8 +2642,9 @@ func responsesBodyFromEnvelope(envelope responsesEnvelope, publicAlias string) m
 	responseID := fallbackID(envelope.ID, "resp")
 	output := make([]map[string]any, 0, 1+len(envelope.ToolCalls))
 	if strings.TrimSpace(envelope.Text) != "" {
+		messageID := fallbackID(envelope.MessageID, "msg")
 		output = append(output, map[string]any{
-			"id":     model.NewID("msg"),
+			"id":     messageID,
 			"type":   "message",
 			"status": "completed",
 			"role":   "assistant",
@@ -2291,7 +2668,7 @@ func responsesBodyFromEnvelope(envelope responsesEnvelope, publicAlias string) m
 	return map[string]any{
 		"id":          responseID,
 		"object":      "response",
-		"created_at":  time.Now().UTC().Unix(),
+		"created_at":  fallbackUnixTimestamp(envelope.CreatedAt),
 		"status":      "completed",
 		"model":       publicAlias,
 		"output":      output,
@@ -2302,6 +2679,13 @@ func responsesBodyFromEnvelope(envelope responsesEnvelope, publicAlias string) m
 			"total_tokens":  envelope.Usage.TotalTokens,
 		},
 	}
+}
+
+func fallbackUnixTimestamp(value int64) int64 {
+	if value > 0 {
+		return value
+	}
+	return time.Now().UTC().Unix()
 }
 
 func usageSummaryMap(summary model.UsageSummary) map[string]any {

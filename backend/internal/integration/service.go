@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -47,9 +48,11 @@ type pinnedClient struct {
 type Option func(*Service)
 
 type SyncResult struct {
-	Snapshot   model.IntegrationSnapshot
-	FinishedAt time.Time
-	Err        error
+	Snapshot         model.IntegrationSnapshot
+	ModelsRefreshed  bool
+	PricingRefreshed bool
+	FinishedAt       time.Time
+	Err              error
 }
 
 type CheckinResult struct {
@@ -63,6 +66,10 @@ type DailyCheckinResult struct {
 	IntegrationID string
 	Result        CheckinResult
 }
+
+const maxIntegrationResponseBodyBytes int64 = 4 << 20
+
+var errIntegrationResponseTooLarge = errors.New("integration response too large")
 
 var integrationTracer = otel.Tracer("github.com/KoinaAI/conduit/backend/internal/integration")
 
@@ -78,6 +85,24 @@ func NewService(options ...Option) *Service {
 		option(service)
 	}
 	return service
+}
+
+func (s *Service) Close() error {
+	if s == nil {
+		return nil
+	}
+	if s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
+	s.pinnedClientsMu.Lock()
+	for key, client := range s.pinnedClients {
+		if client.Transport != nil {
+			client.Transport.CloseIdleConnections()
+		}
+		delete(s.pinnedClients, key)
+	}
+	s.pinnedClientsMu.Unlock()
+	return nil
 }
 
 // WithAllowPrivateBaseURLForTests relaxes SSRF protection for local tests only.
@@ -120,17 +145,19 @@ func (s *Service) PrepareSync(ctx context.Context, integration model.Integration
 		),
 	)
 	defer span.End()
-	snapshot, err := s.sync(ctx, integration)
+	outcome, err := s.sync(ctx, integration)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	} else {
-		span.SetAttributes(attribute.Int("integration.model_count", len(snapshot.ModelNames)))
+		span.SetAttributes(attribute.Int("integration.model_count", len(outcome.Snapshot.ModelNames)))
 	}
 	return SyncResult{
-		Snapshot:   snapshot,
-		FinishedAt: time.Now().UTC(),
-		Err:        err,
+		Snapshot:         outcome.Snapshot,
+		ModelsRefreshed:  outcome.ModelsRefreshed,
+		PricingRefreshed: outcome.PricingRefreshed,
+		FinishedAt:       time.Now().UTC(),
+		Err:              err,
 	}
 }
 
@@ -150,7 +177,19 @@ func (s *Service) ApplySyncResult(state *model.State, integrationID string, resu
 
 	lastCheckinAt := integration.Snapshot.LastCheckinAt
 	lastCheckinResult := integration.Snapshot.LastCheckinResult
-	integration.Snapshot = result.Snapshot
+	nextSnapshot := integration.Snapshot
+	nextSnapshot.Balance = result.Snapshot.Balance
+	nextSnapshot.Used = result.Snapshot.Used
+	nextSnapshot.Currency = result.Snapshot.Currency
+	nextSnapshot.SupportsCheckin = result.Snapshot.SupportsCheckin
+	nextSnapshot.LastError = result.Snapshot.LastError
+	if result.ModelsRefreshed {
+		nextSnapshot.ModelNames = slices.Clone(result.Snapshot.ModelNames)
+	}
+	if result.PricingRefreshed {
+		nextSnapshot.Prices = mapsClonePricing(result.Snapshot.Prices)
+	}
+	integration.Snapshot = nextSnapshot
 	integration.Snapshot.LastCheckinAt = lastCheckinAt
 	integration.Snapshot.LastCheckinResult = lastCheckinResult
 	integration.Snapshot.LastSyncAt = &result.FinishedAt
@@ -159,10 +198,10 @@ func (s *Service) ApplySyncResult(state *model.State, integrationID string, resu
 	provider := buildProviderFromIntegration(integration)
 	integration.LinkedProviderID = provider.ID
 	upsertProvider(&state.Providers, provider)
-	if integration.AutoCreateRoutes {
-		ensureRoutes(state, integration, result.Snapshot)
+	if integration.AutoCreateRoutes && result.ModelsRefreshed {
+		syncAutoRoutes(state, integration, result.Snapshot)
 	}
-	if integration.AutoSyncPricingProfiles {
+	if integration.AutoSyncPricingProfiles && result.PricingRefreshed {
 		syncManagedPricingProfiles(state, integration, result.Snapshot)
 	}
 
@@ -236,14 +275,20 @@ func (s *Service) ApplyDailyCheckins(state *model.State, results []DailyCheckinR
 	return errs
 }
 
-func (s *Service) sync(ctx context.Context, integration model.Integration) (model.IntegrationSnapshot, error) {
+type syncOutcome struct {
+	Snapshot         model.IntegrationSnapshot
+	ModelsRefreshed  bool
+	PricingRefreshed bool
+}
+
+func (s *Service) sync(ctx context.Context, integration model.Integration) (syncOutcome, error) {
 	switch integration.Kind {
 	case model.IntegrationKindNewAPI:
 		return s.syncNewAPI(ctx, integration)
 	case model.IntegrationKindOneHub:
 		return s.syncOneHub(ctx, integration)
 	default:
-		return model.IntegrationSnapshot{}, fmt.Errorf("unsupported integration kind: %s", integration.Kind)
+		return syncOutcome{}, fmt.Errorf("unsupported integration kind: %s", integration.Kind)
 	}
 }
 
@@ -333,16 +378,24 @@ func upsertProvider(providers *[]model.Provider, next model.Provider) {
 	*providers = append(*providers, next)
 }
 
-func ensureRoutes(state *model.State, integration model.Integration, snapshot model.IntegrationSnapshot) {
+const autoCreatedIntegrationRouteNote = "auto-created from integration sync"
+
+func syncAutoRoutes(state *model.State, integration model.Integration, snapshot model.IntegrationSnapshot) {
+	providerID := strings.TrimSpace(integration.LinkedProviderID)
+	if providerID == "" {
+		return
+	}
+	desiredModels := make(map[string]string, len(snapshot.ModelNames))
 	for _, modelName := range snapshot.ModelNames {
 		alias := strings.TrimSpace(modelName)
 		if alias == "" {
 			continue
 		}
+		desiredModels[strings.ToLower(alias)] = alias
 
 		target := model.RouteTarget{
 			ID:               model.NewID("target"),
-			AccountID:        integration.LinkedProviderID,
+			AccountID:        providerID,
 			UpstreamModel:    modelName,
 			Weight:           1,
 			Enabled:          true,
@@ -357,8 +410,11 @@ func ensureRoutes(state *model.State, integration model.Integration, snapshot mo
 			}
 			found = true
 			exists := false
-			for _, current := range route.Targets {
+			for targetIndex, current := range route.Targets {
 				if current.AccountID == target.AccountID && current.UpstreamModel == target.UpstreamModel {
+					route.Targets[targetIndex].Enabled = true
+					route.Targets[targetIndex].Weight = 1
+					route.Targets[targetIndex].MarkupMultiplier = target.MarkupMultiplier
 					exists = true
 					break
 				}
@@ -372,10 +428,32 @@ func ensureRoutes(state *model.State, integration model.Integration, snapshot mo
 			state.ModelRoutes = append(state.ModelRoutes, model.ModelRoute{
 				Alias:   alias,
 				Targets: []model.RouteTarget{target},
-				Notes:   "auto-created from integration sync",
+				Notes:   autoCreatedIntegrationRouteNote,
 			})
 		}
 	}
+
+	removedAliases := map[string]struct{}{}
+	filteredRoutes := state.ModelRoutes[:0]
+	for _, route := range state.ModelRoutes {
+		filteredTargets := route.Targets[:0]
+		for _, target := range route.Targets {
+			if target.AccountID == providerID {
+				if _, ok := desiredModels[strings.ToLower(strings.TrimSpace(target.UpstreamModel))]; !ok {
+					continue
+				}
+			}
+			filteredTargets = append(filteredTargets, target)
+		}
+		route.Targets = slices.Clone(filteredTargets)
+		if len(route.Targets) == 0 && len(route.Scenarios) == 0 && strings.TrimSpace(route.Notes) == autoCreatedIntegrationRouteNote {
+			removedAliases[strings.ToLower(strings.TrimSpace(route.Alias))] = struct{}{}
+			continue
+		}
+		filteredRoutes = append(filteredRoutes, route)
+	}
+	state.ModelRoutes = filteredRoutes
+	removeGatewayKeyModelReferences(state.GatewayKeys, removedAliases)
 }
 
 func integrationMarkup(integration model.Integration, modelName string) float64 {
@@ -386,6 +464,59 @@ func integrationMarkup(integration model.Integration, modelName string) float64 
 		return integration.DefaultMarkupMultiplier
 	}
 	return 1
+}
+
+func removeGatewayKeyModelReferences(keys []model.GatewayKey, aliases map[string]struct{}) {
+	if len(aliases) == 0 {
+		return
+	}
+	for keyIndex := range keys {
+		if len(keys[keyIndex].AllowedModels) == 0 {
+			continue
+		}
+		filtered := keys[keyIndex].AllowedModels[:0]
+		for _, alias := range keys[keyIndex].AllowedModels {
+			if _, removed := aliases[strings.ToLower(strings.TrimSpace(alias))]; removed {
+				continue
+			}
+			filtered = append(filtered, alias)
+		}
+		keys[keyIndex].AllowedModels = slices.Clone(filtered)
+	}
+}
+
+func mapsClonePricing(values map[string]model.IntegrationPricing) map[string]model.IntegrationPricing {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]model.IntegrationPricing, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func syncWarningMessage(modelsErr, pricingErr error) string {
+	warnings := make([]string, 0, 2)
+	if modelsErr != nil {
+		warnings = append(warnings, "model inventory sync skipped: "+modelsErr.Error())
+	}
+	if pricingErr != nil {
+		warnings = append(warnings, "pricing sync skipped: "+pricingErr.Error())
+	}
+	return joinWarnings(warnings...)
+}
+
+func joinWarnings(parts ...string) string {
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	return strings.Join(filtered, "; ")
 }
 
 func syncManagedPricingProfiles(state *model.State, integration model.Integration, snapshot model.IntegrationSnapshot) {
@@ -470,99 +601,140 @@ func managedPricingProfileID(integrationID, modelName string) string {
 	if slug == "" {
 		slug = "model"
 	}
-	return managedPricingProfilePrefix(integrationID) + slug
+	return fmt.Sprintf("%s%s-%08x", managedPricingProfilePrefix(integrationID), slug, modelNameHash(modelName))
 }
 
-func (s *Service) syncNewAPI(ctx context.Context, integration model.Integration) (model.IntegrationSnapshot, error) {
+func modelNameHash(modelName string) uint32 {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(strings.ToLower(strings.TrimSpace(modelName))))
+	return hasher.Sum32()
+}
+
+func (s *Service) syncNewAPI(ctx context.Context, integration model.Integration) (syncOutcome, error) {
 	headers := newAPIHeaders(integration)
 	selfData, err := s.getEnvelope(ctx, integration.BaseURL, "/api/user/self", headers)
 	if err != nil {
 		if strings.TrimSpace(integration.RelayAPIKey) == "" {
-			return model.IntegrationSnapshot{}, err
+			return syncOutcome{}, err
 		}
 		return s.syncNewAPIRelayFallback(ctx, integration, err)
 	}
 
 	var modelsData map[string]any
 	var pricingData map[string]any
+	var modelsErr error
+	var pricingErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		modelsData, _ = s.getEnvelope(ctx, integration.BaseURL, "/api/user/models", headers)
+		modelsData, modelsErr = s.getEnvelope(ctx, integration.BaseURL, "/api/user/models", headers)
 	}()
 	go func() {
 		defer wg.Done()
-		pricingData, _ = s.getEnvelope(ctx, integration.BaseURL, "/api/pricing", nil)
+		pricingData, pricingErr = s.getEnvelope(ctx, integration.BaseURL, "/api/pricing", nil)
 	}()
 	wg.Wait()
-	if len(extractModelNames(modelsData)) == 0 && strings.TrimSpace(integration.RelayAPIKey) != "" {
-		modelsData, _ = s.getRawJSON(ctx, integration.BaseURL, "/v1/models", relayHeaders(integration))
+	if strings.TrimSpace(integration.RelayAPIKey) != "" && (modelsErr != nil || len(extractModelNames(modelsData)) == 0) {
+		relayModels, relayErr := s.getRawJSON(ctx, integration.BaseURL, "/v1/models", relayHeaders(integration))
+		if relayErr == nil {
+			modelsData = relayModels
+			modelsErr = nil
+		}
 	}
 
 	snapshot := model.IntegrationSnapshot{
 		Balance:         readFloat(selfData, "quota"),
 		Used:            readFloat(selfData, "used_quota"),
 		Currency:        "quota",
-		ModelNames:      extractModelNames(modelsData),
-		Prices:          extractPricingHints(pricingData),
 		SupportsCheckin: true,
 	}
-	sort.Strings(snapshot.ModelNames)
-	return snapshot, nil
+	outcome := syncOutcome{
+		Snapshot:         snapshot,
+		ModelsRefreshed:  modelsErr == nil,
+		PricingRefreshed: pricingErr == nil,
+	}
+	if outcome.ModelsRefreshed {
+		outcome.Snapshot.ModelNames = extractModelNames(modelsData)
+		sort.Strings(outcome.Snapshot.ModelNames)
+	}
+	if outcome.PricingRefreshed {
+		outcome.Snapshot.Prices = extractPricingHints(pricingData)
+	}
+	outcome.Snapshot.LastError = syncWarningMessage(modelsErr, pricingErr)
+	return outcome, nil
 }
 
-func (s *Service) syncNewAPIRelayFallback(ctx context.Context, integration model.Integration, managementErr error) (model.IntegrationSnapshot, error) {
+func (s *Service) syncNewAPIRelayFallback(ctx context.Context, integration model.Integration, managementErr error) (syncOutcome, error) {
 	modelsData, err := s.getRawJSON(ctx, integration.BaseURL, "/v1/models", relayHeaders(integration))
 	if err != nil {
-		return model.IntegrationSnapshot{}, fmt.Errorf("management sync failed: %v; relay fallback failed: %w", managementErr, err)
+		return syncOutcome{}, fmt.Errorf("management sync failed: %v; relay fallback failed: %w", managementErr, err)
 	}
 
-	pricingData, _ := s.getEnvelope(ctx, integration.BaseURL, "/api/pricing", nil)
+	pricingData, pricingErr := s.getEnvelope(ctx, integration.BaseURL, "/api/pricing", nil)
 	snapshot := model.IntegrationSnapshot{
 		Balance:         0,
 		Used:            0,
 		Currency:        "quota",
 		ModelNames:      extractModelNames(modelsData),
-		Prices:          extractPricingHints(pricingData),
 		SupportsCheckin: false,
-		LastError:       fmt.Sprintf("management API unavailable; relay fallback inventory sync used: %v", managementErr),
 	}
 	sort.Strings(snapshot.ModelNames)
-	return snapshot, nil
+	outcome := syncOutcome{
+		Snapshot:         snapshot,
+		ModelsRefreshed:  true,
+		PricingRefreshed: pricingErr == nil,
+	}
+	if outcome.PricingRefreshed {
+		outcome.Snapshot.Prices = extractPricingHints(pricingData)
+	}
+	outcome.Snapshot.LastError = joinWarnings(
+		fmt.Sprintf("management API unavailable; relay fallback inventory sync used: %v", managementErr),
+		syncWarningMessage(nil, pricingErr),
+	)
+	return outcome, nil
 }
 
-func (s *Service) syncOneHub(ctx context.Context, integration model.Integration) (model.IntegrationSnapshot, error) {
+func (s *Service) syncOneHub(ctx context.Context, integration model.Integration) (syncOutcome, error) {
 	headers := oneHubHeaders(integration)
 	selfData, err := s.getEnvelope(ctx, integration.BaseURL, "/api/user/self", headers)
 	if err != nil {
-		return model.IntegrationSnapshot{}, err
+		return syncOutcome{}, err
 	}
 
 	var modelsData map[string]any
 	var pricingData map[string]any
+	var modelsErr error
+	var pricingErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		modelsData, _ = s.getRawJSON(ctx, integration.BaseURL, "/v1/models", headers)
+		modelsData, modelsErr = s.getRawJSON(ctx, integration.BaseURL, "/v1/models", headers)
 	}()
 	go func() {
 		defer wg.Done()
-		pricingData, _ = s.getEnvelope(ctx, integration.BaseURL, "/api/prices?type=db", headers)
+		pricingData, pricingErr = s.getEnvelope(ctx, integration.BaseURL, "/api/prices?type=db", headers)
 	}()
 	wg.Wait()
 
-	snapshot := model.IntegrationSnapshot{
+	outcome := syncOutcome{Snapshot: model.IntegrationSnapshot{
 		Balance:         readFloat(selfData, "quota"),
 		Used:            readFloat(selfData, "used_quota"),
 		Currency:        "quota",
-		ModelNames:      extractModelNames(modelsData),
-		Prices:          extractPricingHints(pricingData),
 		SupportsCheckin: false,
+	}}
+	outcome.ModelsRefreshed = modelsErr == nil
+	outcome.PricingRefreshed = pricingErr == nil
+	if outcome.ModelsRefreshed {
+		outcome.Snapshot.ModelNames = extractModelNames(modelsData)
+		sort.Strings(outcome.Snapshot.ModelNames)
 	}
-	sort.Strings(snapshot.ModelNames)
-	return snapshot, nil
+	if outcome.PricingRefreshed {
+		outcome.Snapshot.Prices = extractPricingHints(pricingData)
+	}
+	outcome.Snapshot.LastError = syncWarningMessage(modelsErr, pricingErr)
+	return outcome, nil
 }
 
 func (s *Service) checkinNewAPI(ctx context.Context, integration model.Integration) (string, *time.Time, error) {
@@ -662,8 +834,11 @@ func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath st
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	data, err := readLimitedResponseBody(resp.Body, maxIntegrationResponseBodyBytes)
 	if err != nil {
+		if errors.Is(err, errIntegrationResponseTooLarge) {
+			return nil, fmt.Errorf("integration response exceeds %d bytes", maxIntegrationResponseBodyBytes)
+		}
 		return nil, err
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
@@ -678,6 +853,20 @@ func (s *Service) doJSONRequest(ctx context.Context, method, baseURL, rawPath st
 		return nil, errors.New(readString(payload, "message"))
 	}
 	return payload, nil
+}
+
+func readLimitedResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errIntegrationResponseTooLarge
+	}
+	return data, nil
 }
 
 func (s *Service) clientForResolved(resolved resolvedBaseURL) *http.Client {
@@ -742,7 +931,7 @@ func joinURL(baseURL, rawPath string) (string, error) {
 		return "", err
 	}
 
-	path := rawPath
+	path, rawQuery, _ := strings.Cut(rawPath, "?")
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
@@ -754,6 +943,9 @@ func joinURL(baseURL, rawPath string) (string, error) {
 		base.Path = basePath + strings.TrimPrefix(path, "/v1")
 	default:
 		base.Path = basePath + path
+	}
+	if strings.TrimSpace(rawQuery) != "" {
+		base.RawQuery = strings.TrimSpace(rawQuery)
 	}
 	return base.String(), nil
 }

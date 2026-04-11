@@ -1420,47 +1420,54 @@ func TestRunCheckinsDoesNotBlockSnapshotsWhileWaitingOnUpstream(t *testing.T) {
 	}
 }
 
-func TestBuildOpenAPISpecCoversAdminRoutes(t *testing.T) {
+func TestBuildOpenAPISpecTracksAdminRouteRegistry(t *testing.T) {
 	t.Parallel()
 
-	paths := buildOpenAPISpec()["paths"].(map[string]any)
-	required := []string{
-		"/api/admin/meta",
-		"/api/admin/integrations/sync",
-		"/api/admin/providers",
-		"/api/admin/providers/{id}",
-		"/api/admin/routes",
-		"/api/admin/routes/{alias}",
-		"/api/admin/pricing-profiles",
-		"/api/admin/pricing-profiles/{id}",
-		"/api/admin/integrations",
-		"/api/admin/integrations/{id}",
-		"/api/admin/integrations/{id}/sync",
-		"/api/admin/integrations/{id}/checkin",
-		"/api/admin/gateway-keys",
-		"/api/admin/gateway-keys/{id}",
-		"/api/admin/pricing-aliases",
-		"/api/admin/request-history",
-		"/api/admin/request-history/{id}",
-		"/api/admin/request-history/{id}/attempts",
-		"/api/admin/runtime/sessions",
-		"/api/admin/runtime/sticky-bindings",
-		"/api/admin/runtime/sticky-bindings/reset",
-		"/api/admin/runtime/provider-usage",
-		"/api/admin/runtime/circuits",
-		"/api/admin/runtime/circuits/reset",
-		"/api/admin/stats/summary",
-		"/api/admin/stats/by-key",
-		"/api/admin/stats/by-provider",
-		"/api/admin/stats/by-model",
-		"/api/admin/openapi.json",
-		"/api/admin/maintenance/checkins",
-		"/api/admin/maintenance/probes",
-		"/api/admin/maintenance/pricing-sync",
+	spec := buildOpenAPISpec()
+	paths := spec["paths"].(map[string]any)
+	components := spec["components"].(map[string]any)
+	securitySchemes := components["securitySchemes"].(map[string]any)
+	if _, ok := securitySchemes["AdminTokenHeader"]; !ok {
+		t.Fatal("expected openapi spec to expose AdminTokenHeader security scheme")
 	}
-	for _, path := range required {
-		if _, ok := paths[path]; !ok {
-			t.Fatalf("expected openapi spec to contain %s", path)
+	if _, ok := securitySchemes["AdminBearerToken"]; !ok {
+		t.Fatal("expected openapi spec to expose AdminBearerToken security scheme")
+	}
+
+	seen := map[string]struct{}{}
+	for _, route := range RouteSpecs() {
+		if route.Method == "" || route.Pattern == "" || route.Summary == "" || route.HandlerName == "" {
+			t.Fatalf("expected route spec to be fully documented, got %+v", route)
+		}
+		key := route.Method + " " + route.Pattern
+		if _, ok := seen[key]; ok {
+			t.Fatalf("duplicate admin route spec registered for %s", key)
+		}
+		seen[key] = struct{}{}
+
+		methods, ok := paths[route.Pattern].(map[string]any)
+		if !ok {
+			t.Fatalf("expected openapi spec to contain %s", route.Pattern)
+		}
+		operation, ok := methods[strings.ToLower(route.Method)].(map[string]any)
+		if !ok {
+			t.Fatalf("expected openapi spec to contain %s %s", route.Method, route.Pattern)
+		}
+		if operation["summary"] != route.Summary {
+			t.Fatalf("expected %s %s summary %q, got %v", route.Method, route.Pattern, route.Summary, operation["summary"])
+		}
+		if operation["operationId"] != route.HandlerName {
+			t.Fatalf("expected %s %s operationId %q, got %v", route.Method, route.Pattern, route.HandlerName, operation["operationId"])
+		}
+		security, ok := operation["security"].([]map[string]any)
+		if !ok || len(security) != 2 {
+			t.Fatalf("expected %s %s security requirements, got %#v", route.Method, route.Pattern, operation["security"])
+		}
+		if _, ok := security[0]["AdminTokenHeader"]; !ok {
+			t.Fatalf("expected %s %s to allow X-Admin-Token auth", route.Method, route.Pattern)
+		}
+		if _, ok := security[1]["AdminBearerToken"]; !ok {
+			t.Fatalf("expected %s %s to allow bearer auth", route.Method, route.Pattern)
 		}
 	}
 }

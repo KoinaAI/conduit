@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/model"
 	"github.com/KoinaAI/conduit/backend/internal/observability"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 func TestAuthenticateGatewayRequestCachesInvalidSecretAndLocksSource(t *testing.T) {
@@ -76,6 +78,57 @@ func TestAuthenticateGatewayRequestDoesNotPoisonValidKeyOnDisallowedAlias(t *tes
 		t.Fatalf("expected gateway key gk-1, got %s", authenticated.ID)
 	}
 	service.runtime.releaseGatewayKey(authenticated.ID, 0)
+}
+
+func TestAuthenticateGatewayRequestBackfillsLegacyLookupHash(t *testing.T) {
+	t.Parallel()
+
+	fileStore, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer fileStore.Close()
+
+	hash, err := model.HashGatewaySecret("legacy-secret-123")
+	if err != nil {
+		t.Fatalf("hash gateway secret: %v", err)
+	}
+	if _, err := fileStore.Replace(model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:         "gk-legacy",
+			Name:       "legacy",
+			SecretHash: hash,
+			Enabled:    true,
+		}},
+	}); err != nil {
+		t.Fatalf("replace store state: %v", err)
+	}
+
+	service := &Service{
+		cfg:     config.Config{GatewaySecretLookupPepper: "lookup-pepper"},
+		store:   fileStore,
+		runtime: newRuntimeState(),
+	}
+	headers := http.Header{}
+	headers.Set("X-API-Key", "legacy-secret-123")
+
+	key, err := service.authenticateGatewayRequest(fileStore.RoutingSnapshot(), headers, model.ProtocolOpenAIChat, "gpt-5.4", "203.0.113.5")
+	if err != nil {
+		t.Fatalf("authenticate gateway request: %v", err)
+	}
+	if key.ID != "gk-legacy" {
+		t.Fatalf("expected legacy key to authenticate, got %+v", key)
+	}
+
+	saved := fileStore.Snapshot()
+	backfilled, ok := saved.FindGatewayKey("gk-legacy")
+	if !ok {
+		t.Fatal("expected legacy key to remain in state")
+	}
+	if backfilled.SecretLookupHash == "" {
+		t.Fatalf("expected legacy key lookup hash to be backfilled, got %+v", backfilled)
+	}
 }
 
 func TestGatewayRequestSourceIgnoresSpoofedForwardHeaders(t *testing.T) {
@@ -169,6 +222,117 @@ func TestReleaseGatewayKeyAppendsRollingSpendEvent(t *testing.T) {
 	}
 }
 
+func TestAcquireProviderEnforcesRollingBudgets(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.April, 5, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		key    string
+		limits model.Provider
+		events []gatewaySpendEvent
+		want   error
+	}{
+		{
+			name: "hourly",
+			key:  "provider-hourly",
+			limits: model.Provider{
+				ID:              "provider-hourly",
+				HourlyBudgetUSD: 5,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-30 * time.Minute), CostUSD: 5}},
+			want:   errProviderHourlyBudget,
+		},
+		{
+			name: "daily",
+			key:  "provider-daily",
+			limits: model.Provider{
+				ID:             "provider-daily",
+				DailyBudgetUSD: 10,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-23 * time.Hour), CostUSD: 10}},
+			want:   errProviderDailyBudget,
+		},
+		{
+			name: "weekly",
+			key:  "provider-weekly",
+			limits: model.Provider{
+				ID:              "provider-weekly",
+				WeeklyBudgetUSD: 20,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-6 * 24 * time.Hour), CostUSD: 20}},
+			want:   errProviderWeeklyBudget,
+		},
+		{
+			name: "monthly",
+			key:  "provider-monthly",
+			limits: model.Provider{
+				ID:               "provider-monthly",
+				MonthlyBudgetUSD: 30,
+			},
+			events: []gatewaySpendEvent{{At: now.Add(-29 * 24 * time.Hour), CostUSD: 30}},
+			want:   errProviderMonthlyBudget,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			runtime := newRuntimeState()
+			runtime.providerWindows[tc.key] = &gatewayKeyWindow{SpendEvents: tc.events}
+			if err := runtime.acquireProvider(tc.limits, now); !errors.Is(err, tc.want) {
+				t.Fatalf("expected %v, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestReleaseProviderAppendsRollingSpendEvent(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	runtime.providerWindows["provider-1"] = &gatewayKeyWindow{InFlight: 1}
+
+	runtime.releaseProvider("provider-1", 1.25)
+
+	window := runtime.providerWindows["provider-1"]
+	if window.InFlight != 0 {
+		t.Fatalf("expected in-flight counter to be decremented, got %+v", window)
+	}
+	if len(window.SpendEvents) != 1 || window.SpendEvents[0].CostUSD != 1.25 {
+		t.Fatalf("expected rolling spend event to be recorded, got %+v", window.SpendEvents)
+	}
+}
+
+func TestLocalProviderUsageResetsStaleMinuteBucketOnRead(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	now := time.Date(2026, time.April, 6, 12, 5, 30, 0, time.UTC)
+	provider := model.Provider{
+		ID:   "provider-1",
+		Name: "Provider One",
+	}
+	runtime.providerWindows[provider.ID] = &gatewayKeyWindow{
+		MinuteBucket: now.Add(-time.Minute).Truncate(time.Minute),
+		RequestCount: 7,
+	}
+
+	status, active := runtime.localProviderUsage(provider, now)
+	if active {
+		t.Fatalf("expected stale minute-only usage to be inactive, got %+v", status)
+	}
+	if status.CurrentMinuteRequests != 0 {
+		t.Fatalf("expected stale minute bucket to reset request count, got %+v", status)
+	}
+	if !status.MinuteBucketStartedAt.Equal(now.Truncate(time.Minute)) {
+		t.Fatalf("expected minute bucket to advance to current minute, got %+v", status)
+	}
+	if runtime.providerWindows[provider.ID].RequestCount != 0 {
+		t.Fatalf("expected runtime window request count to be reset, got %+v", runtime.providerWindows[provider.ID])
+	}
+}
+
 func TestRuntimeReadPathsDoNotAllocateState(t *testing.T) {
 	t.Parallel()
 
@@ -224,6 +388,48 @@ func TestRuntimeSweepRemovesStaleEndpointAndCredentialState(t *testing.T) {
 	}
 	if len(runtime.credentials) != 0 {
 		t.Fatalf("expected stale credential state to be swept, got %+v", runtime.credentials)
+	}
+}
+
+func TestRuntimeSweepRemovesIdleGatewayAndProviderWindows(t *testing.T) {
+	t.Parallel()
+
+	runtime := newRuntimeState()
+	now := time.Now().UTC().Truncate(time.Minute)
+	runtime.providerWindows["stale-provider"] = &gatewayKeyWindow{
+		MinuteBucket: now.Add(-time.Minute),
+		RequestCount: 4,
+	}
+	runtime.keyWindows["stale-key"] = &gatewayKeyWindow{
+		MinuteBucket: now.Add(-time.Minute),
+		RequestCount: 3,
+	}
+	runtime.providerWindows["active-provider"] = &gatewayKeyWindow{
+		MinuteBucket: now,
+		InFlight:     1,
+	}
+	runtime.keyWindows["budget-key"] = &gatewayKeyWindow{
+		MinuteBucket: now.Add(-time.Minute),
+		SpendEvents: []gatewaySpendEvent{
+			{At: now.Add(-time.Hour), CostUSD: 1},
+		},
+	}
+
+	runtime.mu.Lock()
+	runtime.sweepRuntimeStateLocked(now)
+	runtime.mu.Unlock()
+
+	if _, ok := runtime.providerWindows["stale-provider"]; ok {
+		t.Fatalf("expected idle stale provider window to be swept, got %+v", runtime.providerWindows)
+	}
+	if _, ok := runtime.keyWindows["stale-key"]; ok {
+		t.Fatalf("expected idle stale gateway key window to be swept, got %+v", runtime.keyWindows)
+	}
+	if _, ok := runtime.providerWindows["active-provider"]; !ok {
+		t.Fatalf("expected inflight provider window to be retained, got %+v", runtime.providerWindows)
+	}
+	if _, ok := runtime.keyWindows["budget-key"]; !ok {
+		t.Fatalf("expected gateway key window with recent spend to be retained, got %+v", runtime.keyWindows)
 	}
 }
 

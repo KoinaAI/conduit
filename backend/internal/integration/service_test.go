@@ -162,7 +162,9 @@ func TestApplySyncResultPreservesCheckinMetadata(t *testing.T) {
 		Snapshot: model.IntegrationSnapshot{
 			ModelNames: []string{"gpt-5.4"},
 		},
-		FinishedAt: time.Date(2026, time.April, 2, 11, 0, 0, 0, time.UTC),
+		ModelsRefreshed:  true,
+		PricingRefreshed: true,
+		FinishedAt:       time.Date(2026, time.April, 2, 11, 0, 0, 0, time.UTC),
 	}
 	_, err := service.ApplySyncResult(&state, "integration-1", result)
 	if err != nil {
@@ -222,7 +224,9 @@ func TestApplySyncResultSyncsManagedPricingProfiles(t *testing.T) {
 				},
 			},
 		},
-		FinishedAt: time.Date(2026, time.April, 5, 8, 0, 0, 0, time.UTC),
+		ModelsRefreshed:  true,
+		PricingRefreshed: true,
+		FinishedAt:       time.Date(2026, time.April, 5, 8, 0, 0, 0, time.UTC),
 	}
 
 	if _, err := service.ApplySyncResult(&state, "integration-1", result); err != nil {
@@ -252,6 +256,165 @@ func TestApplySyncResultSyncsManagedPricingProfiles(t *testing.T) {
 	}
 	if manualRoute.PricingProfileID != "manual-profile" {
 		t.Fatalf("expected manual pricing profile to be preserved, got %q", manualRoute.PricingProfileID)
+	}
+}
+
+func TestApplySyncResultPreservesManagedPricingWhenRefreshSkipped(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(WithAllowPrivateBaseURLForTests())
+	profileID := managedPricingProfileID("integration-1", "gpt-5.4")
+	state := model.DefaultState()
+	state.Integrations = []model.Integration{{
+		ID:                      "integration-1",
+		Name:                    "NewAPI",
+		Kind:                    model.IntegrationKindNewAPI,
+		BaseURL:                 "https://relay.example",
+		AccessKey:               "token",
+		Enabled:                 true,
+		AutoCreateRoutes:        true,
+		AutoSyncPricingProfiles: true,
+		Snapshot: model.IntegrationSnapshot{
+			ModelNames: []string{"gpt-5.4"},
+			Prices: map[string]model.IntegrationPricing{
+				"gpt-5.4": {InputPerMillion: 2.5, OutputPerMillion: 10, Currency: "USD"},
+			},
+		},
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias:            "gpt-5.4",
+		PricingProfileID: profileID,
+		Targets: []model.RouteTarget{{
+			ID:               "target-1",
+			AccountID:        "provider-1",
+			UpstreamModel:    "gpt-5.4",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1.2,
+		}},
+	}}
+	state.PricingProfiles = []model.PricingProfile{{
+		ID:               profileID,
+		Name:             "managed",
+		Currency:         "USD",
+		InputPerMillion:  2.5,
+		OutputPerMillion: 10,
+	}}
+
+	result := SyncResult{
+		Snapshot: model.IntegrationSnapshot{
+			Balance:         100,
+			Used:            50,
+			Currency:        "quota",
+			ModelNames:      []string{"gpt-5.4"},
+			SupportsCheckin: true,
+			LastError:       "pricing sync skipped: temporary upstream failure",
+		},
+		ModelsRefreshed:  true,
+		PricingRefreshed: false,
+		FinishedAt:       time.Date(2026, time.April, 5, 9, 0, 0, 0, time.UTC),
+	}
+
+	if _, err := service.ApplySyncResult(&state, "integration-1", result); err != nil {
+		t.Fatalf("apply sync result: %v", err)
+	}
+	if len(state.PricingProfiles) != 1 || state.PricingProfiles[0].ID != profileID {
+		t.Fatalf("expected managed pricing profile to be preserved when pricing refresh is skipped, got %+v", state.PricingProfiles)
+	}
+	route, ok := state.FindRoute("gpt-5.4")
+	if !ok || route.PricingProfileID != profileID {
+		t.Fatalf("expected route pricing reference to stay intact, got %+v", route)
+	}
+}
+
+func TestApplySyncResultRemovesStaleManagedRoutesAndUpdatesMarkup(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(WithAllowPrivateBaseURLForTests())
+	state := model.DefaultState()
+	state.GatewayKeys = []model.GatewayKey{{
+		ID:            "gk-1",
+		Name:          "gateway",
+		SecretPreview: "uag-12...abcd",
+		Enabled:       true,
+		AllowedModels: []string{"gpt-5.4-old", "gpt-5.4"},
+	}}
+	state.Integrations = []model.Integration{{
+		ID:                      "integration-1",
+		Name:                    "NewAPI",
+		Kind:                    model.IntegrationKindNewAPI,
+		BaseURL:                 "https://relay.example",
+		AccessKey:               "token",
+		Enabled:                 true,
+		LinkedProviderID:        "provider-1",
+		AutoCreateRoutes:        true,
+		DefaultMarkupMultiplier: 1.4,
+		ModelMarkupOverrides: map[string]float64{
+			"gpt-5.4": 1.8,
+		},
+	}}
+	state.ModelRoutes = []model.ModelRoute{
+		{
+			Alias: "gpt-5.4-old",
+			Targets: []model.RouteTarget{{
+				ID:               "target-old",
+				AccountID:        "provider-1",
+				UpstreamModel:    "gpt-5.4-old",
+				Weight:           1,
+				Enabled:          true,
+				MarkupMultiplier: 1.1,
+			}},
+			Notes: autoCreatedIntegrationRouteNote,
+		},
+		{
+			Alias: "gpt-5.4",
+			Targets: []model.RouteTarget{{
+				ID:               "target-current",
+				AccountID:        "provider-1",
+				UpstreamModel:    "gpt-5.4",
+				Weight:           1,
+				Enabled:          true,
+				MarkupMultiplier: 1.1,
+			}},
+			Notes: autoCreatedIntegrationRouteNote,
+		},
+	}
+
+	result := SyncResult{
+		Snapshot: model.IntegrationSnapshot{
+			ModelNames:      []string{"gpt-5.4"},
+			SupportsCheckin: true,
+		},
+		ModelsRefreshed:  true,
+		PricingRefreshed: false,
+		FinishedAt:       time.Date(2026, time.April, 5, 10, 0, 0, 0, time.UTC),
+	}
+
+	if _, err := service.ApplySyncResult(&state, "integration-1", result); err != nil {
+		t.Fatalf("apply sync result: %v", err)
+	}
+	if _, ok := state.FindRoute("gpt-5.4-old"); ok {
+		t.Fatalf("expected stale auto-created route to be removed, got %+v", state.ModelRoutes)
+	}
+	route, ok := state.FindRoute("gpt-5.4")
+	if !ok {
+		t.Fatal("expected current route to remain")
+	}
+	if len(route.Targets) != 1 || route.Targets[0].MarkupMultiplier != 1.8 {
+		t.Fatalf("expected managed target markup to be refreshed, got %+v", route.Targets)
+	}
+	if len(state.GatewayKeys) != 1 || len(state.GatewayKeys[0].AllowedModels) != 1 || state.GatewayKeys[0].AllowedModels[0] != "gpt-5.4" {
+		t.Fatalf("expected removed route alias to be pruned from gateway key allow-list, got %+v", state.GatewayKeys)
+	}
+}
+
+func TestManagedPricingProfileIDIncludesHashToAvoidSlugCollisions(t *testing.T) {
+	t.Parallel()
+
+	first := managedPricingProfileID("integration-1", "gpt-4.1-mini")
+	second := managedPricingProfileID("integration-1", "gpt/4.1 mini")
+	if first == second {
+		t.Fatalf("expected managed pricing profile ids to stay distinct across slug collisions, got %q", first)
 	}
 }
 
@@ -423,6 +586,9 @@ func TestServiceSyncStateOneHub(t *testing.T) {
 				},
 			})
 		case "/api/prices":
+			if r.URL.RawQuery != "type=db" {
+				t.Fatalf("expected onehub pricing sync query to be preserved, got %q", r.URL.RawQuery)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"success": true,
 				"data": []map[string]any{

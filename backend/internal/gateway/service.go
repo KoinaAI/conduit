@@ -599,7 +599,22 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 			_ = resp.Body.Close()
 			closeLiveSession()
 			if writeErr != nil {
-				s.runtime.releaseProvider(candidate.provider.ID, 0)
+				partialUsage := observer.Summary()
+				partialBilling := billing.Calculate(candidate.pricing, partialUsage, candidate.multiplier, candidate.pricing.Name)
+				record.Usage = partialUsage
+				record.Billing = partialBilling
+				if responseWriteStarted(writeErr) {
+					finalCost = partialBilling.FinalCost
+					writeBillingMetadata(w.Header(), record)
+					s.runtime.releaseProvider(candidate.provider.ID, partialBilling.FinalCost)
+					requestSpan.SetAttributes(
+						attribute.String("gateway.provider_id", candidate.provider.ID),
+						attribute.String("gateway.endpoint_id", candidate.endpoint.ID),
+						attribute.Float64("gateway.final_cost", partialBilling.FinalCost),
+					)
+				} else {
+					s.runtime.releaseProvider(candidate.provider.ID, 0)
+				}
 				attemptSpan.RecordError(writeErr)
 				attemptSpan.SetStatus(codes.Error, writeErr.Error())
 				attemptSpan.End()
@@ -796,9 +811,18 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, providerLimitStatusCode(err), err.Error())
 		return
 	}
+	halfOpenProbe, err := s.runtime.acquireEndpoint(candidate, time.Now().UTC())
+	if err != nil {
+		s.runtime.releaseProvider(candidate.provider.ID, 0)
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
 	upstreamURL, err := joinProxyURL(candidate.endpoint.BaseURL, "/v1/realtime")
 	if err != nil {
 		s.runtime.releaseProvider(candidate.provider.ID, 0)
+		s.runtime.reportFailure(candidate, 0, err.Error(), 0, halfOpenProbe)
 		requestSpan.RecordError(err)
 		requestSpan.SetStatus(codes.Error, err.Error())
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -817,19 +841,12 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	dialer, err := s.websocketDialerForProvider(candidate.provider)
 	if err != nil {
 		s.runtime.releaseProvider(candidate.provider.ID, 0)
+		s.runtime.reportFailure(candidate, 0, err.Error(), 0, halfOpenProbe)
 		requestSpan.RecordError(err)
 		requestSpan.SetStatus(codes.Error, err.Error())
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	upgrader := websocket.Upgrader{CheckOrigin: s.allowRealtimeOrigin}
-	clientConn, err := upgrader.Upgrade(w, r, routingMetadataHeader(route, candidate, 0, sessionID, appliedScenario))
-	if err != nil {
-		s.runtime.releaseProvider(candidate.provider.ID, 0)
-		return
-	}
-	defer clientConn.Close()
-	clientConn.SetReadLimit(maxRealtimeFrameBytes)
 
 	headers := http.Header{}
 	copyForwardHeaders(headers, r.Header)
@@ -843,17 +860,37 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	for key, value := range candidate.credential.Headers {
 		headers.Set(key, value)
 	}
+	if requestedSubprotocols := websocket.Subprotocols(r); len(requestedSubprotocols) > 0 {
+		headers.Del("Sec-WebSocket-Protocol")
+		dialer = cloneWebsocketDialerWithSubprotocols(dialer, requestedSubprotocols)
+	}
 
 	serverConn, _, err := dialer.DialContext(ctx, upstreamURL.String(), headers)
 	if err != nil {
 		s.runtime.releaseProvider(candidate.provider.ID, 0)
+		s.runtime.reportFailure(candidate, 0, err.Error(), 0, halfOpenProbe)
 		requestSpan.RecordError(err)
 		requestSpan.SetStatus(codes.Error, err.Error())
-		_ = clientConn.WriteJSON(map[string]any{"type": "error", "error": err.Error()})
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	defer serverConn.Close()
 	serverConn.SetReadLimit(maxRealtimeFrameBytes)
+
+	responseHeaders := routingMetadataHeader(route, candidate, 0, sessionID, appliedScenario)
+	if selectedSubprotocol := strings.TrimSpace(serverConn.Subprotocol()); selectedSubprotocol != "" {
+		responseHeaders.Set("Sec-WebSocket-Protocol", selectedSubprotocol)
+	}
+	upgrader := websocket.Upgrader{CheckOrigin: s.allowRealtimeOrigin}
+	clientConn, err := upgrader.Upgrade(w, r, responseHeaders)
+	if err != nil {
+		s.runtime.releaseProvider(candidate.provider.ID, 0)
+		requestSpan.RecordError(err)
+		requestSpan.SetStatus(codes.Error, err.Error())
+		return
+	}
+	defer clientConn.Close()
+	clientConn.SetReadLimit(maxRealtimeFrameBytes)
 
 	started := time.Now().UTC()
 	observer := NewUsageObserver(model.ProtocolOpenAIRealtime)
@@ -921,8 +958,9 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 		attribute.String("gateway.endpoint_id", candidate.endpoint.ID),
 		attribute.Float64("gateway.final_cost", record.Billing.FinalCost),
 	)
-	appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, 1, "success", false, http.StatusSwitchingProtocols, 0, nil)
 	if err != nil && !isNormalClose(err) {
+		appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, 1, "error", false, http.StatusBadGateway, 0, err)
+		s.runtime.reportFailure(candidate, 0, err.Error(), 0, halfOpenProbe)
 		record.Error = err.Error()
 		requestSpan.RecordError(err)
 		requestSpan.SetStatus(codes.Error, err.Error())
@@ -935,6 +973,8 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 		)
 	} else {
+		appendRoutingEvent(record.RoutingDecision, s.runtime, candidate, 1, "success", false, http.StatusSwitchingProtocols, 0, nil)
+		s.runtime.reportSuccess(candidate, time.Since(started), halfOpenProbe)
 		logger.Info("gateway realtime session completed",
 			"duration_ms", record.DurationMS,
 			"input_tokens", record.Usage.InputTokens,
@@ -1070,6 +1110,15 @@ func (s *Service) websocketDialerForProvider(provider model.Provider) (*websocke
 	}
 	s.proxyDialers[rawProxyURL] = dialer
 	return dialer, nil
+}
+
+func cloneWebsocketDialerWithSubprotocols(base *websocket.Dialer, subprotocols []string) *websocket.Dialer {
+	if base == nil {
+		return nil
+	}
+	cloned := *base
+	cloned.Subprotocols = append([]string(nil), subprotocols...)
+	return &cloned
 }
 
 func transportWithProxy(base *http.Transport, rawProxyURL string) (*http.Transport, error) {
@@ -1281,7 +1330,6 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 	}
 	now := time.Now().UTC()
 	healthy := []resolvedCandidate{}
-	degraded := []resolvedCandidate{}
 	for _, target := range route.Targets {
 		if !target.Enabled || !target.Supports(protocol) {
 			continue
@@ -1323,22 +1371,17 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 					scenario:     scenario,
 				}
 				if s.runtime.endpointOpen(candidate, now) || s.runtime.credentialCoolingDown(candidate, now) {
-					degraded = append(degraded, candidate)
 					continue
 				}
 				healthy = append(healthy, candidate)
 			}
 		}
 	}
-	if len(healthy) == 0 && len(degraded) == 0 {
-		return nil, model.ModelRoute{}, model.PricingProfile{}, "", fmt.Errorf("route %q has no enabled provider for protocol %s", alias, protocol)
+	if len(healthy) == 0 {
+		return nil, model.ModelRoute{}, model.PricingProfile{}, "", fmt.Errorf("route %q has no healthy provider for protocol %s", alias, protocol)
 	}
 
-	candidates := healthy
-	if len(candidates) == 0 {
-		candidates = degraded
-	}
-	candidates = s.orderCandidatePlan(route, protocol, candidates)
+	candidates := s.orderCandidatePlan(route, protocol, healthy)
 
 	if binding, ok := s.runtime.stickyBindingFor(gatewayKeyID, stickyRouteKey(alias, scenario), sessionID, now); ok {
 		for index, candidate := range candidates {

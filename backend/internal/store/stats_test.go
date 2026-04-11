@@ -140,6 +140,47 @@ func TestStatsReportsAggregateByWindowAndDimension(t *testing.T) {
 	}
 }
 
+func TestStatsTreatsRealtimeUpgradeAsSuccess(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	fileStore, err := Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer fileStore.Close()
+
+	now := time.Date(2026, time.April, 4, 12, 0, 0, 0, time.UTC)
+	if err := fileStore.AppendRequestRecord(makeStatsRecord(
+		"req-realtime",
+		now.Add(-5*time.Minute),
+		"gk-1",
+		"provider-1",
+		"OpenAI",
+		"gpt-5.4",
+		101,
+		true,
+		12,
+		8,
+		20,
+		0.4,
+	), nil, 10); err != nil {
+		t.Fatalf("append realtime record: %v", err)
+	}
+
+	window, err := ResolveStatsWindow("today", "", now)
+	if err != nil {
+		t.Fatalf("resolve stats window: %v", err)
+	}
+	summary, err := fileStore.StatsSummary(window)
+	if err != nil {
+		t.Fatalf("stats summary: %v", err)
+	}
+	if summary.Summary.SuccessCount != 1 || summary.Summary.ErrorCount != 0 {
+		t.Fatalf("expected websocket 101 to count as success, got %+v", summary.Summary)
+	}
+}
+
 func makeStatsRecord(
 	id string,
 	startedAt time.Time,

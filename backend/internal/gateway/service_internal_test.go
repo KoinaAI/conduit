@@ -87,8 +87,10 @@ func TestAnthropicToOpenAIChatPreservesToolAndImageContext(t *testing.T) {
 	t.Parallel()
 
 	body, stream, err := anthropicToOpenAIChat(map[string]any{
-		"stream": true,
-		"system": "You are a router.",
+		"stream":         true,
+		"system":         "You are a router.",
+		"stop_sequences": []any{"DONE"},
+		"tool_choice":    map[string]any{"type": "tool", "name": "search"},
 		"messages": []any{
 			map[string]any{
 				"role": "user",
@@ -151,12 +153,25 @@ func TestAnthropicToOpenAIChatPreservesToolAndImageContext(t *testing.T) {
 	if toolMessage["role"] != "tool" || toolMessage["tool_call_id"] != "toolu_1" || toolMessage["content"] != "sunny" {
 		t.Fatalf("expected tool result message to be preserved, got %+v", toolMessage)
 	}
+	if payload["stop"] != "DONE" {
+		t.Fatalf("expected anthropic stop_sequences to map to openai stop, got %+v", payload["stop"])
+	}
+	toolChoice := payload["tool_choice"].(map[string]any)
+	if toolChoice["type"] != "function" || toolChoice["function"].(map[string]any)["name"] != "search" {
+		t.Fatalf("expected anthropic tool_choice to map to openai function selector, got %+v", payload["tool_choice"])
+	}
 }
 
 func TestGeminiToOpenAIChatPreservesFunctionCallsAndResponses(t *testing.T) {
 	t.Parallel()
 
 	body, err := geminiToOpenAIChat([]byte(`{
+		"toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["search"]}},
+		"generationConfig":{
+			"stopSequences":["DONE"],
+			"responseMimeType":"application/json",
+			"responseJsonSchema":{"type":"object","properties":{"result":{"type":"string"}}}
+		},
 		"contents":[
 			{"role":"user","parts":[{"text":"weather?"}]},
 			{"role":"model","parts":[{"functionCall":{"name":"search","args":{"q":"weather"}}}]},
@@ -191,6 +206,17 @@ func TestGeminiToOpenAIChatPreservesFunctionCallsAndResponses(t *testing.T) {
 	if !strings.Contains(toolMessage["content"].(string), `"result":"sunny"`) {
 		t.Fatalf("expected function response payload to be preserved, got %+v", toolMessage)
 	}
+	if payload["stop"] != "DONE" {
+		t.Fatalf("expected gemini stopSequences to map to openai stop, got %+v", payload["stop"])
+	}
+	toolChoice := payload["tool_choice"].(map[string]any)
+	if toolChoice["type"] != "function" || toolChoice["function"].(map[string]any)["name"] != "search" {
+		t.Fatalf("expected gemini functionCallingConfig to map to openai function selector, got %+v", payload["tool_choice"])
+	}
+	responseFormat := payload["response_format"].(map[string]any)
+	if responseFormat["type"] != "json_schema" {
+		t.Fatalf("expected gemini response JSON schema to map to openai response_format, got %+v", payload["response_format"])
+	}
 }
 
 func TestGeminiToOpenAIChatSkipsFunctionResponseWithoutName(t *testing.T) {
@@ -217,6 +243,40 @@ func TestGeminiToOpenAIChatSkipsFunctionResponseWithoutName(t *testing.T) {
 	assistant := messages[0].(map[string]any)
 	if assistant["role"] != "assistant" {
 		t.Fatalf("expected remaining message to be assistant tool call, got %+v", assistant)
+	}
+}
+
+func TestResponseInputItemToolRoleAcceptsCallIDAlias(t *testing.T) {
+	t.Parallel()
+
+	messages, err := responseInputItemToOpenAIMessages(map[string]any{
+		"role":    "tool",
+		"call_id": "call-1",
+		"content": "sunny",
+	})
+	if err != nil {
+		t.Fatalf("response input item to openai messages: %v", err)
+	}
+	if len(messages) != 1 || messages[0]["tool_call_id"] != "call-1" {
+		t.Fatalf("expected tool role call_id alias to populate tool_call_id, got %+v", messages)
+	}
+}
+
+func TestOpenAIChatToolMessageToGeminiUsesMessageNameWhenTrackerMisses(t *testing.T) {
+	t.Parallel()
+
+	content := openAIChatToolMessageToGemini(map[string]any{
+		"role":         "tool",
+		"tool_call_id": "call-1",
+		"name":         "search",
+		"content":      map[string]any{"result": "sunny"},
+	}, map[string]string{})
+	if content == nil {
+		t.Fatal("expected tool message to convert to gemini function response")
+	}
+	functionResponse := content["parts"].([]map[string]any)[0]["functionResponse"].(map[string]any)
+	if functionResponse["name"] != "search" {
+		t.Fatalf("expected message name to survive gemini tool response conversion, got %+v", functionResponse)
 	}
 }
 
@@ -397,6 +457,19 @@ func TestOpenAIChatToolChoiceToGeminiAcceptsCanonicalToolSelector(t *testing.T) 
 	allowed := functionCallingConfig["allowedFunctionNames"].([]string)
 	if len(allowed) != 1 || allowed[0] != "search" {
 		t.Fatalf("expected canonical tool selector to preserve allowed function name, got %+v", config)
+	}
+}
+
+func TestOpenAIChatToolChoiceToGeminiAcceptsCanonicalAnySelector(t *testing.T) {
+	t.Parallel()
+
+	config := openAIChatToolChoiceToGemini("any")
+	if config == nil {
+		t.Fatal("expected canonical any selector to be preserved for gemini")
+	}
+	functionCallingConfig := config["functionCallingConfig"].(map[string]any)
+	if functionCallingConfig["mode"] != "ANY" {
+		t.Fatalf("expected canonical any selector to map to gemini ANY mode, got %+v", config)
 	}
 }
 
@@ -640,6 +713,62 @@ func TestRuntimeReportFailureClampsHugeRetryAfter(t *testing.T) {
 	}
 	if credential.DisabledUntil.Sub(before) > maxRetryAfterCooldown+time.Second {
 		t.Fatalf("expected retry-after clamp within %v, got %v", maxRetryAfterCooldown, credential.DisabledUntil.Sub(before))
+	}
+}
+
+func TestBuildCandidatePlanRejectsCoolingCredentials(t *testing.T) {
+	t.Parallel()
+
+	fileStore, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	state := model.DefaultState()
+	state.PricingProfiles = []model.PricingProfile{{ID: "standard", Name: "standard", Currency: "USD"}}
+	state.Providers = []model.Provider{{
+		ID:           "provider-1",
+		Name:         "Provider 1",
+		Kind:         model.ProviderKindOpenAICompatible,
+		Enabled:      true,
+		Capabilities: []model.Protocol{model.ProtocolOpenAIChat},
+		Endpoints: []model.ProviderEndpoint{{
+			ID:      "endpoint-1",
+			BaseURL: "https://provider.example/v1",
+			Enabled: true,
+		}},
+		Credentials: []model.ProviderCredential{{
+			ID:      "credential-1",
+			APIKey:  "provider-key",
+			Enabled: true,
+		}},
+	}}
+	state.ModelRoutes = []model.ModelRoute{{
+		Alias: "gpt-5.4",
+		Targets: []model.RouteTarget{{
+			ID:               "target-1",
+			AccountID:        "provider-1",
+			UpstreamModel:    "upstream-gpt-5.4",
+			Weight:           1,
+			Enabled:          true,
+			MarkupMultiplier: 1,
+		}},
+		PricingProfileID: "standard",
+	}}
+	if _, err := fileStore.Replace(state); err != nil {
+		t.Fatalf("replace state: %v", err)
+	}
+
+	service := NewService(config.Config{}, fileStore)
+	candidate := resolvedCandidate{
+		provider:   state.Providers[0],
+		endpoint:   state.Providers[0].Endpoints[0],
+		credential: state.Providers[0].Credentials[0],
+	}
+	service.runtime.reportFailure(candidate, http.StatusTooManyRequests, "slow down", 5*time.Minute, false)
+
+	_, _, _, _, err = service.buildCandidatePlan(fileStore.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "session-1", "")
+	if err == nil || !strings.Contains(err.Error(), "no healthy provider") {
+		t.Fatalf("expected cooled-down credential to be excluded from routing, got %v", err)
 	}
 }
 
@@ -942,6 +1071,7 @@ func TestPrepareUpstreamExchangeResponsesToAnthropic(t *testing.T) {
 					"name": "search",
 				},
 			},
+			"stop": "DONE",
 		},
 	}, "claude-3-7-sonnet")
 	if err != nil {
@@ -985,6 +1115,10 @@ func TestPrepareUpstreamExchangeResponsesToAnthropic(t *testing.T) {
 	if toolChoice["type"] != "tool" || toolChoice["name"] != "search" {
 		t.Fatalf("expected responses tool_choice to become anthropic tool selector, got %+v", payload["tool_choice"])
 	}
+	stopSequences := payload["stop_sequences"].([]any)
+	if len(stopSequences) != 1 || stopSequences[0] != "DONE" {
+		t.Fatalf("expected responses stop to become anthropic stop_sequences, got %+v", payload["stop_sequences"])
+	}
 }
 
 func TestPrepareUpstreamExchangeChatToAnthropic(t *testing.T) {
@@ -1007,6 +1141,7 @@ func TestPrepareUpstreamExchangeChatToAnthropic(t *testing.T) {
 				},
 			},
 			"tool_choice": "required",
+			"stop":        "DONE",
 		},
 	}, "claude-3-7-sonnet")
 	if err != nil {
@@ -1039,6 +1174,10 @@ func TestPrepareUpstreamExchangeChatToAnthropic(t *testing.T) {
 	toolChoice := payload["tool_choice"].(map[string]any)
 	if toolChoice["type"] != "any" {
 		t.Fatalf("expected required tool_choice to become anthropic any selector, got %+v", payload["tool_choice"])
+	}
+	stopSequences := payload["stop_sequences"].([]any)
+	if len(stopSequences) != 1 || stopSequences[0] != "DONE" {
+		t.Fatalf("expected chat stop to become anthropic stop_sequences, got %+v", payload["stop_sequences"])
 	}
 }
 
@@ -1078,6 +1217,7 @@ func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
 					"type": "json_object",
 				},
 			},
+			"stop": []any{"DONE", "HALT"},
 			"tool_choice": map[string]any{
 				"type": "function",
 				"function": map[string]any{
@@ -1116,6 +1256,10 @@ func TestPrepareUpstreamExchangeResponsesToGemini(t *testing.T) {
 	generationConfig := payload["generationConfig"].(map[string]any)
 	if generationConfig["responseMimeType"] != "application/json" {
 		t.Fatalf("expected responses text.format to become gemini JSON response mime type, got %+v", generationConfig)
+	}
+	stopSequences := generationConfig["stopSequences"].([]any)
+	if len(stopSequences) != 2 || stopSequences[0] != "DONE" || stopSequences[1] != "HALT" {
+		t.Fatalf("expected responses stop to become gemini stopSequences, got %+v", generationConfig)
 	}
 	toolConfig := payload["toolConfig"].(map[string]any)
 	functionCallingConfig := toolConfig["functionCallingConfig"].(map[string]any)
@@ -1164,6 +1308,7 @@ func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
 				},
 			},
 			"tool_choice": "required",
+			"stop":        []any{"DONE", "HALT"},
 		},
 	}, "gemini-2.5-pro")
 	if err != nil {
@@ -1191,6 +1336,10 @@ func TestPrepareUpstreamExchangeChatToGemini(t *testing.T) {
 	generationConfig := payload["generationConfig"].(map[string]any)
 	if generationConfig["responseMimeType"] != "application/json" {
 		t.Fatalf("expected chat response_format to become gemini JSON response mime type, got %+v", generationConfig)
+	}
+	stopSequences := generationConfig["stopSequences"].([]any)
+	if len(stopSequences) != 2 || stopSequences[0] != "DONE" || stopSequences[1] != "HALT" {
+		t.Fatalf("expected chat stop to become gemini stopSequences, got %+v", generationConfig)
 	}
 	responseSchema := generationConfig["responseJsonSchema"].(map[string]any)
 	if responseSchema["type"] != "object" {

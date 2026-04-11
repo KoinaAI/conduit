@@ -506,6 +506,18 @@ func (h *Handlers) DeletePricingProfile(w http.ResponseWriter, r *http.Request) 
 		if len(state.PricingProfiles) == before {
 			return errNotFound("pricing profile")
 		}
+		for routeIndex := range state.ModelRoutes {
+			if state.ModelRoutes[routeIndex].PricingProfileID == id {
+				state.ModelRoutes[routeIndex].PricingProfileID = ""
+			}
+		}
+		aliases := state.PricingAliases[:0]
+		for _, rule := range state.PricingAliases {
+			if rule.PricingProfileID != id {
+				aliases = append(aliases, rule)
+			}
+		}
+		state.PricingAliases = aliases
 		return nil
 	})
 	if err != nil {
@@ -684,11 +696,17 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		created.Name = created.ID
 	}
 	saved, err := h.updateState(func(state *model.State) error {
+		if err := normalizeGatewayKey(&created); err != nil {
+			return err
+		}
+		if err := ensureGatewayKeySecretUnique(state.GatewayKeys, secret, "", h.cfg.SecretLookupPepper()); err != nil {
+			return err
+		}
 		state.GatewayKeys = append([]model.GatewayKey{created}, state.GatewayKeys...)
 		return nil
 	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeMutationError(w, err)
 		return
 	}
 	key, _ := saved.FindGatewayKey(created.ID)
@@ -785,6 +803,9 @@ func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
 				if err := validateGatewaySecretStrength(secret); err != nil {
 					return errValidation(err.Error())
 				}
+				if err := ensureGatewayKeySecretUnique(state.GatewayKeys, secret, current.ID, h.cfg.SecretLookupPepper()); err != nil {
+					return err
+				}
 				hash, err := model.HashGatewaySecret(secret)
 				if err != nil {
 					return errValidation(err.Error())
@@ -796,6 +817,9 @@ func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
 			}
 			if strings.TrimSpace(current.Name) == "" {
 				current.Name = current.ID
+			}
+			if err := normalizeGatewayKey(&current); err != nil {
+				return err
 			}
 			current.UpdatedAt = time.Now().UTC()
 			state.GatewayKeys[index] = current
@@ -1462,6 +1486,124 @@ func decodeOptionalProtocols(raw json.RawMessage, field string) ([]model.Protoco
 		return nil, fmt.Errorf("%s must be an array of protocol identifiers or null", field)
 	}
 	return values, nil
+}
+
+func ensureGatewayKeySecretUnique(keys []model.GatewayKey, secret, currentID, pepper string) error {
+	if strings.TrimSpace(secret) == "" {
+		return nil
+	}
+	lookupHash := model.GatewaySecretLookupHash(secret, pepper)
+	for _, key := range keys {
+		if key.ID == currentID {
+			continue
+		}
+		if key.SecretLookupHash != "" {
+			if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(lookupHash)) == 1 {
+				return errValidation("gateway secret is already in use by another key")
+			}
+			continue
+		}
+		if key.SecretHash != "" && model.VerifyGatewaySecret(key.SecretHash, secret) {
+			return errValidation("gateway secret is already in use by another key")
+		}
+	}
+	return nil
+}
+
+func normalizeGatewayKey(key *model.GatewayKey) error {
+	if key == nil {
+		return errValidation("gateway key is required")
+	}
+	key.Name = strings.TrimSpace(key.Name)
+	key.SecretPreview = strings.TrimSpace(key.SecretPreview)
+	key.Notes = strings.TrimSpace(key.Notes)
+	key.AllowedModels = normalizeUniqueStrings(key.AllowedModels)
+	protocols, err := normalizeGatewayKeyProtocols(key.AllowedProtocols)
+	if err != nil {
+		return err
+	}
+	key.AllowedProtocols = protocols
+	if key.MaxConcurrency < 0 {
+		return errValidation("max_concurrency must be greater than or equal to 0")
+	}
+	if key.RateLimitRPM < 0 {
+		return errValidation("rate_limit_rpm must be greater than or equal to 0")
+	}
+	for field, value := range map[string]float64{
+		"hourly_budget_usd":  key.HourlyBudgetUSD,
+		"daily_budget_usd":   key.DailyBudgetUSD,
+		"weekly_budget_usd":  key.WeeklyBudgetUSD,
+		"monthly_budget_usd": key.MonthlyBudgetUSD,
+	} {
+		if value < 0 {
+			return errValidation(field + " must be greater than or equal to 0")
+		}
+	}
+	if key.ExpiresAt != nil {
+		expiresAt := key.ExpiresAt.UTC()
+		key.ExpiresAt = &expiresAt
+	}
+	return nil
+}
+
+func normalizeGatewayKeyProtocols(protocols []model.Protocol) ([]model.Protocol, error) {
+	if len(protocols) == 0 {
+		return nil, nil
+	}
+	normalized := make([]model.Protocol, 0, len(protocols))
+	seen := make(map[model.Protocol]struct{}, len(protocols))
+	for _, protocol := range protocols {
+		current, ok := canonicalGatewayProtocol(protocol)
+		if !ok {
+			return nil, errValidation("allowed_protocols contains an unsupported protocol")
+		}
+		if _, exists := seen[current]; exists {
+			continue
+		}
+		seen[current] = struct{}{}
+		normalized = append(normalized, current)
+	}
+	return normalized, nil
+}
+
+func canonicalGatewayProtocol(protocol model.Protocol) (model.Protocol, bool) {
+	switch strings.ToLower(strings.TrimSpace(string(protocol))) {
+	case string(model.ProtocolOpenAIChat):
+		return model.ProtocolOpenAIChat, true
+	case string(model.ProtocolOpenAIResponses):
+		return model.ProtocolOpenAIResponses, true
+	case string(model.ProtocolOpenAIRealtime):
+		return model.ProtocolOpenAIRealtime, true
+	case string(model.ProtocolAnthropic):
+		return model.ProtocolAnthropic, true
+	case string(model.ProtocolGeminiGenerate):
+		return model.ProtocolGeminiGenerate, true
+	case string(model.ProtocolGeminiStream):
+		return model.ProtocolGeminiStream, true
+	default:
+		return "", false
+	}
+}
+
+func normalizeUniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	return normalized
 }
 
 func validateGatewaySecretStrength(secret string) error {

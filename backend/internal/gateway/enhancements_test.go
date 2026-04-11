@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/model"
 	"github.com/KoinaAI/conduit/backend/internal/observability"
+	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
 func TestAuthenticateGatewayRequestCachesInvalidSecretAndLocksSource(t *testing.T) {
@@ -76,6 +78,57 @@ func TestAuthenticateGatewayRequestDoesNotPoisonValidKeyOnDisallowedAlias(t *tes
 		t.Fatalf("expected gateway key gk-1, got %s", authenticated.ID)
 	}
 	service.runtime.releaseGatewayKey(authenticated.ID, 0)
+}
+
+func TestAuthenticateGatewayRequestBackfillsLegacyLookupHash(t *testing.T) {
+	t.Parallel()
+
+	fileStore, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer fileStore.Close()
+
+	hash, err := model.HashGatewaySecret("legacy-secret-123")
+	if err != nil {
+		t.Fatalf("hash gateway secret: %v", err)
+	}
+	if _, err := fileStore.Replace(model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:         "gk-legacy",
+			Name:       "legacy",
+			SecretHash: hash,
+			Enabled:    true,
+		}},
+	}); err != nil {
+		t.Fatalf("replace store state: %v", err)
+	}
+
+	service := &Service{
+		cfg:     config.Config{GatewaySecretLookupPepper: "lookup-pepper"},
+		store:   fileStore,
+		runtime: newRuntimeState(),
+	}
+	headers := http.Header{}
+	headers.Set("X-API-Key", "legacy-secret-123")
+
+	key, err := service.authenticateGatewayRequest(fileStore.RoutingSnapshot(), headers, model.ProtocolOpenAIChat, "gpt-5.4", "203.0.113.5")
+	if err != nil {
+		t.Fatalf("authenticate gateway request: %v", err)
+	}
+	if key.ID != "gk-legacy" {
+		t.Fatalf("expected legacy key to authenticate, got %+v", key)
+	}
+
+	saved := fileStore.Snapshot()
+	backfilled, ok := saved.FindGatewayKey("gk-legacy")
+	if !ok {
+		t.Fatal("expected legacy key to remain in state")
+	}
+	if backfilled.SecretLookupHash == "" {
+		t.Fatalf("expected legacy key lookup hash to be backfilled, got %+v", backfilled)
+	}
 }
 
 func TestGatewayRequestSourceIgnoresSpoofedForwardHeaders(t *testing.T) {

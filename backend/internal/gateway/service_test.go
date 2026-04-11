@@ -27,6 +27,7 @@ type observedRequest struct {
 	Path          string
 	Authorization string
 	APIKey        string
+	Subprotocol   string
 	Body          string
 	Query         string
 }
@@ -65,9 +66,13 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 			openAIRequests <- observedRequest{
 				Path:          r.URL.Path,
 				Authorization: r.Header.Get("Authorization"),
+				Subprotocol:   r.Header.Get("Sec-WebSocket-Protocol"),
 				Query:         r.URL.RawQuery,
 			}
-			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			upgrader := websocket.Upgrader{
+				CheckOrigin:  func(*http.Request) bool { return true },
+				Subprotocols: []string{"realtime.v1"},
+			}
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Fatalf("upgrade failed: %v", err)
@@ -322,7 +327,9 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		wsURL := "ws" + strings.TrimPrefix(gatewayServer.URL, "http") + "/v1/realtime?model=gpt-5.4&session_id=realtime-session&routing_scenario=background"
 		headers := http.Header{}
 		headers.Set("X-API-Key", testGatewaySecret)
-		conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
+		dialer := *websocket.DefaultDialer
+		dialer.Subprotocols = []string{"realtime.v1"}
+		conn, resp, err := dialer.Dial(wsURL, headers)
 		if err != nil {
 			t.Fatalf("dial realtime: %v", err)
 		}
@@ -344,6 +351,9 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		if got := resp.Header.Get("X-Conduit-Scenario"); got != "background" {
 			t.Fatalf("expected realtime scenario header, got %q", got)
 		}
+		if got := conn.Subprotocol(); got != "realtime.v1" {
+			t.Fatalf("expected realtime subprotocol to round-trip through gateway, got %q", got)
+		}
 
 		seen := <-openAIRequests
 		if !strings.Contains(seen.Query, "model=up-openai") {
@@ -354,6 +364,9 @@ func TestGatewayProtocolsEndToEnd(t *testing.T) {
 		}
 		if !strings.Contains(seen.Query, "routing_scenario=background") {
 			t.Fatalf("expected realtime scenario query to be preserved, got %s", seen.Query)
+		}
+		if seen.Subprotocol != "realtime.v1" {
+			t.Fatalf("expected realtime subprotocol to be forwarded upstream, got %q", seen.Subprotocol)
 		}
 	})
 

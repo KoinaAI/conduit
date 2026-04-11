@@ -299,6 +299,9 @@ func responsesToOpenAIChatPayload(payload map[string]any, upstreamModel string) 
 			out[field] = value
 		}
 	}
+	if stopSequences := openAIStopSequences(payload["stop"]); len(stopSequences) > 0 {
+		out["stop"] = payload["stop"]
+	}
 	if maxTokens, ok := payload["max_output_tokens"]; ok {
 		out["max_tokens"] = maxTokens
 	} else if maxTokens, ok := payload["max_tokens"]; ok {
@@ -388,7 +391,7 @@ func responseInputItemToOpenAIMessages(item map[string]any) ([]map[string]any, e
 		message := map[string]any{"role": role}
 		content := responseMessageContentToOpenAIContent(item["content"])
 		if role == "tool" {
-			message["tool_call_id"] = strings.TrimSpace(stringValue(item["tool_call_id"]))
+			message["tool_call_id"] = strings.TrimSpace(firstNonEmptyString(item["tool_call_id"], item["call_id"]))
 			message["content"] = responseContentToText(item["content"])
 			return []map[string]any{message}, nil
 		}
@@ -592,6 +595,9 @@ func openAIChatPayloadToAnthropic(payload map[string]any) ([]byte, error) {
 		if value, ok := payload[field]; ok {
 			out[field] = value
 		}
+	}
+	if stopSequences := openAIStopSequences(payload["stop"]); len(stopSequences) > 0 {
+		out["stop_sequences"] = stopSequences
 	}
 
 	systemBlocks := make([]map[string]any, 0, 2)
@@ -943,6 +949,9 @@ func openAIChatGenerationConfig(payload map[string]any) map[string]any {
 	if topP, ok := payload["top_p"]; ok {
 		config["topP"] = topP
 	}
+	if stopSequences := openAIStopSequences(payload["stop"]); len(stopSequences) > 0 {
+		config["stopSequences"] = stopSequences
+	}
 	for key, value := range openAIChatResponseFormatToGemini(payload["response_format"]) {
 		config[key] = value
 	}
@@ -1020,7 +1029,7 @@ func openAIChatToolMessageToGemini(message map[string]any, toolNames map[string]
 	}
 	name := strings.TrimSpace(toolNames[callID])
 	if name == "" {
-		name = "tool"
+		name = strings.TrimSpace(firstNonEmptyString(message["name"], "tool"))
 	}
 	return map[string]any{
 		"role": "function",
@@ -1210,6 +1219,9 @@ func anthropicToOpenAIChat(payload map[string]any, upstreamModel string) ([]byte
 	if topP, ok := payload["top_p"]; ok {
 		out["top_p"] = topP
 	}
+	if stop := anthropicStopSequencesToOpenAI(payload["stop_sequences"]); stop != nil {
+		out["stop"] = stop
+	}
 	stream, _ := payload["stream"].(bool)
 	if stream {
 		out["stream"] = true
@@ -1257,9 +1269,52 @@ func anthropicToOpenAIChat(payload map[string]any, upstreamModel string) ([]byte
 			out["tools"] = mapped
 		}
 	}
+	if toolChoice := anthropicToolChoiceToOpenAI(payload["tool_choice"]); toolChoice != nil {
+		out["tool_choice"] = toolChoice
+	}
 
 	body, err := json.Marshal(out)
 	return body, stream, err
+}
+
+func anthropicToolChoiceToOpenAI(value any) any {
+	current, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	switch choiceType := strings.ToLower(strings.TrimSpace(stringValue(current["type"]))); choiceType {
+	case "auto":
+		return "auto"
+	case "none":
+		return "none"
+	case "any":
+		return "required"
+	case "tool":
+		name := strings.TrimSpace(stringValue(current["name"]))
+		if name == "" {
+			return nil
+		}
+		return map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": name,
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+func anthropicStopSequencesToOpenAI(value any) any {
+	sequences := stringList(value)
+	switch len(sequences) {
+	case 0:
+		return nil
+	case 1:
+		return sequences[0]
+	default:
+		return sequences
+	}
 }
 
 func flattenAnthropicSystem(value any) string {
@@ -1324,9 +1379,74 @@ func geminiToOpenAIChat(rawBody []byte, upstreamModel string, stream bool) ([]by
 		if topP, ok := generationConfig["topP"]; ok {
 			out["top_p"] = topP
 		}
+		if stop := geminiStopSequencesToOpenAI(generationConfig["stopSequences"]); stop != nil {
+			out["stop"] = stop
+		}
+		if responseFormat := geminiResponseFormatToOpenAI(generationConfig); responseFormat != nil {
+			out["response_format"] = responseFormat
+		}
+	}
+	if toolConfig, ok := payload["toolConfig"].(map[string]any); ok {
+		if toolChoice := geminiToolChoiceToOpenAI(toolConfig["functionCallingConfig"]); toolChoice != nil {
+			out["tool_choice"] = toolChoice
+		}
 	}
 
 	return json.Marshal(out)
+}
+
+func geminiToolChoiceToOpenAI(value any) any {
+	config, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	switch mode := strings.ToUpper(strings.TrimSpace(stringValue(config["mode"]))); mode {
+	case "NONE":
+		return "none"
+	case "AUTO":
+		return "auto"
+	case "ANY":
+		names := stringList(config["allowedFunctionNames"])
+		if len(names) == 1 {
+			return map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": names[0],
+				},
+			}
+		}
+		return "required"
+	default:
+		return nil
+	}
+}
+
+func geminiStopSequencesToOpenAI(value any) any {
+	sequences := stringList(value)
+	switch len(sequences) {
+	case 0:
+		return nil
+	case 1:
+		return sequences[0]
+	default:
+		return sequences
+	}
+}
+
+func geminiResponseFormatToOpenAI(generationConfig map[string]any) any {
+	mimeType := strings.ToLower(strings.TrimSpace(stringValue(generationConfig["responseMimeType"])))
+	if mimeType != "application/json" {
+		return nil
+	}
+	if schema, ok := generationConfig["responseJsonSchema"]; ok && schema != nil {
+		return map[string]any{
+			"type": "json_schema",
+			"json_schema": map[string]any{
+				"schema": schema,
+			},
+		}
+	}
+	return map[string]any{"type": "json_object"}
 }
 
 func flattenGeminiParts(value any) string {
@@ -1695,6 +1815,43 @@ func marshalJSONObject(value any) string {
 func stringValue(value any) string {
 	text, _ := value.(string)
 	return text
+}
+
+func openAIStopSequences(value any) []string {
+	sequences := stringList(value)
+	if len(sequences) == 0 {
+		return nil
+	}
+	return sequences
+}
+
+func stringList(value any) []string {
+	switch current := value.(type) {
+	case string:
+		text := strings.TrimSpace(current)
+		if text == "" {
+			return nil
+		}
+		return []string{text}
+	case []string:
+		out := make([]string, 0, len(current))
+		for _, item := range current {
+			if text := strings.TrimSpace(item); text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(current))
+		for _, item := range current {
+			if text := strings.TrimSpace(stringValue(item)); text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {

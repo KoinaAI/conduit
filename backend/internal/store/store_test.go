@@ -154,6 +154,58 @@ func TestOpenHonorsConfiguredRequestHistoryLimitOnReload(t *testing.T) {
 	}
 }
 
+func TestOpenNormalizesLegacyTimestampOrderingOnReload(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	fileStore, err := Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	base := time.Date(2026, time.April, 11, 10, 0, 0, 0, time.UTC)
+	if err := fileStore.AppendRequestRecord(model.RequestRecord{
+		ID:        "req-earlier",
+		StartedAt: base,
+	}, nil, 10); err != nil {
+		t.Fatalf("append earlier: %v", err)
+	}
+	if err := fileStore.AppendRequestRecord(model.RequestRecord{
+		ID:        "req-later",
+		StartedAt: base.Add(100 * time.Millisecond),
+	}, nil, 10); err != nil {
+		t.Fatalf("append later: %v", err)
+	}
+
+	if _, err := fileStore.db.Exec(
+		`UPDATE request_records SET started_at = CASE id
+			WHEN 'req-earlier' THEN ?
+			WHEN 'req-later' THEN ?
+		END`,
+		base.Format(time.RFC3339Nano),
+		base.Add(100*time.Millisecond).Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("downgrade timestamp format: %v", err)
+	}
+	if err := fileStore.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+
+	page, err := reopened.QueryRequestHistory(RequestHistoryQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("query request history: %v", err)
+	}
+	if len(page.Items) != 2 || page.Items[0].ID != "req-later" || page.Items[1].ID != "req-earlier" {
+		t.Fatalf("expected migrated timestamps to preserve chronological ordering, got %+v", page.Items)
+	}
+}
+
 func TestBackupCreatesRotatingSnapshots(t *testing.T) {
 	t.Parallel()
 

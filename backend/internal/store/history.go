@@ -186,7 +186,7 @@ func (s *FileStore) ActiveSessions(now time.Time, activeWithin time.Duration, li
 
 	rows, err := db.Query(
 		s.rebind(`SELECT payload FROM request_records WHERE started_at >= ? ORDER BY started_at DESC, id DESC`),
-		cutoff.Format(time.RFC3339Nano),
+		formatStoreTime(cutoff),
 	)
 	if err != nil {
 		return nil, err
@@ -278,7 +278,7 @@ func (s *FileStore) ProviderUsage(now time.Time, limit int) ([]ProviderUsageRow,
 
 	rows, err := db.Query(
 		s.rebind(`SELECT payload FROM request_records WHERE started_at >= ? ORDER BY started_at DESC, id DESC`),
-		cutoff.Format(time.RFC3339Nano),
+		formatStoreTime(cutoff),
 	)
 	if err != nil {
 		return nil, err
@@ -366,7 +366,7 @@ func (s *FileStore) queryRequestHistoryBatch(db *sql.DB, query RequestHistoryQue
 
 	if !cursor.StartedAt.IsZero() && strings.TrimSpace(cursor.ID) != "" {
 		builder.WriteString(` AND (started_at < ? OR (started_at = ? AND id < ?))`)
-		startedAt := cursor.StartedAt.UTC().Format(time.RFC3339Nano)
+		startedAt := formatStoreTime(cursor.StartedAt)
 		args = append(args, startedAt, startedAt, cursor.ID)
 	}
 	if query.Protocol != "" {
@@ -416,7 +416,7 @@ func (s *FileStore) queryRequestHistoryBatch(db *sql.DB, query RequestHistoryQue
 		if err := rows.Scan(&id, &startedRaw, &raw); err != nil {
 			return nil, err
 		}
-		startedAt, err := time.Parse(time.RFC3339Nano, startedRaw)
+		startedAt, err := parseStoreTime(startedRaw)
 		if err != nil {
 			return nil, err
 		}

@@ -3,6 +3,8 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"hash/fnv"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -236,6 +238,31 @@ func TestCreateGatewayKeyRejectsWeakCustomSecret(t *testing.T) {
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected bad request for weak secret, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCreateGatewayKeyRejectsDuplicateSecret(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:               "gk-1",
+			Name:             "existing",
+			SecretHash:       mustHashGatewaySecret(t, "shared-secret-123"),
+			SecretLookupHash: model.GatewaySecretLookupHash("shared-secret-123", "pepper"),
+			Enabled:          true,
+		}},
+	})
+	handlers := New(config.Config{GatewaySecretLookupPepper: "pepper"}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/gateway-keys", strings.NewReader(`{"name":"duplicate","secret":"shared-secret-123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handlers.CreateGatewayKey(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected duplicate secret to be rejected, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -582,6 +609,7 @@ func TestCreateProviderAcceptsSOCKSProxyURL(t *testing.T) {
 func TestDeleteIntegrationCleansLinkedProviderRoutesAndManagedPricing(t *testing.T) {
 	t.Parallel()
 
+	profileID := managedPricingProfileIDForTest("integration-1", "gpt-5.4")
 	fileStore := openTestStore(t, model.State{
 		Version: "2026-04-01",
 		Providers: []model.Provider{{
@@ -612,7 +640,7 @@ func TestDeleteIntegrationCleansLinkedProviderRoutesAndManagedPricing(t *testing
 		ModelRoutes: []model.ModelRoute{
 			{
 				Alias:            "gpt-5.4",
-				PricingProfileID: "pricing-sync-integration-1-gpt-5-4",
+				PricingProfileID: profileID,
 				Targets: []model.RouteTarget{{
 					ID:               "target-1",
 					AccountID:        "provider-1",
@@ -666,7 +694,7 @@ func TestDeleteIntegrationCleansLinkedProviderRoutesAndManagedPricing(t *testing
 			},
 		},
 		PricingProfiles: []model.PricingProfile{
-			{ID: "pricing-sync-integration-1-gpt-5-4", Name: "managed"},
+			{ID: profileID, Name: "managed"},
 			{ID: "manual-profile", Name: "manual"},
 		},
 		GatewayKeys: []model.GatewayKey{{
@@ -708,7 +736,7 @@ func TestDeleteIntegrationCleansLinkedProviderRoutesAndManagedPricing(t *testing
 	if len(shared.Scenarios) != 1 || len(shared.Scenarios[0].Targets) != 1 || shared.Scenarios[0].Targets[0].AccountID != "provider-2" {
 		t.Fatalf("expected shared route scenario targets to drop linked provider, got %+v", shared.Scenarios)
 	}
-	if _, ok := saved.FindPricingProfile("pricing-sync-integration-1-gpt-5-4"); ok {
+	if _, ok := saved.FindPricingProfile(profileID); ok {
 		t.Fatalf("expected managed pricing profile to be removed, got %+v", saved.PricingProfiles)
 	}
 	if len(saved.GatewayKeys) != 1 || len(saved.GatewayKeys[0].AllowedModels) != 1 || saved.GatewayKeys[0].AllowedModels[0] != "shared-route" {
@@ -1030,6 +1058,77 @@ func TestUpdateGatewayKeyClearsAllowedRestrictionsWhenNull(t *testing.T) {
 	}
 	if len(key.AllowedProtocols) != 0 {
 		t.Fatalf("expected allowed_protocols to be cleared, got %+v", key.AllowedProtocols)
+	}
+}
+
+func TestUpdateGatewayKeyRejectsInvalidPolicies(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		GatewayKeys: []model.GatewayKey{{
+			ID:               "gk-1",
+			Name:             "restricted",
+			SecretHash:       mustHashGatewaySecret(t, "original-secret-123"),
+			SecretLookupHash: "lookup",
+			Enabled:          true,
+		}},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/gateway-keys/gk-1", strings.NewReader(`{
+		"allowed_protocols":["OpenAI.Chat","unknown.protocol"],
+		"rate_limit_rpm":-1
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("id", "gk-1")
+	recorder := httptest.NewRecorder()
+	handlers.UpdateGatewayKey(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid gateway key policies to be rejected, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDeletePricingProfileClearsRouteAndAliasReferences(t *testing.T) {
+	t.Parallel()
+
+	fileStore := openTestStore(t, model.State{
+		Version: "2026-04-01",
+		PricingProfiles: []model.PricingProfile{
+			{ID: "profile-1", Name: "profile-1"},
+			{ID: "profile-2", Name: "profile-2"},
+		},
+		ModelRoutes: []model.ModelRoute{{
+			Alias:            "gpt-5.4",
+			PricingProfileID: "profile-1",
+		}},
+		PricingAliases: []model.PricingAliasRule{
+			{Name: "managed", MatchType: model.PricingAliasMatchExact, Pattern: "gpt-5.4", PricingProfileID: "profile-1", Enabled: true},
+			{Name: "manual", MatchType: model.PricingAliasMatchExact, Pattern: "gpt-4.1", PricingProfileID: "profile-2", Enabled: true},
+		},
+	})
+	handlers := New(config.Config{}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/pricing-profiles/profile-1", nil)
+	req.SetPathValue("id", "profile-1")
+	recorder := httptest.NewRecorder()
+	handlers.DeletePricingProfile(recorder, req)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("expected pricing profile delete to succeed, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	saved := fileStore.Snapshot()
+	route, ok := saved.FindRoute("gpt-5.4")
+	if !ok {
+		t.Fatal("expected route to remain")
+	}
+	if route.PricingProfileID != "" {
+		t.Fatalf("expected route pricing profile reference to be cleared, got %+v", route)
+	}
+	if len(saved.PricingAliases) != 1 || saved.PricingAliases[0].PricingProfileID != "profile-2" {
+		t.Fatalf("expected pricing alias references to deleted profile to be removed, got %+v", saved.PricingAliases)
 	}
 }
 
@@ -1378,4 +1477,28 @@ func openTestStore(t *testing.T, state model.State) *store.FileStore {
 		t.Fatalf("replace store state: %v", err)
 	}
 	return fileStore
+}
+
+func mustHashGatewaySecret(t *testing.T, secret string) string {
+	t.Helper()
+
+	hash, err := model.HashGatewaySecret(secret)
+	if err != nil {
+		t.Fatalf("hash gateway secret: %v", err)
+	}
+	return hash
+}
+
+func managedPricingProfileIDForTest(integrationID, modelName string) string {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(strings.ToLower(strings.TrimSpace(modelName))))
+	slug := strings.NewReplacer("/", "-", " ", "-", ".", "-").Replace(strings.ToLower(strings.TrimSpace(modelName)))
+	slug = strings.Trim(slug, "-")
+	for strings.Contains(slug, "--") {
+		slug = strings.ReplaceAll(slug, "--", "-")
+	}
+	if slug == "" {
+		slug = "model"
+	}
+	return "pricing-sync-" + strings.TrimSpace(integrationID) + "-" + slug + "-" + fmt.Sprintf("%08x", hasher.Sum32())
 }

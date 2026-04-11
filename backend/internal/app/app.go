@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,12 +22,15 @@ import (
 )
 
 type App struct {
-	cfg       config.Config
-	store     *store.FileStore
-	admin     *admin.Handlers
-	gateway   *gateway.Service
-	scheduler *scheduler.Service
-	startedAt time.Time
+	cfg              config.Config
+	store            *store.FileStore
+	admin            *admin.Handlers
+	integration      *integration.Service
+	gateway          *gateway.Service
+	scheduler        *scheduler.Service
+	backgroundCancel context.CancelFunc
+	backgroundWG     sync.WaitGroup
+	startedAt        time.Time
 }
 
 func New(cfg config.Config) (*App, error) {
@@ -46,10 +50,11 @@ func New(cfg config.Config) (*App, error) {
 	adminHandlers := admin.New(cfg, store, integrationService, gatewayService)
 
 	return &App{
-		cfg:     cfg,
-		store:   store,
-		admin:   adminHandlers,
-		gateway: gatewayService,
+		cfg:         cfg,
+		store:       store,
+		admin:       adminHandlers,
+		integration: integrationService,
+		gateway:     gatewayService,
 		scheduler: scheduler.New(
 			adminHandlers,
 			time.Duration(cfg.ProbeIntervalSeconds)*time.Second,
@@ -222,9 +227,20 @@ func (a *App) Healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *App) StartBackground(ctx context.Context) {
-	go a.scheduler.Start(ctx)
+	backgroundCtx, cancel := context.WithCancel(ctx)
+	a.backgroundCancel = cancel
+
+	a.backgroundWG.Add(1)
+	go func() {
+		defer a.backgroundWG.Done()
+		a.scheduler.Start(backgroundCtx)
+	}()
 	if strings.TrimSpace(a.cfg.BackupDirectory) != "" && a.cfg.BackupIntervalSeconds > 0 && a.store.SupportsBackup() {
-		go a.runBackupLoop(ctx)
+		a.backgroundWG.Add(1)
+		go func() {
+			defer a.backgroundWG.Done()
+			a.runBackupLoop(backgroundCtx)
+		}()
 	}
 }
 
@@ -232,7 +248,19 @@ func (a *App) Close() error {
 	if a == nil {
 		return nil
 	}
+	if a.backgroundCancel != nil {
+		a.backgroundCancel()
+		a.backgroundCancel = nil
+	}
+	if a.scheduler != nil {
+		a.scheduler.Stop()
+	}
+	a.backgroundWG.Wait()
+
 	var errs []error
+	if a.integration != nil {
+		errs = append(errs, a.integration.Close())
+	}
 	if a.gateway != nil {
 		errs = append(errs, a.gateway.Close())
 	}

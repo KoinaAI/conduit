@@ -1,12 +1,10 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/model"
 )
@@ -72,206 +70,54 @@ func TestAppendRequestRecordTrimsHistoryAndPreservesRoutingState(t *testing.T) {
 	}
 }
 
-func TestOpenRoundTripPreservesGatewayKeySecretHash(t *testing.T) {
+func TestOpenRejectsLegacyJSONStateFile(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "state.json")
-	fileStore, err := Open(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
+	if err := os.WriteFile(path, []byte(`{"version":"2026-04-01"}`), 0o600); err != nil {
+		t.Fatalf("write legacy file: %v", err)
 	}
 
-	hash, err := model.HashGatewaySecret("gateway-secret-123")
-	if err != nil {
-		t.Fatalf("hash secret: %v", err)
+	if _, err := Open(path); err == nil {
+		t.Fatal("expected legacy JSON state files to be rejected")
 	}
+	if _, err := os.Stat(path + ".legacy.json"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("did not expect legacy backup file to be created, stat err=%v", err)
+	}
+}
+
+func TestStorePersistsGatewayKeyHashesAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	firstStore, err := Open(path)
+	if err != nil {
+		t.Fatalf("open first store: %v", err)
+	}
+
 	state := model.DefaultState()
 	state.GatewayKeys = []model.GatewayKey{{
 		ID:               "gk-1",
 		Name:             "gateway",
-		SecretHash:       hash,
-		SecretLookupHash: "lookup",
-		SecretPreview:    model.SecretPreview("gateway-secret-123"),
+		SecretHash:       "bcrypt-hash",
+		SecretLookupHash: "lookup-hash",
+		SecretPreview:    "uag-12...abcd",
 		Enabled:          true,
 	}}
-	if _, err := fileStore.Replace(state); err != nil {
+	if _, err := firstStore.Replace(state); err != nil {
 		t.Fatalf("replace state: %v", err)
-	}
-	if err := fileStore.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
 	}
 
 	reopened, err := Open(path)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
-	defer reopened.Close()
 
-	saved := reopened.Snapshot()
-	key, ok := saved.FindGatewayKey("gk-1")
-	if !ok {
-		t.Fatal("expected gateway key after reopen")
+	snapshot := reopened.Snapshot()
+	if len(snapshot.GatewayKeys) != 1 {
+		t.Fatalf("expected one gateway key after reopen, got %+v", snapshot.GatewayKeys)
 	}
-	if key.SecretHash == "" {
-		t.Fatalf("expected secret hash to persist across reopen, got %+v", key)
-	}
-	if !model.VerifyGatewaySecret(key.SecretHash, "gateway-secret-123") {
-		t.Fatalf("expected persisted secret hash to stay valid")
-	}
-}
-
-func TestOpenHonorsConfiguredRequestHistoryLimitOnReload(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "state.json")
-	fileStore, err := Open(path, WithRequestHistoryLimit(5))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-
-	for index := 0; index < 8; index++ {
-		recordID := "req-" + strconv.Itoa(index+1)
-		if err := fileStore.AppendRequestRecord(model.RequestRecord{ID: recordID, StartedAt: time.Now().UTC().Add(time.Duration(index) * time.Millisecond)}, nil, 5); err != nil {
-			t.Fatalf("append record %s: %v", recordID, err)
-		}
-	}
-	if err := fileStore.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-
-	reopened, err := Open(path, WithRequestHistoryLimit(5))
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
-	}
-	defer reopened.Close()
-
-	saved := reopened.Snapshot()
-	if len(saved.RequestHistory) != 5 {
-		t.Fatalf("expected 5 records after reopen, got %d", len(saved.RequestHistory))
-	}
-	if saved.RequestHistory[0].ID != "req-4" || saved.RequestHistory[4].ID != "req-8" {
-		t.Fatalf("expected most recent 5 records after reopen, got %+v", saved.RequestHistory)
-	}
-}
-
-func TestOpenNormalizesLegacyTimestampOrderingOnReload(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "state.db")
-	fileStore, err := Open(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-
-	base := time.Date(2026, time.April, 11, 10, 0, 0, 0, time.UTC)
-	if err := fileStore.AppendRequestRecord(model.RequestRecord{
-		ID:        "req-earlier",
-		StartedAt: base,
-	}, nil, 10); err != nil {
-		t.Fatalf("append earlier: %v", err)
-	}
-	if err := fileStore.AppendRequestRecord(model.RequestRecord{
-		ID:        "req-later",
-		StartedAt: base.Add(100 * time.Millisecond),
-	}, nil, 10); err != nil {
-		t.Fatalf("append later: %v", err)
-	}
-
-	if _, err := fileStore.db.Exec(
-		`UPDATE request_records SET started_at = CASE id
-			WHEN 'req-earlier' THEN ?
-			WHEN 'req-later' THEN ?
-		END`,
-		base.Format(time.RFC3339Nano),
-		base.Add(100*time.Millisecond).Format(time.RFC3339Nano),
-	); err != nil {
-		t.Fatalf("downgrade timestamp format: %v", err)
-	}
-	if err := fileStore.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-
-	reopened, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
-	}
-	defer reopened.Close()
-
-	page, err := reopened.QueryRequestHistory(RequestHistoryQuery{Limit: 10})
-	if err != nil {
-		t.Fatalf("query request history: %v", err)
-	}
-	if len(page.Items) != 2 || page.Items[0].ID != "req-later" || page.Items[1].ID != "req-earlier" {
-		t.Fatalf("expected migrated timestamps to preserve chronological ordering, got %+v", page.Items)
-	}
-}
-
-func TestBackupCreatesRotatingSnapshots(t *testing.T) {
-	t.Parallel()
-
-	tempDir := t.TempDir()
-	path := filepath.Join(tempDir, "gateway.db")
-	fileStore, err := Open(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer fileStore.Close()
-
-	if _, err := fileStore.Replace(model.DefaultState()); err != nil {
-		t.Fatalf("replace state: %v", err)
-	}
-
-	backupDir := filepath.Join(tempDir, "backups")
-	for index := 0; index < 3; index++ {
-		backupPath, err := fileStore.Backup(backupDir, 2)
-		if err != nil {
-			t.Fatalf("backup %d: %v", index, err)
-		}
-		if _, err := os.Stat(backupPath); err != nil {
-			t.Fatalf("expected backup file %q to exist: %v", backupPath, err)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-
-	entries, err := os.ReadDir(backupDir)
-	if err != nil {
-		t.Fatalf("read backup dir: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("expected backup retention to keep 2 snapshots, got %d", len(entries))
-	}
-}
-
-func TestDetectBackendRecognizesPostgresLocator(t *testing.T) {
-	t.Parallel()
-
-	backend, err := detectBackend("postgres://conduit:secret@db.example/conduit?sslmode=disable")
-	if err != nil {
-		t.Fatalf("detect backend: %v", err)
-	}
-	if backend != backendPostgres {
-		t.Fatalf("expected postgres backend, got %q", backend)
-	}
-}
-
-func TestRebindQueryConvertsQuestionPlaceholdersToDollarSyntax(t *testing.T) {
-	t.Parallel()
-
-	query := `INSERT INTO request_records (id, payload, started_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload`
-	rewritten := rebindQuery(query)
-	if strings.Contains(rewritten, "?") {
-		t.Fatalf("expected rebinding to remove question placeholders, got %q", rewritten)
-	}
-	if !strings.Contains(rewritten, "$1") || !strings.Contains(rewritten, "$2") || !strings.Contains(rewritten, "$3") {
-		t.Fatalf("expected rebinding to introduce dollar placeholders, got %q", rewritten)
-	}
-}
-
-func TestBackupRejectsPostgresBackends(t *testing.T) {
-	t.Parallel()
-
-	fileStore := &FileStore{backend: backendPostgres}
-	if _, err := fileStore.Backup(t.TempDir(), 1); err == nil {
-		t.Fatal("expected postgres backup to be rejected")
+	if snapshot.GatewayKeys[0].SecretHash != "bcrypt-hash" {
+		t.Fatalf("expected secret hash to survive reopen, got %+v", snapshot.GatewayKeys[0])
 	}
 }

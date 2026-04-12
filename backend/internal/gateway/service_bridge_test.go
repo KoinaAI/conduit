@@ -92,14 +92,18 @@ func TestGatewayProtocolBridgesMutually(t *testing.T) {
 			DefaultMarkupMultiplier: 1,
 			Capabilities:            []model.Protocol{model.ProtocolOpenAIChat},
 			Endpoints: []model.ProviderEndpoint{{
-				ID:      "endpoint-openai-chat",
+				ID:      "openai-chat-endpoint",
 				BaseURL: openAIServer.URL + "/v1",
 				Enabled: true,
+				Weight:  1,
+				Headers: map[string]string{},
 			}},
 			Credentials: []model.ProviderCredential{{
-				ID:      "credential-openai-chat",
+				ID:      "openai-chat-credential",
 				APIKey:  "openai-chat-key",
 				Enabled: true,
+				Weight:  1,
+				Headers: map[string]string{},
 			}},
 		},
 		{
@@ -112,14 +116,18 @@ func TestGatewayProtocolBridgesMutually(t *testing.T) {
 			DefaultMarkupMultiplier: 1,
 			Capabilities:            []model.Protocol{model.ProtocolOpenAIResponses},
 			Endpoints: []model.ProviderEndpoint{{
-				ID:      "endpoint-openai-responses",
+				ID:      "openai-responses-endpoint",
 				BaseURL: openAIServer.URL + "/v1",
 				Enabled: true,
+				Weight:  1,
+				Headers: map[string]string{},
 			}},
 			Credentials: []model.ProviderCredential{{
-				ID:      "credential-openai-responses",
+				ID:      "openai-responses-credential",
 				APIKey:  "openai-resp-key",
 				Enabled: true,
+				Weight:  1,
+				Headers: map[string]string{},
 			}},
 		},
 		{
@@ -132,14 +140,18 @@ func TestGatewayProtocolBridgesMutually(t *testing.T) {
 			DefaultMarkupMultiplier: 1,
 			Capabilities:            []model.Protocol{model.ProtocolAnthropic},
 			Endpoints: []model.ProviderEndpoint{{
-				ID:      "endpoint-anthropic",
+				ID:      "anthropic-endpoint",
 				BaseURL: anthropicServer.URL,
 				Enabled: true,
+				Weight:  1,
+				Headers: map[string]string{},
 			}},
 			Credentials: []model.ProviderCredential{{
-				ID:      "credential-anthropic",
+				ID:      "anthropic-credential",
 				APIKey:  "anthropic-key",
 				Enabled: true,
+				Weight:  1,
+				Headers: map[string]string{},
 			}},
 		},
 		{
@@ -152,14 +164,18 @@ func TestGatewayProtocolBridgesMutually(t *testing.T) {
 			DefaultMarkupMultiplier: 1,
 			Capabilities:            []model.Protocol{model.ProtocolGeminiGenerate, model.ProtocolGeminiStream},
 			Endpoints: []model.ProviderEndpoint{{
-				ID:      "endpoint-gemini",
+				ID:      "gemini-endpoint",
 				BaseURL: geminiServer.URL,
 				Enabled: true,
+				Weight:  1,
+				Headers: map[string]string{},
 			}},
 			Credentials: []model.ProviderCredential{{
-				ID:      "credential-gemini",
+				ID:      "gemini-credential",
 				APIKey:  "gemini-key",
 				Enabled: true,
+				Weight:  1,
+				Headers: map[string]string{},
 			}},
 		},
 	}

@@ -1,26 +1,21 @@
 package admin
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"maps"
 	"net/http"
-	"net/url"
 	"slices"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/gateway"
 	"github.com/KoinaAI/conduit/backend/internal/integration"
 	"github.com/KoinaAI/conduit/backend/internal/model"
-	"github.com/KoinaAI/conduit/backend/internal/pricing"
 	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
@@ -29,7 +24,6 @@ type Handlers struct {
 	cfg         config.Config
 	store       *store.FileStore
 	integration *integration.Service
-	pricing     *pricing.Service
 	gateway     *gateway.Service
 }
 
@@ -41,15 +35,10 @@ func New(cfg config.Config, store *store.FileStore, integration *integration.Ser
 	if len(gatewayService) > 0 {
 		currentGateway = gatewayService[0]
 	}
-	var pricingService *pricing.Service
-	if cfg.PricingSyncEnabled {
-		pricingService = pricing.NewService(cfg.PricingCatalogURL, nil)
-	}
 	return &Handlers{
 		cfg:         cfg,
 		store:       store,
 		integration: integration,
-		pricing:     pricingService,
 		gateway:     currentGateway,
 	}
 }
@@ -61,16 +50,11 @@ func (h *Handlers) Middleware(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		adminToken := strings.TrimSpace(h.cfg.AdminToken)
-		if adminToken == "" {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "admin API is not configured"})
-			return
-		}
-		token := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+		token := r.Header.Get("X-Admin-Token")
 		if token == "" {
 			token = bearerToken(r.Header.Get("Authorization"))
 		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(h.cfg.AdminToken)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
@@ -78,14 +62,39 @@ func (h *Handlers) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// GetState serves the current admin state snapshot.
+func (h *Handlers) GetState(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, h.store.Snapshot())
+}
+
+// PutState replaces the writable admin state while preserving server-owned
+// history, secrets, and timestamps.
+func (h *Handlers) PutState(w http.ResponseWriter, r *http.Request) {
+	var payload stateWriteRequest
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	next := payload.toModelState()
+	saved, err := h.updateState(func(state *model.State) error {
+		mergeStateWritePayload(state, &next, time.Now().UTC())
+		*state = next
+		state.Normalize()
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
 // GetMeta serves lightweight control-plane metadata.
 func (h *Handlers) GetMeta(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enable_realtime":      h.cfg.EnableRealtime,
-		"pricing_sync_enabled": h.cfg.PricingSyncEnabled,
-		"pricing_catalog_url":  strings.TrimSpace(h.cfg.PricingCatalogURL),
-		"server_time":          time.Now().UTC(),
-		"openapi_url":          "/api/admin/openapi.json",
+		"enable_realtime": h.cfg.EnableRealtime,
+		"server_time":     time.Now().UTC(),
+		"openapi_url":     "/api/admin/openapi.json",
 	})
 }
 
@@ -104,16 +113,17 @@ func (h *Handlers) SyncIntegration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := h.integration.PrepareSync(r.Context(), current)
-	if result.Err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": result.Err.Error()})
-		return
-	}
+	var applyErr error
 	saved, err := h.updateState(func(state *model.State) error {
-		_, err := h.integration.ApplySyncResult(state, id, result)
-		return err
+		_, applyErr = h.integration.ApplySyncResult(state, id, result)
+		return nil
 	})
 	if err != nil {
-		writeResourceError(w, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if applyErr != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": applyErr.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, saved)
@@ -154,83 +164,35 @@ func (h *Handlers) SyncAllIntegrations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	operations := make([]syncOperation, 0, len(snapshot.Integrations))
-	indexByID := map[string]int{}
+	var firstErr error
 	for _, current := range snapshot.Integrations {
 		if !current.Enabled {
 			continue
 		}
-		operations = append(operations, syncOperation{id: current.ID})
-		indexByID[current.ID] = len(operations) - 1
-	}
-	if len(operations) == 0 {
-		writeJSON(w, http.StatusOK, snapshot)
-		return
-	}
-
-	var (
-		mu sync.Mutex
-		wg sync.WaitGroup
-	)
-	for _, current := range snapshot.Integrations {
-		if !current.Enabled {
-			continue
+		result := h.integration.PrepareSync(r.Context(), current)
+		if firstErr == nil && result.Err != nil {
+			firstErr = result.Err
 		}
-		current := current
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			result := h.integration.PrepareSync(r.Context(), current)
-			mu.Lock()
-			operations[indexByID[current.ID]].result = result
-			mu.Unlock()
-		}()
-	}
-	wg.Wait()
-
-	successful := make([]syncOperation, 0, len(operations))
-	failures := make([]map[string]any, 0)
-	for _, operation := range operations {
-		if operation.result.Err != nil {
-			failures = append(failures, map[string]any{
-				"integration_id": operation.id,
-				"error":          operation.result.Err.Error(),
-			})
-			continue
-		}
-		successful = append(successful, operation)
-	}
-	if len(successful) == 0 {
-		message := "all integration sync operations failed"
-		if len(failures) == 1 {
-			message = failures[0]["error"].(string)
-		}
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"error":    message,
-			"failures": failures,
-		})
-		return
+		operations = append(operations, syncOperation{id: current.ID, result: result})
 	}
 
 	saved, err := h.updateState(func(state *model.State) error {
-		for _, operation := range successful {
-			if _, err := h.integration.ApplySyncResult(state, operation.id, operation.result); err != nil {
-				return err
+		for _, operation := range operations {
+			if _, err := h.integration.ApplySyncResult(state, operation.id, operation.result); err != nil && firstErr == nil {
+				firstErr = err
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		writeResourceError(w, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	if len(failures) == 0 {
-		writeJSON(w, http.StatusOK, saved)
+	if firstErr != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": firstErr.Error()})
 		return
 	}
-	writeJSON(w, http.StatusMultiStatus, map[string]any{
-		"state":    saved,
-		"failures": failures,
-	})
+	writeJSON(w, http.StatusOK, saved)
 }
 
 // ListProviders serves GET /api/admin/providers.
@@ -240,25 +202,19 @@ func (h *Handlers) ListProviders(w http.ResponseWriter, _ *http.Request) {
 
 // CreateProvider serves POST /api/admin/providers.
 func (h *Handlers) CreateProvider(w http.ResponseWriter, r *http.Request) {
-	var payload model.Provider
-	if err := decodeJSONBody(w, r, &payload); err != nil {
+	var request providerWriteRequest
+	if err := decodeJSONBody(w, r, &request); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := validateProviderProxyURL(payload.ProxyURL); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := validateProviderPayload(payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
+	payload := request.toModel()
 	if payload.ID == "" {
 		payload.ID = model.NewID("provider")
 	}
 	payload.CreatedAt = time.Now().UTC()
 	payload.UpdatedAt = payload.CreatedAt
 	saved, err := h.updateState(func(state *model.State) error {
+		payload = preserveProviderSecrets(model.Provider{}, payload)
 		state.Providers = append([]model.Provider{payload}, state.Providers...)
 		return nil
 	})
@@ -283,25 +239,19 @@ func (h *Handlers) GetProvider(w http.ResponseWriter, r *http.Request) {
 // UpdateProvider serves PUT /api/admin/providers/{id}.
 func (h *Handlers) UpdateProvider(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var payload model.Provider
-	if err := decodeJSONBody(w, r, &payload); err != nil {
+	var request providerWriteRequest
+	if err := decodeJSONBody(w, r, &request); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := validateProviderProxyURL(payload.ProxyURL); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := validateProviderPayload(payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
+	payload := request.toModel()
 	payload.ID = id
 	saved, err := h.updateState(func(state *model.State) error {
 		for index := range state.Providers {
 			if state.Providers[index].ID != id {
 				continue
 			}
+			payload = preserveProviderSecrets(state.Providers[index], payload)
 			payload.CreatedAt = state.Providers[index].CreatedAt
 			payload.UpdatedAt = time.Now().UTC()
 			state.Providers[index] = payload
@@ -326,7 +276,16 @@ func (h *Handlers) DeleteProvider(w http.ResponseWriter, r *http.Request) {
 		if len(state.Providers) == before {
 			return errNotFound("provider")
 		}
-		removeProviderReferences(state, id)
+		for routeIndex := range state.ModelRoutes {
+			route := &state.ModelRoutes[routeIndex]
+			filtered := route.Targets[:0]
+			for _, target := range route.Targets {
+				if target.AccountID != id {
+					filtered = append(filtered, target)
+				}
+			}
+			route.Targets = filtered
+		}
 		return nil
 	})
 	if err != nil {
@@ -349,18 +308,11 @@ func (h *Handlers) CreateRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	saved, err := h.updateState(func(state *model.State) error {
-		payload.Alias = strings.TrimSpace(payload.Alias)
-		if !validateRouteStrategy(&payload) {
-			return errValidation("route strategy or transformers are invalid")
-		}
-		if err := validateRouteAlias(state.ModelRoutes, payload.Alias, ""); err != nil {
-			return err
-		}
 		state.ModelRoutes = append([]model.ModelRoute{payload}, state.ModelRoutes...)
 		return nil
 	})
 	if err != nil {
-		writeMutationError(w, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	route, _ := saved.FindRoute(payload.Alias)
@@ -385,18 +337,7 @@ func (h *Handlers) UpdateRoute(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	payload.Alias = strings.TrimSpace(payload.Alias)
-	if payload.Alias == "" {
-		payload.Alias = strings.TrimSpace(alias)
-	}
-	if !validateRouteStrategy(&payload) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "route strategy or transformers are invalid"})
-		return
-	}
 	saved, err := h.updateState(func(state *model.State) error {
-		if err := validateRouteAlias(state.ModelRoutes, payload.Alias, alias); err != nil {
-			return err
-		}
 		for index := range state.ModelRoutes {
 			if !strings.EqualFold(state.ModelRoutes[index].Alias, alias) {
 				continue
@@ -407,7 +348,7 @@ func (h *Handlers) UpdateRoute(w http.ResponseWriter, r *http.Request) {
 		return errNotFound("route")
 	})
 	if err != nil {
-		writeMutationError(w, err)
+		writeResourceError(w, err)
 		return
 	}
 	route, _ := saved.FindRoute(payload.Alias)
@@ -429,9 +370,6 @@ func (h *Handlers) DeleteRoute(w http.ResponseWriter, r *http.Request) {
 		if len(state.ModelRoutes) == before {
 			return errNotFound("route")
 		}
-		removeGatewayKeyModelReferences(state.GatewayKeys, map[string]struct{}{
-			strings.ToLower(strings.TrimSpace(alias)): {},
-		})
 		return nil
 	})
 	if err != nil {
@@ -506,18 +444,6 @@ func (h *Handlers) DeletePricingProfile(w http.ResponseWriter, r *http.Request) 
 		if len(state.PricingProfiles) == before {
 			return errNotFound("pricing profile")
 		}
-		for routeIndex := range state.ModelRoutes {
-			if state.ModelRoutes[routeIndex].PricingProfileID == id {
-				state.ModelRoutes[routeIndex].PricingProfileID = ""
-			}
-		}
-		aliases := state.PricingAliases[:0]
-		for _, rule := range state.PricingAliases {
-			if rule.PricingProfileID != id {
-				aliases = append(aliases, rule)
-			}
-		}
-		state.PricingAliases = aliases
 		return nil
 	})
 	if err != nil {
@@ -534,11 +460,12 @@ func (h *Handlers) ListIntegrations(w http.ResponseWriter, _ *http.Request) {
 
 // CreateIntegration serves POST /api/admin/integrations.
 func (h *Handlers) CreateIntegration(w http.ResponseWriter, r *http.Request) {
-	var payload model.Integration
-	if err := decodeJSONBody(w, r, &payload); err != nil {
+	var request integrationWriteRequest
+	if err := decodeJSONBody(w, r, &request); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	payload := request.toModel()
 	if err := h.integration.ValidateBaseURL(payload.BaseURL); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
@@ -548,6 +475,7 @@ func (h *Handlers) CreateIntegration(w http.ResponseWriter, r *http.Request) {
 	}
 	payload.UpdatedAt = time.Now().UTC()
 	saved, err := h.updateState(func(state *model.State) error {
+		payload = preserveIntegrationSecrets(model.Integration{}, payload)
 		state.Integrations = append([]model.Integration{payload}, state.Integrations...)
 		return nil
 	})
@@ -562,11 +490,12 @@ func (h *Handlers) CreateIntegration(w http.ResponseWriter, r *http.Request) {
 // UpdateIntegration serves PUT /api/admin/integrations/{id}.
 func (h *Handlers) UpdateIntegration(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var payload model.Integration
-	if err := decodeJSONBody(w, r, &payload); err != nil {
+	var request integrationWriteRequest
+	if err := decodeJSONBody(w, r, &request); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+	payload := request.toModel()
 	if err := h.integration.ValidateBaseURL(payload.BaseURL); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
@@ -575,6 +504,7 @@ func (h *Handlers) UpdateIntegration(w http.ResponseWriter, r *http.Request) {
 	saved, err := h.updateState(func(state *model.State) error {
 		for index := range state.Integrations {
 			if state.Integrations[index].ID == id {
+				payload = preserveIntegrationSecrets(state.Integrations[index], payload)
 				payload.UpdatedAt = time.Now().UTC()
 				state.Integrations[index] = payload
 				return nil
@@ -595,12 +525,8 @@ func (h *Handlers) DeleteIntegration(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	_, err := h.updateState(func(state *model.State) error {
 		before := len(state.Integrations)
-		linkedProviderID := ""
 		filtered := state.Integrations[:0]
 		for _, integration := range state.Integrations {
-			if integration.ID == id {
-				linkedProviderID = strings.TrimSpace(integration.LinkedProviderID)
-			}
 			if integration.ID != id {
 				filtered = append(filtered, integration)
 			}
@@ -609,11 +535,6 @@ func (h *Handlers) DeleteIntegration(w http.ResponseWriter, r *http.Request) {
 		if len(state.Integrations) == before {
 			return errNotFound("integration")
 		}
-		if linkedProviderID != "" {
-			state.Providers = slicesDeleteProvider(state.Providers, linkedProviderID)
-			removeProviderReferences(state, linkedProviderID)
-		}
-		removeIntegrationPricingProfiles(state, id)
 		return nil
 	})
 	if err != nil {
@@ -640,10 +561,7 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		AllowedProtocols []model.Protocol `json:"allowed_protocols"`
 		MaxConcurrency   int              `json:"max_concurrency"`
 		RateLimitRPM     int              `json:"rate_limit_rpm"`
-		HourlyBudgetUSD  float64          `json:"hourly_budget_usd"`
 		DailyBudgetUSD   float64          `json:"daily_budget_usd"`
-		WeeklyBudgetUSD  float64          `json:"weekly_budget_usd"`
-		MonthlyBudgetUSD float64          `json:"monthly_budget_usd"`
 		Notes            string           `json:"notes"`
 	}
 	if err := decodeJSONBody(w, r, &payload); err != nil {
@@ -684,10 +602,7 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		AllowedProtocols: payload.AllowedProtocols,
 		MaxConcurrency:   payload.MaxConcurrency,
 		RateLimitRPM:     payload.RateLimitRPM,
-		HourlyBudgetUSD:  payload.HourlyBudgetUSD,
 		DailyBudgetUSD:   payload.DailyBudgetUSD,
-		WeeklyBudgetUSD:  payload.WeeklyBudgetUSD,
-		MonthlyBudgetUSD: payload.MonthlyBudgetUSD,
 		Notes:            payload.Notes,
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -696,17 +611,11 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		created.Name = created.ID
 	}
 	saved, err := h.updateState(func(state *model.State) error {
-		if err := normalizeGatewayKey(&created); err != nil {
-			return err
-		}
-		if err := ensureGatewayKeySecretUnique(state.GatewayKeys, secret, "", h.cfg.SecretLookupPepper()); err != nil {
-			return err
-		}
 		state.GatewayKeys = append([]model.GatewayKey{created}, state.GatewayKeys...)
 		return nil
 	})
 	if err != nil {
-		writeMutationError(w, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	key, _ := saved.FindGatewayKey(created.ID)
@@ -714,129 +623,6 @@ func (h *Handlers) CreateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		"gateway_key": key,
 		"secret":      secret,
 	})
-}
-
-// UpdateGatewayKey serves PUT /api/admin/gateway-keys/{id}.
-func (h *Handlers) UpdateGatewayKey(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var payload struct {
-		Name             *string         `json:"name"`
-		Secret           *string         `json:"secret"`
-		Enabled          *bool           `json:"enabled"`
-		ExpiresAt        json.RawMessage `json:"expires_at"`
-		AllowedModels    json.RawMessage `json:"allowed_models"`
-		AllowedProtocols json.RawMessage `json:"allowed_protocols"`
-		MaxConcurrency   *int            `json:"max_concurrency"`
-		RateLimitRPM     *int            `json:"rate_limit_rpm"`
-		HourlyBudgetUSD  *float64        `json:"hourly_budget_usd"`
-		DailyBudgetUSD   *float64        `json:"daily_budget_usd"`
-		WeeklyBudgetUSD  *float64        `json:"weekly_budget_usd"`
-		MonthlyBudgetUSD *float64        `json:"monthly_budget_usd"`
-		Notes            *string         `json:"notes"`
-	}
-	if err := decodeJSONBody(w, r, &payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-
-	var rotatedSecret string
-	saved, err := h.updateState(func(state *model.State) error {
-		for index := range state.GatewayKeys {
-			if state.GatewayKeys[index].ID != id {
-				continue
-			}
-			current := state.GatewayKeys[index]
-			if payload.Name != nil {
-				current.Name = strings.TrimSpace(*payload.Name)
-			}
-			if payload.Enabled != nil {
-				current.Enabled = *payload.Enabled
-			}
-			if payload.ExpiresAt != nil {
-				if bytes.Equal(bytes.TrimSpace(payload.ExpiresAt), []byte("null")) {
-					current.ExpiresAt = nil
-				} else {
-					var expiresAt time.Time
-					if err := json.Unmarshal(payload.ExpiresAt, &expiresAt); err != nil {
-						return errValidation("expires_at must be a valid RFC3339 timestamp or null")
-					}
-					current.ExpiresAt = &expiresAt
-				}
-			}
-			if payload.AllowedModels != nil {
-				allowedModels, err := decodeOptionalStrings(payload.AllowedModels, "allowed_models")
-				if err != nil {
-					return errValidation(err.Error())
-				}
-				current.AllowedModels = allowedModels
-			}
-			if payload.AllowedProtocols != nil {
-				allowedProtocols, err := decodeOptionalProtocols(payload.AllowedProtocols, "allowed_protocols")
-				if err != nil {
-					return errValidation(err.Error())
-				}
-				current.AllowedProtocols = allowedProtocols
-			}
-			if payload.MaxConcurrency != nil {
-				current.MaxConcurrency = *payload.MaxConcurrency
-			}
-			if payload.RateLimitRPM != nil {
-				current.RateLimitRPM = *payload.RateLimitRPM
-			}
-			if payload.HourlyBudgetUSD != nil {
-				current.HourlyBudgetUSD = *payload.HourlyBudgetUSD
-			}
-			if payload.DailyBudgetUSD != nil {
-				current.DailyBudgetUSD = *payload.DailyBudgetUSD
-			}
-			if payload.WeeklyBudgetUSD != nil {
-				current.WeeklyBudgetUSD = *payload.WeeklyBudgetUSD
-			}
-			if payload.MonthlyBudgetUSD != nil {
-				current.MonthlyBudgetUSD = *payload.MonthlyBudgetUSD
-			}
-			if payload.Notes != nil {
-				current.Notes = *payload.Notes
-			}
-			if payload.Secret != nil {
-				secret := strings.TrimSpace(*payload.Secret)
-				if err := validateGatewaySecretStrength(secret); err != nil {
-					return errValidation(err.Error())
-				}
-				if err := ensureGatewayKeySecretUnique(state.GatewayKeys, secret, current.ID, h.cfg.SecretLookupPepper()); err != nil {
-					return err
-				}
-				hash, err := model.HashGatewaySecret(secret)
-				if err != nil {
-					return errValidation(err.Error())
-				}
-				current.SecretHash = hash
-				current.SecretLookupHash = model.GatewaySecretLookupHash(secret, h.cfg.SecretLookupPepper())
-				current.SecretPreview = model.SecretPreview(secret)
-				rotatedSecret = secret
-			}
-			if strings.TrimSpace(current.Name) == "" {
-				current.Name = current.ID
-			}
-			if err := normalizeGatewayKey(&current); err != nil {
-				return err
-			}
-			current.UpdatedAt = time.Now().UTC()
-			state.GatewayKeys[index] = current
-			return nil
-		}
-		return errNotFound("gateway key")
-	})
-	if err != nil {
-		writeMutationError(w, err)
-		return
-	}
-	key, _ := saved.FindGatewayKey(id)
-	response := map[string]any{"gateway_key": key}
-	if rotatedSecret != "" {
-		response["secret"] = rotatedSecret
-	}
-	writeJSON(w, http.StatusOK, response)
 }
 
 // DeleteGatewayKey serves DELETE /api/admin/gateway-keys/{id}.
@@ -863,61 +649,9 @@ func (h *Handlers) DeleteGatewayKey(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// GetPricingAliases serves GET /api/admin/pricing-aliases.
-func (h *Handlers) GetPricingAliases(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.store.Snapshot().PricingAliases)
-}
-
-// UpdatePricingAliases serves PUT /api/admin/pricing-aliases.
-func (h *Handlers) UpdatePricingAliases(w http.ResponseWriter, r *http.Request) {
-	var payload []model.PricingAliasRule
-	if err := decodeJSONBody(w, r, &payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-
-	saved, err := h.updateState(func(state *model.State) error {
-		rules := slices.Clone(payload)
-		if err := validatePricingAliasRules(state, rules); err != nil {
-			return err
-		}
-		state.PricingAliases = rules
-		return nil
-	})
-	if err != nil {
-		writeMutationError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, saved.PricingAliases)
-}
-
 // ListRequestHistory serves GET /api/admin/request-history.
-func (h *Handlers) ListRequestHistory(w http.ResponseWriter, r *http.Request) {
-	query, err := readRequestHistoryQuery(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	page, err := h.store.QueryRequestHistory(query)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, page)
-}
-
-// GetRequestHistoryRecord serves GET /api/admin/request-history/{id}.
-func (h *Handlers) GetRequestHistoryRecord(w http.ResponseWriter, r *http.Request) {
-	record, ok, err := h.store.RequestRecord(r.PathValue("id"))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "request record not found"})
-		return
-	}
-	writeJSON(w, http.StatusOK, record)
+func (h *Handlers) ListRequestHistory(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, h.store.Snapshot().RequestHistory)
 }
 
 // GetRequestAttempts serves GET /api/admin/request-history/{id}/attempts.
@@ -930,160 +664,6 @@ func (h *Handlers) GetRequestAttempts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, attempts)
 }
 
-// ListActiveSessions serves GET /api/admin/runtime/sessions.
-func (h *Handlers) ListActiveSessions(w http.ResponseWriter, r *http.Request) {
-	if h.gateway == nil {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
-		return
-	}
-	limit, err := readPositiveIntQuery(r, "limit", 50, 200)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	activeWithinMinutes, err := readPositiveIntQuery(r, "active_within_minutes", 15, 24*60)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	items := h.gateway.ActiveSessions(time.Duration(activeWithinMinutes)*time.Minute, limit)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"active_within_minutes": activeWithinMinutes,
-		"items":                 items,
-	})
-}
-
-// GetStickyBindings serves GET /api/admin/runtime/sticky-bindings.
-func (h *Handlers) GetStickyBindings(w http.ResponseWriter, _ *http.Request) {
-	if h.gateway == nil {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": h.gateway.StickyBindings()})
-}
-
-// ResetStickyBindings serves POST /api/admin/runtime/sticky-bindings/reset.
-func (h *Handlers) ResetStickyBindings(w http.ResponseWriter, r *http.Request) {
-	if h.gateway == nil {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
-		return
-	}
-	var payload struct {
-		GatewayKeyID string `json:"gateway_key_id"`
-		RouteAlias   string `json:"route_alias"`
-		Scenario     string `json:"scenario"`
-		SessionID    string `json:"session_id"`
-	}
-	if err := decodeJSONBody(w, r, &payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	resetCount := h.gateway.ResetStickyBindings(payload.GatewayKeyID, payload.RouteAlias, payload.Scenario, payload.SessionID)
-	writeJSON(w, http.StatusOK, map[string]any{"reset": resetCount})
-}
-
-// GetProviderUsage serves GET /api/admin/runtime/provider-usage.
-func (h *Handlers) GetProviderUsage(w http.ResponseWriter, r *http.Request) {
-	if h.gateway == nil {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
-		return
-	}
-	limit, err := readPositiveIntQuery(r, "limit", 200, 500)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	items := h.gateway.ProviderUsage(limit)
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
-}
-
-// GetCircuitStatus serves GET /api/admin/runtime/circuits.
-func (h *Handlers) GetCircuitStatus(w http.ResponseWriter, _ *http.Request) {
-	if h.gateway == nil {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": h.gateway.CircuitStatuses()})
-}
-
-// ResetCircuits serves POST /api/admin/runtime/circuits/reset.
-func (h *Handlers) ResetCircuits(w http.ResponseWriter, r *http.Request) {
-	if h.gateway == nil {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "gateway runtime service not configured"})
-		return
-	}
-	var payload struct {
-		ProviderID string `json:"provider_id"`
-		EndpointID string `json:"endpoint_id"`
-	}
-	if err := decodeJSONBody(w, r, &payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	resetCount := h.gateway.ResetCircuits(payload.ProviderID, payload.EndpointID)
-	writeJSON(w, http.StatusOK, map[string]any{"reset": resetCount})
-}
-
-// GetStatsSummary serves GET /api/admin/stats/summary.
-func (h *Handlers) GetStatsSummary(w http.ResponseWriter, r *http.Request) {
-	window, err := readStatsWindow(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	report, err := h.store.StatsSummary(window)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, report)
-}
-
-// GetStatsByGatewayKey serves GET /api/admin/stats/by-key.
-func (h *Handlers) GetStatsByGatewayKey(w http.ResponseWriter, r *http.Request) {
-	window, err := readStatsWindow(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	report, err := h.store.StatsByGatewayKey(window)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, report)
-}
-
-// GetStatsByProvider serves GET /api/admin/stats/by-provider.
-func (h *Handlers) GetStatsByProvider(w http.ResponseWriter, r *http.Request) {
-	window, err := readStatsWindow(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	report, err := h.store.StatsByProvider(window)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, report)
-}
-
-// GetStatsByModel serves GET /api/admin/stats/by-model.
-func (h *Handlers) GetStatsByModel(w http.ResponseWriter, r *http.Request) {
-	window, err := readStatsWindow(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	report, err := h.store.StatsByModel(window)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, report)
-}
-
 // ProbeAllProviders executes the active endpoint probe flow.
 func (h *Handlers) ProbeAllProviders(w http.ResponseWriter, r *http.Request) {
 	if h.gateway == nil {
@@ -1094,100 +674,19 @@ func (h *Handlers) ProbeAllProviders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// CheckinAllIntegrations executes manual check-ins for all enabled integrations
-// that advertise check-in support.
-func (h *Handlers) CheckinAllIntegrations(w http.ResponseWriter, r *http.Request) {
-	result := h.RunCheckinsReport(r.Context(), false)
-	failures, _ := result["failures"].([]map[string]any)
-	if len(failures) == 0 {
-		writeJSON(w, http.StatusOK, result)
-		return
-	}
-	if successCount, _ := result["success_count"].(int); successCount == 0 {
-		writeJSON(w, http.StatusBadGateway, result)
-		return
-	}
-	writeJSON(w, http.StatusMultiStatus, result)
-}
-
-// SyncPricingCatalog executes a managed pricing catalog refresh.
-func (h *Handlers) SyncPricingCatalog(w http.ResponseWriter, r *http.Request) {
-	result := h.RunPricingSync(r.Context())
-	if errValue, ok := result["error"].(string); ok && errValue != "" {
-		writeJSON(w, http.StatusBadGateway, result)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
 // RunCheckins executes background daily check-ins.
 func (h *Handlers) RunCheckins(ctx context.Context) {
-	_ = h.RunCheckinsReport(ctx, true)
-}
-
-// RunCheckinsReport executes automatic or manual check-ins and returns a
-// detailed result summary suitable for admin maintenance endpoints.
-func (h *Handlers) RunCheckinsReport(ctx context.Context, dueOnly bool) map[string]any {
 	now := time.Now().UTC()
 	snapshot := h.store.Snapshot()
-	results := make([]integration.DailyCheckinResult, 0, len(snapshot.Integrations))
-	for _, current := range snapshot.Integrations {
-		if !current.Enabled || !current.Snapshot.SupportsCheckin {
-			continue
-		}
-		if dueOnly && !integration.NeedsCheckin(current, now) {
-			continue
-		}
-		results = append(results, integration.DailyCheckinResult{
-			IntegrationID: current.ID,
-			Result:        h.integration.PrepareCheckin(ctx, current),
-		})
-	}
+	results := h.integration.PrepareDailyCheckins(ctx, snapshot, now)
 	if len(results) == 0 {
-		return map[string]any{
-			"checked_at":     now,
-			"results":        []any{},
-			"success_count":  0,
-			"failure_count":  0,
-			"skipped_due_to": map[string]any{"mode": map[bool]string{true: "automatic", false: "manual"}[dueOnly]},
-		}
+		return
 	}
 
-	failures := make([]map[string]any, 0)
-	for _, result := range results {
-		if result.Result.Err == nil {
-			continue
-		}
-		failures = append(failures, map[string]any{
-			"integration_id": result.IntegrationID,
-			"error":          result.Result.Err.Error(),
-		})
-	}
-
-	saved, err := h.store.Update(func(state *model.State) error {
-		for _, result := range results {
-			_ = h.integration.ApplyCheckinResult(state, result.IntegrationID, result.Result)
-		}
+	_, _ = h.store.Update(func(state *model.State) error {
+		_ = h.integration.ApplyDailyCheckins(state, results)
 		return nil
 	})
-	if err != nil {
-		return map[string]any{
-			"checked_at":    now,
-			"results":       results,
-			"success_count": 0,
-			"failure_count": len(results),
-			"error":         err.Error(),
-		}
-	}
-
-	return map[string]any{
-		"checked_at":    now,
-		"results":       results,
-		"success_count": len(results) - len(failures),
-		"failure_count": len(failures),
-		"failures":      failures,
-		"state":         saved,
-	}
 }
 
 // RunProbes executes active endpoint probes and returns the probe report.
@@ -1202,53 +701,53 @@ func (h *Handlers) RunProbes(ctx context.Context) map[string]any {
 	return h.gateway.RunProbes(ctx)
 }
 
-// RunPricingSync refreshes managed pricing profiles from the configured public catalog.
-func (h *Handlers) RunPricingSync(ctx context.Context) map[string]any {
-	if h.pricing == nil || !h.pricing.Enabled() {
-		return map[string]any{
-			"checked_at": time.Now().UTC(),
-			"profiles":   0,
-			"error":      "pricing catalog is not configured",
-		}
-	}
-
-	result := h.pricing.PrepareSync(ctx)
-	if result.Err != nil {
-		return map[string]any{
-			"checked_at": result.FinishedAt,
-			"source_url": result.SourceURL,
-			"profiles":   len(result.Profiles),
-			"error":      result.Err.Error(),
-		}
-	}
-
-	saved, err := h.store.Update(func(state *model.State) error {
-		pricing.ApplySyncResult(state, result)
-		return nil
-	})
-	if err != nil {
-		return map[string]any{
-			"checked_at": result.FinishedAt,
-			"source_url": result.SourceURL,
-			"profiles":   len(result.Profiles),
-			"error":      err.Error(),
-		}
-	}
-
-	return map[string]any{
-		"checked_at": result.FinishedAt,
-		"source_url": result.SourceURL,
-		"profiles":   len(result.Profiles),
-		"state":      saved,
-	}
-}
-
 func (h *Handlers) updateState(mutate func(*model.State) error) (model.State, error) {
 	saved, err := h.store.Update(mutate)
 	if err != nil {
 		return model.State{}, err
 	}
 	return saved, nil
+}
+
+func mergeStateWritePayload(current, next *model.State, now time.Time) {
+	next.Normalize()
+	current.Normalize()
+
+	if len(next.GatewayKeys) == 0 {
+		next.GatewayKeys = current.GatewayKeys
+	}
+	next.RequestHistory = current.RequestHistory
+	for nextProviderIndex := range next.Providers {
+		nextProvider := &next.Providers[nextProviderIndex]
+		currentProvider, ok := current.FindProvider(nextProvider.ID)
+		if !ok {
+			continue
+		}
+		*nextProvider = preserveProviderSecrets(currentProvider, *nextProvider)
+		nextProvider.CreatedAt = currentProvider.CreatedAt
+		nextProvider.UpdatedAt = now
+	}
+	for nextProviderIndex := range next.Providers {
+		nextProvider := &next.Providers[nextProviderIndex]
+		if !nextProvider.CreatedAt.IsZero() {
+			continue
+		}
+		nextProvider.CreatedAt = now
+		nextProvider.UpdatedAt = now
+	}
+	for nextIntegrationIndex := range next.Integrations {
+		nextIntegration := &next.Integrations[nextIntegrationIndex]
+		currentIntegration, ok := current.FindIntegration(nextIntegration.ID)
+		if !ok {
+			if nextIntegration.UpdatedAt.IsZero() {
+				nextIntegration.UpdatedAt = now
+			}
+			continue
+		}
+		*nextIntegration = preserveIntegrationSecrets(currentIntegration, *nextIntegration)
+		nextIntegration.Snapshot = currentIntegration.Snapshot
+		nextIntegration.UpdatedAt = now
+	}
 }
 
 func buildOpenAPISpec() map[string]any {
@@ -1260,111 +759,31 @@ func buildOpenAPISpec() map[string]any {
 			"description": "RESTful administrative surface for providers, routes, pricing, integrations, gateway keys, request history, and maintenance operations.",
 		},
 		"paths": map[string]any{
-			"/api/admin/meta": map[string]any{
-				"get": map[string]any{"summary": "Get admin metadata"},
-			},
-			"/api/admin/integrations/sync": map[string]any{
-				"post": map[string]any{"summary": "Sync all enabled integrations"},
-			},
 			"/api/admin/providers": map[string]any{
 				"get":  map[string]any{"summary": "List providers"},
 				"post": map[string]any{"summary": "Create provider"},
-			},
-			"/api/admin/providers/{id}": map[string]any{
-				"get":    map[string]any{"summary": "Get one provider"},
-				"put":    map[string]any{"summary": "Update one provider"},
-				"delete": map[string]any{"summary": "Delete one provider"},
 			},
 			"/api/admin/routes": map[string]any{
 				"get":  map[string]any{"summary": "List routes"},
 				"post": map[string]any{"summary": "Create route"},
 			},
-			"/api/admin/routes/{alias}": map[string]any{
-				"get":    map[string]any{"summary": "Get one route"},
-				"put":    map[string]any{"summary": "Update one route"},
-				"delete": map[string]any{"summary": "Delete one route"},
-			},
 			"/api/admin/pricing-profiles": map[string]any{
 				"get":  map[string]any{"summary": "List pricing profiles"},
 				"post": map[string]any{"summary": "Create pricing profile"},
-			},
-			"/api/admin/pricing-profiles/{id}": map[string]any{
-				"put":    map[string]any{"summary": "Update one pricing profile"},
-				"delete": map[string]any{"summary": "Delete one pricing profile"},
 			},
 			"/api/admin/integrations": map[string]any{
 				"get":  map[string]any{"summary": "List integrations"},
 				"post": map[string]any{"summary": "Create integration"},
 			},
-			"/api/admin/integrations/{id}": map[string]any{
-				"put":    map[string]any{"summary": "Update one integration"},
-				"delete": map[string]any{"summary": "Delete one integration"},
-			},
-			"/api/admin/integrations/{id}/sync": map[string]any{
-				"post": map[string]any{"summary": "Sync one integration"},
-			},
-			"/api/admin/integrations/{id}/checkin": map[string]any{
-				"post": map[string]any{"summary": "Run one integration daily checkin"},
-			},
 			"/api/admin/gateway-keys": map[string]any{
 				"get":  map[string]any{"summary": "List gateway keys"},
 				"post": map[string]any{"summary": "Create gateway key"},
 			},
-			"/api/admin/gateway-keys/{id}": map[string]any{
-				"put":    map[string]any{"summary": "Update gateway key"},
-				"delete": map[string]any{"summary": "Delete gateway key"},
-			},
-			"/api/admin/pricing-aliases": map[string]any{
-				"get": map[string]any{"summary": "List pricing alias rules"},
-				"put": map[string]any{"summary": "Replace pricing alias rules"},
-			},
 			"/api/admin/request-history": map[string]any{
-				"get": map[string]any{"summary": "List request history with filters"},
-			},
-			"/api/admin/request-history/{id}": map[string]any{
-				"get": map[string]any{"summary": "Get one request history record"},
-			},
-			"/api/admin/request-history/{id}/attempts": map[string]any{
-				"get": map[string]any{"summary": "Get recorded upstream attempts for one request"},
-			},
-			"/api/admin/runtime/sessions": map[string]any{
-				"get": map[string]any{"summary": "List live runtime sessions currently tracked by the gateway"},
-			},
-			"/api/admin/runtime/sticky-bindings": map[string]any{
-				"get": map[string]any{"summary": "List live sticky routing bindings"},
-			},
-			"/api/admin/runtime/sticky-bindings/reset": map[string]any{
-				"post": map[string]any{"summary": "Reset live sticky routing bindings"},
-			},
-			"/api/admin/runtime/provider-usage": map[string]any{
-				"get": map[string]any{"summary": "List live provider runtime windows currently tracked by the gateway"},
-			},
-			"/api/admin/runtime/circuits": map[string]any{
-				"get": map[string]any{"summary": "List passive circuit states for provider endpoints"},
-			},
-			"/api/admin/runtime/circuits/reset": map[string]any{
-				"post": map[string]any{"summary": "Reset passive circuit state for matching endpoints"},
-			},
-			"/api/admin/stats/summary": map[string]any{
-				"get": map[string]any{"summary": "Get aggregate request statistics"},
-			},
-			"/api/admin/stats/by-key": map[string]any{
-				"get": map[string]any{"summary": "Get request statistics grouped by gateway key"},
-			},
-			"/api/admin/stats/by-provider": map[string]any{
-				"get": map[string]any{"summary": "Get request statistics grouped by provider"},
-			},
-			"/api/admin/stats/by-model": map[string]any{
-				"get": map[string]any{"summary": "Get request statistics grouped by routed model"},
+				"get": map[string]any{"summary": "List request history"},
 			},
 			"/api/admin/maintenance/probes": map[string]any{
 				"post": map[string]any{"summary": "Probe all provider endpoints"},
-			},
-			"/api/admin/maintenance/checkins": map[string]any{
-				"post": map[string]any{"summary": "Run check-ins for all enabled integrations that support daily checkin"},
-			},
-			"/api/admin/maintenance/pricing-sync": map[string]any{
-				"post": map[string]any{"summary": "Refresh managed pricing profiles from the public catalog"},
 			},
 			"/api/admin/openapi.json": map[string]any{
 				"get": map[string]any{"summary": "OpenAPI document"},
@@ -1408,14 +827,6 @@ func sanitizeAdminPayload(payload any) any {
 	case model.GatewayKey:
 		return sanitizeGatewayKey(current)
 	case map[string]any:
-		if state, ok := current["state"].(model.State); ok {
-			next := cloneMap(current)
-			next["state"] = sanitizeState(state)
-			if gatewayKey, ok := next["gateway_key"].(model.GatewayKey); ok {
-				next["gateway_key"] = sanitizeGatewayKey(gatewayKey)
-			}
-			return next
-		}
 		if gatewayKey, ok := current["gateway_key"].(model.GatewayKey); ok {
 			next := cloneMap(current)
 			next["gateway_key"] = sanitizeGatewayKey(gatewayKey)
@@ -1443,6 +854,9 @@ func sanitizeState(state model.State) model.State {
 
 func sanitizeProvider(provider model.Provider) model.Provider {
 	providerCopy := provider
+	providerCopy.Headers = maps.Clone(provider.Headers)
+	providerCopy.Capabilities = slices.Clone(provider.Capabilities)
+	providerCopy.Endpoints = append([]model.ProviderEndpoint(nil), provider.Endpoints...)
 	providerCopy.Credentials = append([]model.ProviderCredential(nil), provider.Credentials...)
 	for index := range providerCopy.Credentials {
 		providerCopy.Credentials[index].APIKeyPreview = model.SecretPreview(providerCopy.Credentials[index].APIKey)
@@ -1466,235 +880,34 @@ func sanitizeGatewayKey(key model.GatewayKey) model.GatewayKey {
 	return key
 }
 
-func decodeOptionalStrings(raw json.RawMessage, field string) ([]string, error) {
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, nil
+func preserveProviderSecrets(current, next model.Provider) model.Provider {
+	byID := make(map[string]model.ProviderCredential, len(current.Credentials))
+	for _, credential := range current.Credentials {
+		byID[credential.ID] = credential
 	}
-	var values []string
-	if err := json.Unmarshal(raw, &values); err != nil {
-		return nil, fmt.Errorf("%s must be an array of strings or null", field)
+	for index := range next.Credentials {
+		credential := &next.Credentials[index]
+		currentCredential, ok := byID[credential.ID]
+		if ok && strings.TrimSpace(credential.APIKey) == "" {
+			credential.APIKey = currentCredential.APIKey
+		}
 	}
-	return values, nil
+	return next
 }
 
-func decodeOptionalProtocols(raw json.RawMessage, field string) ([]model.Protocol, error) {
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, nil
+func preserveIntegrationSecrets(current, next model.Integration) model.Integration {
+	if strings.TrimSpace(next.AccessKey) == "" {
+		next.AccessKey = current.AccessKey
 	}
-	var values []model.Protocol
-	if err := json.Unmarshal(raw, &values); err != nil {
-		return nil, fmt.Errorf("%s must be an array of protocol identifiers or null", field)
+	if strings.TrimSpace(next.RelayAPIKey) == "" {
+		next.RelayAPIKey = current.RelayAPIKey
 	}
-	return values, nil
-}
-
-func ensureGatewayKeySecretUnique(keys []model.GatewayKey, secret, currentID, pepper string) error {
-	if strings.TrimSpace(secret) == "" {
-		return nil
-	}
-	lookupHash := model.GatewaySecretLookupHash(secret, pepper)
-	for _, key := range keys {
-		if key.ID == currentID {
-			continue
-		}
-		if key.SecretLookupHash != "" {
-			if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(lookupHash)) == 1 {
-				return errValidation("gateway secret is already in use by another key")
-			}
-			continue
-		}
-		if key.SecretHash != "" && model.VerifyGatewaySecret(key.SecretHash, secret) {
-			return errValidation("gateway secret is already in use by another key")
-		}
-	}
-	return nil
-}
-
-func normalizeGatewayKey(key *model.GatewayKey) error {
-	if key == nil {
-		return errValidation("gateway key is required")
-	}
-	key.Name = strings.TrimSpace(key.Name)
-	key.SecretPreview = strings.TrimSpace(key.SecretPreview)
-	key.Notes = strings.TrimSpace(key.Notes)
-	key.AllowedModels = normalizeUniqueStrings(key.AllowedModels)
-	protocols, err := normalizeGatewayKeyProtocols(key.AllowedProtocols)
-	if err != nil {
-		return err
-	}
-	key.AllowedProtocols = protocols
-	if key.MaxConcurrency < 0 {
-		return errValidation("max_concurrency must be greater than or equal to 0")
-	}
-	if key.RateLimitRPM < 0 {
-		return errValidation("rate_limit_rpm must be greater than or equal to 0")
-	}
-	for field, value := range map[string]float64{
-		"hourly_budget_usd":  key.HourlyBudgetUSD,
-		"daily_budget_usd":   key.DailyBudgetUSD,
-		"weekly_budget_usd":  key.WeeklyBudgetUSD,
-		"monthly_budget_usd": key.MonthlyBudgetUSD,
-	} {
-		if value < 0 {
-			return errValidation(field + " must be greater than or equal to 0")
-		}
-	}
-	if key.ExpiresAt != nil {
-		expiresAt := key.ExpiresAt.UTC()
-		key.ExpiresAt = &expiresAt
-	}
-	return nil
-}
-
-func normalizeGatewayKeyProtocols(protocols []model.Protocol) ([]model.Protocol, error) {
-	if len(protocols) == 0 {
-		return nil, nil
-	}
-	normalized := make([]model.Protocol, 0, len(protocols))
-	seen := make(map[model.Protocol]struct{}, len(protocols))
-	for _, protocol := range protocols {
-		current, ok := canonicalGatewayProtocol(protocol)
-		if !ok {
-			return nil, errValidation("allowed_protocols contains an unsupported protocol")
-		}
-		if _, exists := seen[current]; exists {
-			continue
-		}
-		seen[current] = struct{}{}
-		normalized = append(normalized, current)
-	}
-	return normalized, nil
-}
-
-func canonicalGatewayProtocol(protocol model.Protocol) (model.Protocol, bool) {
-	switch strings.ToLower(strings.TrimSpace(string(protocol))) {
-	case string(model.ProtocolOpenAIChat):
-		return model.ProtocolOpenAIChat, true
-	case string(model.ProtocolOpenAIResponses):
-		return model.ProtocolOpenAIResponses, true
-	case string(model.ProtocolOpenAIRealtime):
-		return model.ProtocolOpenAIRealtime, true
-	case string(model.ProtocolAnthropic):
-		return model.ProtocolAnthropic, true
-	case string(model.ProtocolGeminiGenerate):
-		return model.ProtocolGeminiGenerate, true
-	case string(model.ProtocolGeminiStream):
-		return model.ProtocolGeminiStream, true
-	default:
-		return "", false
-	}
-}
-
-func normalizeUniqueStrings(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	normalized := make([]string, 0, len(values))
-	seen := make(map[string]struct{}, len(values))
-	for _, value := range values {
-		trimmed := strings.TrimSpace(value)
-		if trimmed == "" {
-			continue
-		}
-		key := strings.ToLower(trimmed)
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		normalized = append(normalized, trimmed)
-	}
-	return normalized
+	return next
 }
 
 func validateGatewaySecretStrength(secret string) error {
-	return model.ValidateGatewaySecretStrength(secret)
-}
-
-func validateRouteStrategy(route *model.ModelRoute) bool {
-	if route == nil {
-		return false
-	}
-	if route.Strategy != "" {
-		canonical := route.Strategy.Canonical()
-		if canonical == "" {
-			return false
-		}
-		route.Strategy = canonical
-	}
-	for index := range route.Scenarios {
-		scenario := &route.Scenarios[index]
-		scenario.Name = strings.TrimSpace(scenario.Name)
-		if scenario.Name == "" {
-			return false
-		}
-		if scenario.Strategy == "" {
-			continue
-		}
-		canonical := scenario.Strategy.Canonical()
-		if canonical == "" {
-			return false
-		}
-		scenario.Strategy = canonical
-	}
-	for index := range route.Transformers {
-		transformer := &route.Transformers[index]
-		transformer.Name = strings.TrimSpace(transformer.Name)
-		transformer.Target = strings.TrimSpace(transformer.Target)
-		transformer.Phase = transformer.Phase.Canonical()
-		transformer.Type = transformer.Type.Canonical()
-		if transformer.Phase == "" || transformer.Type == "" {
-			return false
-		}
-		switch transformer.Type {
-		case model.TransformerTypeSetHeader, model.TransformerTypeRemoveHeader, model.TransformerTypeSetJSON, model.TransformerTypeDeleteJSON:
-			if transformer.Target == "" {
-				return false
-			}
-		case model.TransformerTypePrependMessage:
-			if transformer.Phase != model.TransformerPhaseRequest {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func validateProviderProxyURL(raw string) error {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return nil
-	}
-	parsed, err := url.Parse(trimmed)
-	if err != nil {
-		return fmt.Errorf("proxy_url must be a valid URL: %w", err)
-	}
-	switch strings.ToLower(strings.TrimSpace(parsed.Scheme)) {
-	case "http", "https", "socks5", "socks5h":
-	default:
-		return errors.New("proxy_url must use http, https, socks5, or socks5h")
-	}
-	if strings.TrimSpace(parsed.Host) == "" {
-		return errors.New("proxy_url host is required")
-	}
-	return nil
-}
-
-func validateProviderPayload(provider model.Provider) error {
-	if len(provider.Endpoints) == 0 {
-		return errors.New("provider must declare at least one endpoint")
-	}
-	if len(provider.Credentials) == 0 {
-		return errors.New("provider must declare at least one credential")
-	}
-	for _, endpoint := range provider.Endpoints {
-		if strings.TrimSpace(endpoint.BaseURL) == "" {
-			return errors.New("provider endpoints must include base_url")
-		}
-	}
-	for _, credential := range provider.Credentials {
-		if strings.TrimSpace(credential.APIKey) == "" {
-			return errors.New("provider credentials must include api_key")
-		}
+	if len(strings.TrimSpace(secret)) < 16 {
+		return errors.New("custom gateway secrets must be at least 16 characters long")
 	}
 	return nil
 }
@@ -1715,6 +928,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 	defer reader.Close()
 
 	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
 		return err
 	}
@@ -1727,101 +941,16 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) error {
 	return nil
 }
 
-func readRequestHistoryQuery(r *http.Request) (store.RequestHistoryQuery, error) {
-	query := r.URL.Query()
-	limit, err := readPositiveIntQuery(r, "limit", 50, 200)
-	if err != nil {
-		return store.RequestHistoryQuery{}, err
-	}
-	statusCode, err := readOptionalIntValue(query.Get("status_code"), "status_code")
-	if err != nil {
-		return store.RequestHistoryQuery{}, err
-	}
-	stream, err := readOptionalBoolValue(query.Get("stream"), "stream")
-	if err != nil {
-		return store.RequestHistoryQuery{}, err
-	}
-	hasError, err := readOptionalBoolValue(query.Get("has_error"), "has_error")
-	if err != nil {
-		return store.RequestHistoryQuery{}, err
-	}
-	return store.RequestHistoryQuery{
-		Limit:        limit,
-		Cursor:       strings.TrimSpace(query.Get("cursor")),
-		Protocol:     model.Protocol(strings.TrimSpace(query.Get("protocol"))),
-		RouteAlias:   strings.TrimSpace(query.Get("route_alias")),
-		ProviderID:   strings.TrimSpace(query.Get("provider_id")),
-		GatewayKeyID: strings.TrimSpace(query.Get("gateway_key_id")),
-		SessionID:    strings.TrimSpace(query.Get("session_id")),
-		StatusCode:   statusCode,
-		Stream:       stream,
-		HasError:     hasError,
-		Search:       strings.TrimSpace(query.Get("search")),
-	}, nil
-}
-
-func readStatsWindow(r *http.Request) (store.StatsWindow, error) {
-	query := r.URL.Query()
-	return store.ResolveStatsWindow(query.Get("window"), query.Get("days"), time.Now().UTC())
-}
-
-func readPositiveIntQuery(r *http.Request, key string, defaultValue, maxValue int) (int, error) {
-	return readPositiveIntValue(r.URL.Query().Get(key), key, defaultValue, maxValue)
-}
-
-func readPositiveIntValue(raw, field string, defaultValue, maxValue int) (int, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return defaultValue, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be a positive integer", field)
-	}
-	if value <= 0 || value > maxValue {
-		return 0, fmt.Errorf("%s must be between 1 and %d", field, maxValue)
-	}
-	return value, nil
-}
-
-func readOptionalIntValue(raw, field string) (*int, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return nil, fmt.Errorf("%s must be an integer", field)
-	}
-	return &value, nil
-}
-
-func readOptionalBoolValue(raw, field string) (*bool, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil
-	}
-	value, err := strconv.ParseBool(raw)
-	if err != nil {
-		return nil, fmt.Errorf("%s must be a boolean", field)
-	}
-	return &value, nil
-}
-
 func bearerToken(value string) string {
-	scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
-		return ""
+	const prefix = "Bearer "
+	if len(value) >= len(prefix) && value[:len(prefix)] == prefix {
+		return value[len(prefix):]
 	}
-	return strings.TrimSpace(token)
+	return value
 }
 
 type resourceError struct {
 	name string
-}
-
-type validationError struct {
-	message string
 }
 
 func (e resourceError) Error() string {
@@ -1830,10 +959,6 @@ func (e resourceError) Error() string {
 
 func errNotFound(name string) error {
 	return resourceError{name: name}
-}
-
-func errValidation(message string) error {
-	return validationError{message: message}
 }
 
 func writeResourceError(w http.ResponseWriter, err error) {
@@ -1845,19 +970,6 @@ func writeResourceError(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 }
 
-func (e validationError) Error() string {
-	return e.message
-}
-
-func writeMutationError(w http.ResponseWriter, err error) {
-	var validation validationError
-	if errors.As(err, &validation) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": validation.Error()})
-		return
-	}
-	writeResourceError(w, err)
-}
-
 func slicesDeleteProvider(providers []model.Provider, id string) []model.Provider {
 	filtered := providers[:0]
 	for _, provider := range providers {
@@ -1866,153 +978,4 @@ func slicesDeleteProvider(providers []model.Provider, id string) []model.Provide
 		}
 	}
 	return filtered
-}
-
-func validateRouteAlias(routes []model.ModelRoute, alias, currentAlias string) error {
-	trimmedAlias := strings.TrimSpace(alias)
-	if trimmedAlias == "" {
-		return errValidation("route alias is required")
-	}
-	for _, route := range routes {
-		if !strings.EqualFold(route.Alias, trimmedAlias) {
-			continue
-		}
-		if currentAlias != "" && strings.EqualFold(route.Alias, currentAlias) {
-			continue
-		}
-		return errValidation("route alias already exists")
-	}
-	return nil
-}
-
-func validatePricingAliasRules(state *model.State, rules []model.PricingAliasRule) error {
-	if state == nil {
-		return errValidation("state is required")
-	}
-	seen := map[string]struct{}{}
-	for index := range rules {
-		rule := &rules[index]
-		rule.Name = strings.TrimSpace(rule.Name)
-		rule.Pattern = strings.TrimSpace(rule.Pattern)
-		rule.PricingProfileID = strings.TrimSpace(rule.PricingProfileID)
-		rule.MatchType = rule.MatchType.Canonical()
-		if rule.MatchType == "" {
-			return errValidation("pricing alias match_type must be exact, prefix, or wildcard")
-		}
-		if rule.Pattern == "" {
-			return errValidation("pricing alias pattern is required")
-		}
-		if rule.PricingProfileID == "" {
-			return errValidation("pricing alias pricing_profile_id is required")
-		}
-		if _, ok := state.FindPricingProfile(rule.PricingProfileID); !ok {
-			return errValidation("pricing alias pricing_profile_id must reference an existing pricing profile")
-		}
-		if rule.MatchType == model.PricingAliasMatchWildcard && strings.Count(rule.Pattern, "*") > 1 {
-			return errValidation("pricing alias wildcard pattern may contain at most one *")
-		}
-		key := strings.ToLower(string(rule.MatchType)) + "\x00" + strings.ToLower(rule.Pattern) + "\x00" + strings.ToLower(rule.PricingProfileID)
-		if _, exists := seen[key]; exists {
-			return errValidation("pricing alias rules must be unique")
-		}
-		seen[key] = struct{}{}
-	}
-	return nil
-}
-
-func removeGatewayKeyModelReferences(keys []model.GatewayKey, aliases map[string]struct{}) {
-	if len(aliases) == 0 {
-		return
-	}
-	updatedAt := time.Now().UTC()
-	for keyIndex := range keys {
-		if len(keys[keyIndex].AllowedModels) == 0 {
-			continue
-		}
-		original := keys[keyIndex].AllowedModels
-		filtered := make([]string, 0, len(original))
-		removedAny := false
-		for _, alias := range original {
-			if _, removed := aliases[strings.ToLower(strings.TrimSpace(alias))]; removed {
-				removedAny = true
-				continue
-			}
-			filtered = append(filtered, alias)
-		}
-		if removedAny {
-			keys[keyIndex].AllowedModels = slices.Clone(filtered)
-			keys[keyIndex].UpdatedAt = updatedAt
-		}
-	}
-}
-
-func removeProviderReferences(state *model.State, providerID string) {
-	if state == nil || strings.TrimSpace(providerID) == "" {
-		return
-	}
-	removedAliases := map[string]struct{}{}
-	filteredRoutes := state.ModelRoutes[:0]
-	for _, route := range state.ModelRoutes {
-		filteredTargets := route.Targets[:0]
-		for _, target := range route.Targets {
-			if target.AccountID != providerID {
-				filteredTargets = append(filteredTargets, target)
-			}
-		}
-		route.Targets = filteredTargets
-		filteredScenarios := route.Scenarios[:0]
-		for _, scenario := range route.Scenarios {
-			scenarioTargets := scenario.Targets[:0]
-			for _, target := range scenario.Targets {
-				if target.AccountID != providerID {
-					scenarioTargets = append(scenarioTargets, target)
-				}
-			}
-			scenario.Targets = scenarioTargets
-			filteredScenarios = append(filteredScenarios, scenario)
-		}
-		route.Scenarios = filteredScenarios
-		routeHasScenarioTargets := false
-		for _, scenario := range route.Scenarios {
-			if len(scenario.Targets) > 0 {
-				routeHasScenarioTargets = true
-				break
-			}
-		}
-		if len(route.Targets) == 0 && !routeHasScenarioTargets {
-			removedAliases[strings.ToLower(strings.TrimSpace(route.Alias))] = struct{}{}
-			continue
-		}
-		filteredRoutes = append(filteredRoutes, route)
-	}
-	state.ModelRoutes = filteredRoutes
-	removeGatewayKeyModelReferences(state.GatewayKeys, removedAliases)
-}
-
-func removeIntegrationPricingProfiles(state *model.State, integrationID string) {
-	if state == nil {
-		return
-	}
-	prefix := "pricing-sync-" + strings.TrimSpace(integrationID) + "-"
-	if strings.TrimSpace(prefix) == "pricing-sync--" {
-		return
-	}
-	filtered := state.PricingProfiles[:0]
-	removedProfiles := map[string]struct{}{}
-	for _, profile := range state.PricingProfiles {
-		if strings.HasPrefix(profile.ID, prefix) {
-			removedProfiles[profile.ID] = struct{}{}
-			continue
-		}
-		filtered = append(filtered, profile)
-	}
-	state.PricingProfiles = filtered
-	if len(removedProfiles) == 0 {
-		return
-	}
-	for routeIndex := range state.ModelRoutes {
-		if _, removed := removedProfiles[state.ModelRoutes[routeIndex].PricingProfileID]; removed {
-			state.ModelRoutes[routeIndex].PricingProfileID = ""
-		}
-	}
 }

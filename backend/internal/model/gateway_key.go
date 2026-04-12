@@ -6,15 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 )
-
-const maxGatewaySecretBytes = 72
-const minGatewaySecretChars = 16
 
 // NewGatewaySecret returns a high-entropy secret suitable for public gateway use.
 func NewGatewaySecret() (string, error) {
@@ -25,32 +21,9 @@ func NewGatewaySecret() (string, error) {
 	return "uag-" + base64.RawURLEncoding.EncodeToString(raw[:]), nil
 }
 
-// ValidateGatewaySecretStrength enforces the minimum secret requirements for
-// user-supplied and bootstrap gateway credentials.
-func ValidateGatewaySecretStrength(secret string) error {
-	trimmed := strings.TrimSpace(secret)
-	if trimmed == "" {
-		return errors.New("custom gateway secret is required")
-	}
-	if len(trimmed) < minGatewaySecretChars {
-		return fmt.Errorf("custom gateway secrets must be at least %d characters long", minGatewaySecretChars)
-	}
-	if len([]byte(trimmed)) > maxGatewaySecretBytes {
-		return fmt.Errorf("custom gateway secrets must be %d bytes or fewer", maxGatewaySecretBytes)
-	}
-	return nil
-}
-
 // HashGatewaySecret hashes a gateway secret for storage.
 func HashGatewaySecret(secret string) (string, error) {
-	trimmed := strings.TrimSpace(secret)
-	if trimmed == "" {
-		return "", errors.New("gateway secret is required")
-	}
-	if len([]byte(trimmed)) > maxGatewaySecretBytes {
-		return "", fmt.Errorf("gateway secret must be %d bytes or fewer", maxGatewaySecretBytes)
-	}
-	hashed, err := bcrypt.GenerateFromPassword([]byte(trimmed), bcrypt.DefaultCost)
+	hashed, err := bcrypt.GenerateFromPassword([]byte(strings.TrimSpace(secret)), bcrypt.DefaultCost)
 	if err != nil {
 		return "", err
 	}
@@ -81,13 +54,8 @@ func GatewaySecretLookupHash(secret, pepper string) string {
 // SecretPreview formats a short non-sensitive preview for the admin console.
 func SecretPreview(secret string) string {
 	trimmed := strings.TrimSpace(secret)
-	switch {
-	case len(trimmed) == 0:
-		return ""
-	case len(trimmed) <= 4:
-		return strings.Repeat("*", len(trimmed))
-	case len(trimmed) <= 8:
-		return fmt.Sprintf("%s...%s", trimmed[:1], trimmed[len(trimmed)-1:])
+	if len(trimmed) <= 8 {
+		return trimmed
 	}
 	return fmt.Sprintf("%s...%s", trimmed[:6], trimmed[len(trimmed)-4:])
 }

@@ -1170,7 +1170,7 @@ func TestGatewayRetriesTransformFailuresBeforeWritingResponse(t *testing.T) {
 			Kind:           model.ProviderKindOpenAICompatible,
 			Enabled:        true,
 			MaxAttempts:    1,
-			Capabilities:   []model.Protocol{model.ProtocolAnthropic},
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
 			TimeoutSeconds: 30,
 			Endpoints: []model.ProviderEndpoint{{
 				ID:      "endpoint-first",
@@ -1189,7 +1189,7 @@ func TestGatewayRetriesTransformFailuresBeforeWritingResponse(t *testing.T) {
 			Kind:           model.ProviderKindOpenAICompatible,
 			Enabled:        true,
 			MaxAttempts:    1,
-			Capabilities:   []model.Protocol{model.ProtocolAnthropic},
+			Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
 			TimeoutSeconds: 30,
 			Endpoints: []model.ProviderEndpoint{{
 				ID:      "endpoint-second",

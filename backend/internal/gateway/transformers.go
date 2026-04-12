@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -54,6 +55,39 @@ func applyRequestTransformers(exchange upstreamExchange, candidate resolvedCandi
 	exchange.RequestHeaderSet = headers
 	exchange.RequestHeaderRemove = removed
 	return exchange, nil
+}
+
+func transformStreamingResponseLine(line []byte, transformers []model.RouteTransformer, candidate resolvedCandidate) ([]byte, error) {
+	if len(line) == 0 || !hasBodyTransformers(transformers, model.TransformerPhaseResponse) {
+		return nil, nil
+	}
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return nil, nil
+	}
+	payload := strings.TrimSpace(string(bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))))
+	if payload == "" || payload == "[DONE]" {
+		return nil, nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+		return nil, nil
+	}
+	body, err := applyResponseBodyTransformers(body, transformers, candidate)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	suffix := []byte("\n")
+	if bytes.HasSuffix(line, []byte("\r\n")) {
+		suffix = []byte("\r\n")
+	} else if !bytes.HasSuffix(line, []byte("\n")) {
+		suffix = nil
+	}
+	return append(append([]byte("data: "), encoded...), suffix...), nil
 }
 
 func applyResponseTransformers(headers http.Header, payload map[string]any, transformers []model.RouteTransformer, candidate resolvedCandidate) (map[string]any, error) {

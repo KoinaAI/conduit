@@ -539,11 +539,11 @@ func TestBuildCandidatePlanRouteStrategyRoundRobinRotatesProviderGroups(t *testi
 	}}
 	state.Normalize()
 
-	first, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "")
+	first, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, false, "gk-1", "", "")
 	if err != nil {
 		t.Fatalf("build first candidate plan: %v", err)
 	}
-	second, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "")
+	second, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, false, "gk-1", "", "")
 	if err != nil {
 		t.Fatalf("build second candidate plan: %v", err)
 	}
@@ -606,7 +606,7 @@ func TestBuildCandidatePlanAppliesScenarioOverride(t *testing.T) {
 	}}
 	state.Normalize()
 
-	candidates, route, _, appliedScenario, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "background")
+	candidates, route, _, appliedScenario, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, false, "gk-1", "", "background")
 	if err != nil {
 		t.Fatalf("build scenario candidate plan: %v", err)
 	}
@@ -657,7 +657,7 @@ func TestBuildCandidatePlanRejectsUnknownScenario(t *testing.T) {
 	}}
 	state.Normalize()
 
-	_, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "typo-background")
+	_, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, false, "gk-1", "", "typo-background")
 	if err == nil || !strings.Contains(err.Error(), "does not define scenario") {
 		t.Fatalf("expected unknown scenario to fail fast, got %v", err)
 	}
@@ -779,7 +779,7 @@ func mustGatewayKey(t *testing.T, id, secret, pepper string) model.GatewayKey {
 func mustBuildCandidatePlan(t *testing.T, service *Service, state model.State) []resolvedCandidate {
 	t.Helper()
 
-	candidates, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, "gk-1", "", "")
+	candidates, _, _, _, err := service.buildCandidatePlan(state.RoutingSnapshot(), "gpt-5.4", model.ProtocolOpenAIChat, false, "gk-1", "", "")
 	if err != nil {
 		t.Fatalf("build candidate plan: %v", err)
 	}

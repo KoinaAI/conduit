@@ -45,16 +45,17 @@ type Service struct {
 }
 
 type resolvedCandidate struct {
-	provider     model.Provider
-	route        model.ModelRoute
-	target       model.RouteTarget
-	pricing      model.PricingProfile
-	endpoint     model.ProviderEndpoint
-	credential   model.ProviderCredential
-	multiplier   float64
-	gatewayKeyID string
-	sessionID    string
-	scenario     string
+	provider         model.Provider
+	route            model.ModelRoute
+	target           model.RouteTarget
+	pricing          model.PricingProfile
+	endpoint         model.ProviderEndpoint
+	credential       model.ProviderCredential
+	upstreamProtocol model.Protocol
+	multiplier       float64
+	gatewayKeyID     string
+	sessionID        string
+	scenario         string
 }
 
 type parsedProxyRequest struct {
@@ -72,6 +73,8 @@ type upstreamExchange struct {
 	Body                []byte
 	Stream              bool
 	ResponseMode        responseMode
+	PublicProtocol      model.Protocol
+	UpstreamProtocol    model.Protocol
 	UpstreamModel       string
 	PublicAlias         string
 	QuerySet            url.Values
@@ -86,14 +89,18 @@ var errRequestBodyTooLarge = errors.New("request body too large")
 type responseMode string
 
 const (
-	responseModePassthrough   responseMode = "passthrough"
-	responseModeAnthropicJSON responseMode = "anthropic-json"
-	responseModeAnthropicSSE  responseMode = "anthropic-sse"
-	responseModeGeminiJSON    responseMode = "gemini-json"
-	responseModeGeminiSSE     responseMode = "gemini-sse"
-	responseModeResponsesJSON responseMode = "responses-json"
-	responseModeResponsesSSE  responseMode = "responses-sse"
-	maxRealtimeFrameBytes     int64        = 8 << 20
+	responseModePassthrough         responseMode = "passthrough"
+	responseModeOpenAIChatJSON      responseMode = "openai-chat-json"
+	responseModeOpenAIChatSSE       responseMode = "openai-chat-sse"
+	responseModeOpenAIResponsesJSON responseMode = "responses-json"
+	responseModeOpenAIResponsesSSE  responseMode = "responses-sse"
+	responseModeResponsesJSON       responseMode = responseModeOpenAIResponsesJSON
+	responseModeResponsesSSE        responseMode = responseModeOpenAIResponsesSSE
+	responseModeAnthropicJSON       responseMode = "anthropic-json"
+	responseModeAnthropicSSE        responseMode = "anthropic-sse"
+	responseModeGeminiJSON          responseMode = "gemini-json"
+	responseModeGeminiSSE           responseMode = "gemini-sse"
+	maxRealtimeFrameBytes           int64        = 8 << 20
 )
 
 const (
@@ -323,7 +330,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 		}()
 
 		_, planSpan := gatewayTracer.Start(ctx, "gateway.route_plan")
-		candidates, route, _, appliedScenario, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, gatewayKey.ID, parsedRequest.sessionID, parsedRequest.scenario)
+		candidates, route, _, appliedScenario, err := s.buildCandidatePlan(state, parsedRequest.routeAlias, protocol, parsedRequest.stream, gatewayKey.ID, parsedRequest.sessionID, parsedRequest.scenario)
 		planSpan.SetAttributes(attribute.Int("gateway.candidate_count", len(candidates)))
 		if appliedScenario != "" {
 			planSpan.SetAttributes(attribute.String("gateway.scenario", appliedScenario))
@@ -372,7 +379,7 @@ func (s *Service) ProxyHTTP(protocol model.Protocol) http.HandlerFunc {
 					attribute.String("gateway.credential_id", candidate.credential.ID),
 				),
 			)
-			exchange, err := prepareUpstreamExchange(protocol, candidate.provider.Kind, r.URL.Path, parsedRequest, effectiveUpstreamModel(candidate))
+			exchange, err := prepareUpstreamExchange(protocol, candidate.upstreamProtocol, r.URL.Path, parsedRequest, effectiveUpstreamModel(candidate))
 			if err != nil {
 				attemptSpan.RecordError(err)
 				attemptSpan.SetStatus(codes.Error, err.Error())
@@ -788,7 +795,7 @@ func (s *Service) ProxyRealtime(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	_, planSpan := gatewayTracer.Start(ctx, "gateway.route_plan")
-	candidates, route, _, appliedScenario, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, gatewayKey.ID, sessionID, scenario)
+	candidates, route, _, appliedScenario, err := s.buildCandidatePlan(state, routeAlias, model.ProtocolOpenAIRealtime, false, gatewayKey.ID, sessionID, scenario)
 	planSpan.SetAttributes(attribute.Int("gateway.candidate_count", len(candidates)))
 	if appliedScenario != "" {
 		planSpan.SetAttributes(attribute.String("gateway.scenario", appliedScenario))
@@ -1319,7 +1326,7 @@ func (s *Service) RunProbes(ctx context.Context) map[string]any {
 	}
 }
 
-func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, protocol model.Protocol, gatewayKeyID, sessionID, scenario string) ([]resolvedCandidate, model.ModelRoute, model.PricingProfile, string, error) {
+func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, protocol model.Protocol, requestStream bool, gatewayKeyID, sessionID, scenario string) ([]resolvedCandidate, model.ModelRoute, model.PricingProfile, string, error) {
 	route, ok := state.FindRoute(alias)
 	if !ok {
 		return nil, model.ModelRoute{}, model.PricingProfile{}, "", fmt.Errorf("route %q is not configured", alias)
@@ -1335,7 +1342,11 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 			continue
 		}
 		provider, ok := state.FindProvider(target.AccountID)
-		if !ok || !provider.Enabled || !provider.Supports(protocol) {
+		if !ok || !provider.Enabled {
+			continue
+		}
+		upstreamProtocol, supported := resolveUpstreamProtocol(protocol, requestStream, provider)
+		if !supported {
 			continue
 		}
 		for _, endpoint := range provider.Endpoints {
@@ -1359,16 +1370,17 @@ func (s *Service) buildCandidatePlan(state model.RoutingState, alias string, pro
 					}
 				}
 				candidate := resolvedCandidate{
-					provider:     provider,
-					route:        route,
-					target:       target,
-					pricing:      profile,
-					endpoint:     endpoint,
-					credential:   credential,
-					multiplier:   multiplier,
-					gatewayKeyID: gatewayKeyID,
-					sessionID:    sessionID,
-					scenario:     scenario,
+					provider:         provider,
+					route:            route,
+					target:           target,
+					pricing:          profile,
+					endpoint:         endpoint,
+					credential:       credential,
+					upstreamProtocol: upstreamProtocol,
+					multiplier:       multiplier,
+					gatewayKeyID:     gatewayKeyID,
+					sessionID:        sessionID,
+					scenario:         scenario,
 				}
 				if s.runtime.endpointOpen(candidate, now) || s.runtime.credentialCoolingDown(candidate, now) {
 					continue

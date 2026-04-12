@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -70,6 +71,7 @@ func prepareUpstreamExchange(publicProtocol, upstreamProtocol model.Protocol, cu
 				UpstreamProtocol: upstreamProtocol,
 				UpstreamModel:    upstreamModel,
 				PublicAlias:      request.routeAlias,
+				QuerySet:         url.Values{"alt": []string{"sse"}},
 			}, nil
 		}
 	}
@@ -93,6 +95,7 @@ func prepareUpstreamExchange(publicProtocol, upstreamProtocol model.Protocol, cu
 		UpstreamProtocol: upstreamProtocol,
 		UpstreamModel:    upstreamModel,
 		PublicAlias:      request.routeAlias,
+		QuerySet:         bridgeQuerySet(upstreamProtocol),
 	}, nil
 }
 
@@ -128,6 +131,13 @@ func chooseResponseMode(stream bool, nonStream, streaming responseMode) response
 		return streaming
 	}
 	return nonStream
+}
+
+func bridgeQuerySet(protocol model.Protocol) url.Values {
+	if protocol == model.ProtocolGeminiStream {
+		return url.Values{"alt": []string{"sse"}}
+	}
+	return nil
 }
 
 func cloneJSONMap(value map[string]any) map[string]any {

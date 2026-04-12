@@ -1497,13 +1497,7 @@ func ensureGatewayKeySecretUnique(keys []model.GatewayKey, secret, currentID, pe
 		if key.ID == currentID {
 			continue
 		}
-		if key.SecretLookupHash != "" {
-			if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(lookupHash)) == 1 {
-				return errValidation("gateway secret is already in use by another key")
-			}
-			continue
-		}
-		if key.SecretHash != "" && model.VerifyGatewaySecret(key.SecretHash, secret) {
+		if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(lookupHash)) == 1 {
 			return errValidation("gateway secret is already in use by another key")
 		}
 	}

@@ -199,13 +199,16 @@ func flattenGeminiParts(value any) string {
 	return strings.Join(parts, "\n")
 }
 
-func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string) error {
+func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	if exchange.ResponseMode == responseModePassthrough {
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			clearWriteDeadline(w)
 			copyResponseHeaders(w.Header(), resp.Header)
+			if _, err := applyResponseTransformers(w.Header(), nil, transformers, candidate); err != nil {
+				return err
+			}
 			w.WriteHeader(resp.StatusCode)
-			if err := copyStreamingResponse(w, resp.Body, observer); err != nil {
+			if err := copyStreamingResponse(w, resp.Body, observer, transformers, candidate); err != nil {
 				return proxyResponseWriteError{err: err}
 			}
 			return nil
@@ -216,11 +219,30 @@ func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response,
 		}
 		observer.ObserveJSON(payload)
 		copyResponseHeaders(w.Header(), resp.Header)
+		var responsePayload map[string]any
+		if hasBodyTransformers(transformers, model.TransformerPhaseResponse) {
+			if err := json.Unmarshal(payload, &responsePayload); err != nil {
+				return err
+			}
+		}
+		responsePayload, err = applyResponseTransformers(w.Header(), responsePayload, transformers, candidate)
+		if err != nil {
+			return err
+		}
+		if responsePayload != nil {
+			payload, err = json.Marshal(responsePayload)
+			if err != nil {
+				return err
+			}
+		}
 		w.WriteHeader(resp.StatusCode)
 		if _, err = w.Write(payload); err != nil {
 			return proxyResponseWriteError{err: err}
 		}
 		return nil
+	}
+	if _, err := applyResponseTransformers(w.Header(), nil, transformers, candidate); err != nil {
+		return err
 	}
 	return writeBridgeCompletion(w, resp, observer, exchange, publicAlias)
 }

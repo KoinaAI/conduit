@@ -80,7 +80,7 @@ func TestAuthenticateGatewayRequestDoesNotPoisonValidKeyOnDisallowedAlias(t *tes
 	service.runtime.releaseGatewayKey(authenticated.ID, 0)
 }
 
-func TestAuthenticateGatewayRequestBackfillsLegacyLookupHash(t *testing.T) {
+func TestAuthenticateGatewayRequestRejectsGatewayKeysWithoutLookupHash(t *testing.T) {
 	t.Parallel()
 
 	fileStore, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -113,21 +113,17 @@ func TestAuthenticateGatewayRequestBackfillsLegacyLookupHash(t *testing.T) {
 	headers := http.Header{}
 	headers.Set("X-API-Key", "legacy-secret-123")
 
-	key, err := service.authenticateGatewayRequest(fileStore.RoutingSnapshot(), headers, model.ProtocolOpenAIChat, "gpt-5.4", "203.0.113.5")
-	if err != nil {
-		t.Fatalf("authenticate gateway request: %v", err)
-	}
-	if key.ID != "gk-legacy" {
-		t.Fatalf("expected legacy key to authenticate, got %+v", key)
+	if _, err := service.authenticateGatewayRequest(fileStore.RoutingSnapshot(), headers, model.ProtocolOpenAIChat, "gpt-5.4", "203.0.113.5"); !errors.Is(err, errUnauthorized) {
+		t.Fatalf("expected gateway key without lookup hash to be rejected, got %v", err)
 	}
 
 	saved := fileStore.Snapshot()
-	backfilled, ok := saved.FindGatewayKey("gk-legacy")
+	current, ok := saved.FindGatewayKey("gk-legacy")
 	if !ok {
 		t.Fatal("expected legacy key to remain in state")
 	}
-	if backfilled.SecretLookupHash == "" {
-		t.Fatalf("expected legacy key lookup hash to be backfilled, got %+v", backfilled)
+	if current.SecretLookupHash != "" {
+		t.Fatalf("did not expect lookup hash backfill, got %+v", current)
 	}
 }
 

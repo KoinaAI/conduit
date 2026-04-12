@@ -93,14 +93,12 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 	}
 	lookupHash := model.GatewaySecretLookupHash(secret, s.cfg.SecretLookupPepper())
 	fastCandidates := make([]model.GatewayKey, 0, 1)
-	legacyCandidates := make([]model.GatewayKey, 0, 1)
 
 	for _, key := range state.GatewayKeys {
 		if !key.Enabled || key.IsExpired(now) {
 			continue
 		}
 		if key.SecretLookupHash == "" {
-			legacyCandidates = append(legacyCandidates, key)
 			continue
 		}
 		if subtle.ConstantTimeCompare([]byte(key.SecretLookupHash), []byte(lookupHash)) == 1 {
@@ -108,7 +106,7 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 		}
 	}
 
-	candidateFingerprint := gatewayAuthCandidateFingerprint(fastCandidates, legacyCandidates)
+	candidateFingerprint := gatewayAuthCandidateFingerprint(fastCandidates)
 	if s.runtime.invalidGatewayLookupCached(lookupHash, candidateFingerprint, now) {
 		s.runtime.recordGatewayAuthFailure(source, lookupHash, candidateFingerprint, now)
 		slog.Warn("gateway authentication failed",
@@ -120,7 +118,7 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 		return model.GatewayKey{}, errUnauthorized
 	}
 
-	key, ok := findGatewayKeyMatch(secret, fastCandidates, legacyCandidates)
+	key, ok := findGatewayKeyMatch(secret, fastCandidates)
 	if !ok {
 		s.runtime.recordGatewayAuthFailure(source, lookupHash, candidateFingerprint, now)
 		slog.Warn("gateway authentication failed",
@@ -130,9 +128,6 @@ func (s *Service) authenticateGatewayRequest(state model.RoutingState, headers h
 			"route_alias", alias,
 		)
 		return model.GatewayKey{}, errUnauthorized
-	}
-	if key.SecretLookupHash == "" {
-		s.backfillGatewayLookupHash(key.ID, lookupHash)
 	}
 
 	s.runtime.clearGatewayAuthFailures(source, lookupHash)
@@ -209,26 +204,4 @@ func normalizeGatewayAuthSource(source string) string {
 		return strings.TrimSpace(host)
 	}
 	return trimmed
-}
-
-func (s *Service) backfillGatewayLookupHash(keyID, lookupHash string) {
-	if s == nil || s.store == nil || strings.TrimSpace(keyID) == "" || strings.TrimSpace(lookupHash) == "" {
-		return
-	}
-	if _, err := s.store.Update(func(state *model.State) error {
-		for index := range state.GatewayKeys {
-			if state.GatewayKeys[index].ID != keyID {
-				continue
-			}
-			if state.GatewayKeys[index].SecretLookupHash == lookupHash {
-				return nil
-			}
-			state.GatewayKeys[index].SecretLookupHash = lookupHash
-			state.GatewayKeys[index].UpdatedAt = time.Now().UTC()
-			return nil
-		}
-		return nil
-	}); err != nil {
-		slog.Warn("gateway lookup hash backfill failed", "gateway_key_id", keyID, "error", err)
-	}
 }

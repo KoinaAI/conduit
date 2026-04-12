@@ -32,8 +32,8 @@ const (
 	backendPostgres storageBackend = "postgres"
 )
 
-// FileStore keeps the public type name stable while switching the persistence
-// backend from a JSON file to SQLite.
+// FileStore persists configuration state and request history across the
+// configured SQL backend.
 type FileStore struct {
 	path                string
 	backend             storageBackend

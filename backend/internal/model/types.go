@@ -68,8 +68,12 @@ const (
 type ProviderRoutingMode string
 
 const (
-	ProviderRoutingModeWeighted ProviderRoutingMode = "weighted"
-	ProviderRoutingModeLatency  ProviderRoutingMode = "latency"
+	ProviderRoutingModeWeighted   ProviderRoutingMode = "weighted"
+	ProviderRoutingModeLatency    ProviderRoutingMode = "latency"
+	ProviderRoutingModeRoundRobin ProviderRoutingMode = "round-robin"
+	ProviderRoutingModeRandom     ProviderRoutingMode = "random"
+	ProviderRoutingModeFailover   ProviderRoutingMode = "failover"
+	ProviderRoutingModeOrdered    ProviderRoutingMode = "ordered"
 )
 
 // RouteStrategy controls how candidates are ordered for one public model route.
@@ -644,7 +648,7 @@ func (s *State) Normalize() {
 		if integration.Snapshot.Prices == nil {
 			integration.Snapshot.Prices = map[string]IntegrationPricing{}
 		}
-		if integration.DefaultProtocols == nil || len(integration.DefaultProtocols) == 0 {
+		if len(integration.DefaultProtocols) == 0 {
 			integration.DefaultProtocols = []Protocol{
 				ProtocolOpenAIChat,
 				ProtocolOpenAIResponses,

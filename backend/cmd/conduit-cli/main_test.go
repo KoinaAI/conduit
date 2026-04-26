@@ -46,7 +46,7 @@ func TestRunHealth(t *testing.T) {
 }
 
 func TestRunCreateKeyRequiresAdminToken(t *testing.T) {
-	t.Parallel()
+	t.Setenv("GATEWAY_ADMIN_TOKEN", "")
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -54,7 +54,20 @@ func TestRunCreateKeyRequiresAdminToken(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("expected usage error, got code %d", code)
 	}
-	if !strings.Contains(stderr.String(), "--admin-token and --name are required") {
+	if !strings.Contains(stderr.String(), "--admin-token") || !strings.Contains(stderr.String(), "--name are required") {
 		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+}
+
+func TestRunCreateKeyAcceptsAdminTokenFromEnv(t *testing.T) {
+	t.Setenv("GATEWAY_ADMIN_TOKEN", "env-token")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	// Missing --base-url so the request will fail, but only after the env-token
+	// is accepted. We just want to confirm the env-token unblocks the required-flag check.
+	code := run([]string{"create-key", "--base-url", "http://127.0.0.1:1", "--name", "laptop"}, &stdout, &stderr)
+	if code == 2 {
+		t.Fatalf("expected env token to satisfy admin-token requirement, got usage error: %s", stderr.String())
 	}
 }

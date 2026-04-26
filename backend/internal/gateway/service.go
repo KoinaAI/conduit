@@ -109,13 +109,6 @@ const (
 	runtimeSessionHeartbeat  = 30 * time.Second
 )
 
-const (
-	providerRoutingModeRoundRobin model.ProviderRoutingMode = "round-robin"
-	providerRoutingModeRandom     model.ProviderRoutingMode = "random"
-	providerRoutingModeFailover   model.ProviderRoutingMode = "failover"
-	providerRoutingModeOrdered    model.ProviderRoutingMode = "ordered"
-)
-
 type cancelReadCloser struct {
 	io.ReadCloser
 	cancel context.CancelFunc
@@ -127,26 +120,6 @@ func (c cancelReadCloser) Close() error {
 	err := c.ReadCloser.Close()
 	c.cancel()
 	return err
-}
-
-type openAIChoiceDelta struct {
-	Content string `json:"content"`
-}
-
-type openAIMessage struct {
-	Content any `json:"content"`
-}
-
-type openAIChoice struct {
-	Message      openAIMessage     `json:"message"`
-	Delta        openAIChoiceDelta `json:"delta"`
-	FinishReason string            `json:"finish_reason"`
-}
-
-type openAIChatResponse struct {
-	ID      string         `json:"id"`
-	Model   string         `json:"model"`
-	Choices []openAIChoice `json:"choices"`
 }
 
 func NewService(cfg config.Config, store *store.FileStore) *Service {
@@ -1633,7 +1606,7 @@ func (s *Service) orderCandidateBand(mode model.ProviderRoutingMode, alias strin
 			}
 			return candidateIdentity(band[i]) < candidateIdentity(band[j])
 		})
-	case providerRoutingModeRoundRobin:
+	case model.ProviderRoutingModeRoundRobin:
 		sort.SliceStable(band, func(i, j int) bool {
 			leftWeight := totalCandidateWeight(band[i])
 			rightWeight := totalCandidateWeight(band[j])
@@ -1644,7 +1617,7 @@ func (s *Service) orderCandidateBand(mode model.ProviderRoutingMode, alias strin
 		})
 		offset := s.runtime.nextRoundRobinOffset(roundRobinKey(alias, protocol, groupKey), len(band))
 		band = rotateCandidates(band, offset)
-	case providerRoutingModeRandom:
+	case model.ProviderRoutingModeRandom:
 		sort.SliceStable(band, func(i, j int) bool {
 			return candidateIdentity(band[i]) < candidateIdentity(band[j])
 		})
@@ -1653,7 +1626,7 @@ func (s *Service) orderCandidateBand(mode model.ProviderRoutingMode, alias strin
 		rng.Shuffle(len(band), func(i, j int) {
 			band[i], band[j] = band[j], band[i]
 		})
-	case providerRoutingModeFailover, providerRoutingModeOrdered:
+	case model.ProviderRoutingModeFailover, model.ProviderRoutingModeOrdered:
 		sort.SliceStable(band, func(i, j int) bool {
 			leftWeight := totalCandidateWeight(band[i])
 			rightWeight := totalCandidateWeight(band[j])
@@ -1682,7 +1655,7 @@ func (s *Service) orderCandidateBand(mode model.ProviderRoutingMode, alias strin
 
 func normalizeProviderRoutingMode(mode model.ProviderRoutingMode) model.ProviderRoutingMode {
 	switch normalized := model.ProviderRoutingMode(strings.ToLower(strings.TrimSpace(string(mode)))); normalized {
-	case model.ProviderRoutingModeLatency, providerRoutingModeRoundRobin, providerRoutingModeRandom, providerRoutingModeFailover, providerRoutingModeOrdered:
+	case model.ProviderRoutingModeLatency, model.ProviderRoutingModeRoundRobin, model.ProviderRoutingModeRandom, model.ProviderRoutingModeFailover, model.ProviderRoutingModeOrdered:
 		return normalized
 	default:
 		return model.ProviderRoutingModeWeighted
@@ -2180,7 +2153,7 @@ func copyStreamingResponse(w http.ResponseWriter, body io.Reader, observer *Usag
 			if _, writeErr := w.Write(output); writeErr != nil {
 				return writeErr
 			}
-			if flusher != nil && len(bytes.TrimSpace(output)) == 0 {
+			if flusher != nil {
 				flusher.Flush()
 			}
 		}
@@ -2242,7 +2215,10 @@ func isNormalClose(err error) bool {
 	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
 }
 
-func routeAliasTimestamp(alias string) int64 {
+// routeAliasTimestamp returns a stable epoch reported as the "created" field on
+// OpenAI-compatible /v1/models entries. Conduit defines all gateway-managed
+// models under one logical generation, so the timestamp is intentionally fixed.
+func routeAliasTimestamp(_ string) int64 {
 	const modelListEpochUnix = 1_775_001_600
 	return modelListEpochUnix
 }

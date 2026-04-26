@@ -17,6 +17,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/integration"
 	"github.com/KoinaAI/conduit/backend/internal/model"
+	"github.com/KoinaAI/conduit/backend/internal/pricing"
 	"github.com/KoinaAI/conduit/backend/internal/store"
 )
 
@@ -423,10 +424,11 @@ func TestRunPricingSyncPersistsManagedCatalogProfiles(t *testing.T) {
 	defer server.Close()
 
 	fileStore := openTestStore(t, model.DefaultState())
-	handlers := New(config.Config{
+	pricingSvc := pricing.NewService(server.URL, nil, pricing.WithAllowPrivateSourceForTests())
+	handlers := NewWithPricingService(config.Config{
 		PricingSyncEnabled: true,
 		PricingCatalogURL:  server.URL,
-	}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()))
+	}, fileStore, integration.NewService(integration.WithAllowPrivateBaseURLForTests()), pricingSvc)
 
 	result := handlers.RunPricingSync(context.Background())
 	if errValue := result["error"]; errValue != nil {

@@ -476,7 +476,7 @@ func TestBuildCandidatePlanRoundRobinRotatesCandidates(t *testing.T) {
 	t.Parallel()
 
 	service := &Service{runtime: newRuntimeState()}
-	state := newRoutingModeState(providerRoutingModeRoundRobin)
+	state := newRoutingModeState(model.ProviderRoutingModeRoundRobin)
 
 	first := mustBuildCandidatePlan(t, service, state)
 	second := mustBuildCandidatePlan(t, service, state)
@@ -675,7 +675,7 @@ func TestBuildCandidatePlanRandomRoutingKeepsUniqueCandidates(t *testing.T) {
 	t.Parallel()
 
 	service := &Service{runtime: newRuntimeState()}
-	state := newRoutingModeState(providerRoutingModeRandom)
+	state := newRoutingModeState(model.ProviderRoutingModeRandom)
 
 	candidates := mustBuildCandidatePlan(t, service, state)
 	got := []string{candidates[0].credential.ID, candidates[1].credential.ID}
@@ -861,7 +861,7 @@ func newFailoverRoutingState() model.State {
 		Name:           "Provider 1",
 		Kind:           model.ProviderKindOpenAICompatible,
 		Enabled:        true,
-		RoutingMode:    providerRoutingModeFailover,
+		RoutingMode:    model.ProviderRoutingModeFailover,
 		MaxAttempts:    2,
 		Capabilities:   []model.Protocol{model.ProtocolOpenAIChat},
 		TimeoutSeconds: 30,

@@ -26,7 +26,9 @@ type Config struct {
 	EnableRealtime             bool
 	RequestHistory             int
 	BootstrapGatewayKey        string
+	GatewaySecretBcryptCost    int
 	ProbeIntervalSeconds       int
+	CheckinIntervalSeconds     int
 	BackupDirectory            string
 	BackupIntervalSeconds      int
 	BackupRetention            int
@@ -57,7 +59,9 @@ func Load() Config {
 		EnableRealtime:             getenvBool("GATEWAY_ENABLE_REALTIME", true),
 		RequestHistory:             getenvInt("GATEWAY_REQUEST_HISTORY", 10000),
 		BootstrapGatewayKey:        getenv("GATEWAY_BOOTSTRAP_GATEWAY_KEY", ""),
+		GatewaySecretBcryptCost:    getenvInt("GATEWAY_SECRET_BCRYPT_COST", 12),
 		ProbeIntervalSeconds:       getenvInt("GATEWAY_PROBE_INTERVAL_SECONDS", 180),
+		CheckinIntervalSeconds:     getenvInt("GATEWAY_CHECKIN_INTERVAL_SECONDS", 3600),
 		BackupDirectory:            strings.TrimSpace(os.Getenv("GATEWAY_BACKUP_DIR")),
 		BackupIntervalSeconds:      getenvInt("GATEWAY_BACKUP_INTERVAL_SECONDS", 21600),
 		BackupRetention:            getenvInt("GATEWAY_BACKUP_RETENTION", 10),
@@ -79,6 +83,9 @@ func (c Config) Validate() error {
 	}
 	if c.ProbeIntervalSeconds < 0 {
 		return errors.New("GATEWAY_PROBE_INTERVAL_SECONDS must be greater than or equal to 0")
+	}
+	if c.CheckinIntervalSeconds < 0 {
+		return errors.New("GATEWAY_CHECKIN_INTERVAL_SECONDS must be greater than or equal to 0")
 	}
 	if c.LogFile != "" {
 		if c.LogMaxSizeMB <= 0 {
@@ -112,6 +119,9 @@ func (c Config) Validate() error {
 	}
 	if c.RedisDB < 0 {
 		return errors.New("GATEWAY_REDIS_DB must be greater than or equal to 0")
+	}
+	if c.GatewaySecretBcryptCost != 0 && (c.GatewaySecretBcryptCost < 4 || c.GatewaySecretBcryptCost > 31) {
+		return errors.New("GATEWAY_SECRET_BCRYPT_COST must be between 4 and 31")
 	}
 	if strings.TrimSpace(c.BootstrapGatewayKey) != "" {
 		if err := model.ValidateGatewaySecretStrength(c.BootstrapGatewayKey); err != nil {
@@ -170,18 +180,21 @@ func getenv(key, fallback string) string {
 }
 
 func getenvBool(key string, fallback bool) bool {
-	value := os.Getenv(key)
+	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
 		return fallback
 	}
-	switch value {
-	case "1", "true", "TRUE", "True", "yes", "YES", "on", "ON":
+	switch strings.ToLower(value) {
+	case "yes", "on":
 		return true
-	case "0", "false", "FALSE", "False", "no", "NO", "off", "OFF":
+	case "no", "off":
 		return false
-	default:
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
 		return fallback
 	}
+	return parsed
 }
 
 func getenvInt(key string, fallback int) int {

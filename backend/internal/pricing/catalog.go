@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -20,8 +22,21 @@ const maxCatalogResponseBodyBytes int64 = 4 << 20
 var errCatalogResponseTooLarge = errors.New("pricing catalog response too large")
 
 type Service struct {
-	sourceURL string
-	client    *http.Client
+	sourceURL          string
+	client             *http.Client
+	allowPrivateSource bool
+}
+
+// Option customises Service construction.
+type Option func(*Service)
+
+// WithAllowPrivateSourceForTests permits the pricing catalog URL to resolve to
+// loopback or private IP ranges. It exists solely so unit tests can run against
+// httptest servers; production code paths must never use it.
+func WithAllowPrivateSourceForTests() Option {
+	return func(s *Service) {
+		s.allowPrivateSource = true
+	}
 }
 
 type SyncResult struct {
@@ -39,14 +54,64 @@ type catalogModel struct {
 	Cost map[string]float64 `json:"cost"`
 }
 
-func NewService(sourceURL string, client *http.Client) *Service {
+func NewService(sourceURL string, client *http.Client, opts ...Option) *Service {
 	if client == nil {
 		client = &http.Client{Timeout: 20 * time.Second}
 	}
-	return &Service{
+	s := &Service{
 		sourceURL: strings.TrimSpace(sourceURL),
 		client:    client,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
+}
+
+// validateSourceURL enforces a small SSRF-style allowlist on the configured
+// pricing catalog URL: only http/https schemes, and (unless explicitly enabled
+// for tests) no loopback / private / link-local hosts.
+func (s *Service) validateSourceURL() error {
+	parsed, err := url.Parse(s.sourceURL)
+	if err != nil {
+		return fmt.Errorf("invalid pricing catalog url: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("pricing catalog url scheme %q is not allowed", parsed.Scheme)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return errors.New("pricing catalog url is missing a host")
+	}
+	if s.allowPrivateSource {
+		return nil
+	}
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return errors.New("pricing catalog url must not target localhost")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if blockedCatalogIP(ip) {
+			return errors.New("pricing catalog url must not target private or local addresses")
+		}
+		return nil
+	}
+	ips, lookupErr := net.LookupIP(host)
+	if lookupErr != nil {
+		return fmt.Errorf("pricing catalog url host lookup failed: %w", lookupErr)
+	}
+	for _, ip := range ips {
+		if blockedCatalogIP(ip) {
+			return errors.New("pricing catalog url must not target private or local addresses")
+		}
+	}
+	return nil
+}
+
+func blockedCatalogIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
 }
 
 func (s *Service) Enabled() bool {
@@ -71,6 +136,9 @@ func (s *Service) PrepareSync(ctx context.Context) SyncResult {
 func (s *Service) FetchProfiles(ctx context.Context) ([]model.PricingProfile, error) {
 	if !s.Enabled() {
 		return nil, fmt.Errorf("pricing catalog source is not configured")
+	}
+	if err := s.validateSourceURL(); err != nil {
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.sourceURL, nil)
 	if err != nil {

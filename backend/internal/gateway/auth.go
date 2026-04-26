@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/KoinaAI/conduit/backend/internal/httpx"
 	"github.com/KoinaAI/conduit/backend/internal/model"
 )
 
@@ -34,10 +35,6 @@ var (
 
 type gatewayAuthContextKey struct{}
 
-func withGatewayKeyContext(ctx context.Context, key model.GatewayKey) context.Context {
-	return context.WithValue(ctx, gatewayAuthContextKey{}, key)
-}
-
 // GatewayKeyFromContext returns the authenticated gateway key when present.
 func GatewayKeyFromContext(ctx context.Context) (model.GatewayKey, bool) {
 	key, ok := ctx.Value(gatewayAuthContextKey{}).(model.GatewayKey)
@@ -49,17 +46,9 @@ func extractGatewaySecret(headers http.Header) string {
 		return value
 	}
 	if value := strings.TrimSpace(headers.Get("Authorization")); value != "" {
-		return bearerToken(value)
+		return httpx.BearerToken(value)
 	}
 	return ""
-}
-
-func bearerToken(value string) string {
-	scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
-		return ""
-	}
-	return strings.TrimSpace(token)
 }
 
 func gatewayRequestSource(r *http.Request) string {

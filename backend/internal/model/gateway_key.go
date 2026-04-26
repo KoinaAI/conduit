@@ -16,6 +16,23 @@ import (
 const maxGatewaySecretBytes = 72
 const minGatewaySecretChars = 16
 
+// gatewaySecretBcryptCost is the bcrypt work factor used to hash new gateway
+// secrets. Production deployments should override this from config (the gateway
+// binary defaults to 12). The package-level fallback stays at bcrypt.DefaultCost
+// to keep test fixtures fast.
+var gatewaySecretBcryptCost = bcrypt.DefaultCost
+
+// SetGatewaySecretBcryptCost overrides the bcrypt work factor used when hashing
+// new gateway secrets. Values outside the bcrypt-supported range fall back to
+// the default.
+func SetGatewaySecretBcryptCost(cost int) {
+	if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
+		gatewaySecretBcryptCost = bcrypt.DefaultCost
+		return
+	}
+	gatewaySecretBcryptCost = cost
+}
+
 // NewGatewaySecret returns a high-entropy secret suitable for public gateway use.
 func NewGatewaySecret() (string, error) {
 	var raw [24]byte
@@ -50,7 +67,7 @@ func HashGatewaySecret(secret string) (string, error) {
 	if len([]byte(trimmed)) > maxGatewaySecretBytes {
 		return "", fmt.Errorf("gateway secret must be %d bytes or fewer", maxGatewaySecretBytes)
 	}
-	hashed, err := bcrypt.GenerateFromPassword([]byte(trimmed), bcrypt.DefaultCost)
+	hashed, err := bcrypt.GenerateFromPassword([]byte(trimmed), gatewaySecretBcryptCost)
 	if err != nil {
 		return "", err
 	}

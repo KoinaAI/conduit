@@ -8,24 +8,39 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/admin"
 )
 
+// defaultCheckinInterval is the cadence at which integration check-ins fire
+// when no explicit override is configured.
+const defaultCheckinInterval = time.Hour
+
 type Service struct {
 	admin           *admin.Handlers
 	stop            chan struct{}
 	probeInterval   time.Duration
 	pricingInterval time.Duration
+	checkinInterval time.Duration
 }
 
 func New(admin *admin.Handlers, probeInterval, pricingInterval time.Duration) *Service {
+	return NewWithCheckinInterval(admin, probeInterval, pricingInterval, defaultCheckinInterval)
+}
+
+// NewWithCheckinInterval returns a Service with a custom check-in cadence.
+// A non-positive checkinInterval falls back to the default.
+func NewWithCheckinInterval(admin *admin.Handlers, probeInterval, pricingInterval, checkinInterval time.Duration) *Service {
+	if checkinInterval <= 0 {
+		checkinInterval = defaultCheckinInterval
+	}
 	return &Service{
 		admin:           admin,
 		stop:            make(chan struct{}),
 		probeInterval:   probeInterval,
 		pricingInterval: pricingInterval,
+		checkinInterval: checkinInterval,
 	}
 }
 
 func (s *Service) Start(ctx context.Context) {
-	checkinTicker := time.NewTicker(1 * time.Hour)
+	checkinTicker := time.NewTicker(s.checkinInterval)
 	defer checkinTicker.Stop()
 
 	var probeTicker *time.Ticker

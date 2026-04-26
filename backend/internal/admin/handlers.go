@@ -18,6 +18,7 @@ import (
 
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/gateway"
+	"github.com/KoinaAI/conduit/backend/internal/httpx"
 	"github.com/KoinaAI/conduit/backend/internal/integration"
 	"github.com/KoinaAI/conduit/backend/internal/model"
 	"github.com/KoinaAI/conduit/backend/internal/pricing"
@@ -37,13 +38,19 @@ const maxAdminBodyBytes = 1 << 20
 
 // New creates the admin handler set.
 func New(cfg config.Config, store *store.FileStore, integration *integration.Service, gatewayService ...*gateway.Service) *Handlers {
-	var currentGateway *gateway.Service
-	if len(gatewayService) > 0 {
-		currentGateway = gatewayService[0]
-	}
 	var pricingService *pricing.Service
 	if cfg.PricingSyncEnabled {
 		pricingService = pricing.NewService(cfg.PricingCatalogURL, nil)
+	}
+	return NewWithPricingService(cfg, store, integration, pricingService, gatewayService...)
+}
+
+// NewWithPricingService is identical to New but allows callers (notably tests)
+// to supply a pre-built *pricing.Service. Production code should use New.
+func NewWithPricingService(cfg config.Config, store *store.FileStore, integration *integration.Service, pricingService *pricing.Service, gatewayService ...*gateway.Service) *Handlers {
+	var currentGateway *gateway.Service
+	if len(gatewayService) > 0 {
+		currentGateway = gatewayService[0]
 	}
 	return &Handlers{
 		cfg:         cfg,
@@ -68,7 +75,7 @@ func (h *Handlers) Middleware(next http.Handler) http.Handler {
 		}
 		token := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
 		if token == "" {
-			token = bearerToken(r.Header.Get("Authorization"))
+			token = httpx.BearerToken(r.Header.Get("Authorization"))
 		}
 		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
@@ -89,7 +96,7 @@ func (h *Handlers) GetMeta(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// OpenAPI serves a hand-maintained OpenAPI document for the RESTful admin API.
+// OpenAPI serves an OpenAPI document generated from the admin route registry.
 func (h *Handlers) OpenAPI(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, buildOpenAPISpec())
 }
@@ -1251,128 +1258,6 @@ func (h *Handlers) updateState(mutate func(*model.State) error) (model.State, er
 	return saved, nil
 }
 
-func buildOpenAPISpec() map[string]any {
-	return map[string]any{
-		"openapi": "3.1.0",
-		"info": map[string]any{
-			"title":       "Universal AI Gateway Admin API",
-			"version":     "2026-04-01",
-			"description": "RESTful administrative surface for providers, routes, pricing, integrations, gateway keys, request history, and maintenance operations.",
-		},
-		"paths": map[string]any{
-			"/api/admin/meta": map[string]any{
-				"get": map[string]any{"summary": "Get admin metadata"},
-			},
-			"/api/admin/integrations/sync": map[string]any{
-				"post": map[string]any{"summary": "Sync all enabled integrations"},
-			},
-			"/api/admin/providers": map[string]any{
-				"get":  map[string]any{"summary": "List providers"},
-				"post": map[string]any{"summary": "Create provider"},
-			},
-			"/api/admin/providers/{id}": map[string]any{
-				"get":    map[string]any{"summary": "Get one provider"},
-				"put":    map[string]any{"summary": "Update one provider"},
-				"delete": map[string]any{"summary": "Delete one provider"},
-			},
-			"/api/admin/routes": map[string]any{
-				"get":  map[string]any{"summary": "List routes"},
-				"post": map[string]any{"summary": "Create route"},
-			},
-			"/api/admin/routes/{alias}": map[string]any{
-				"get":    map[string]any{"summary": "Get one route"},
-				"put":    map[string]any{"summary": "Update one route"},
-				"delete": map[string]any{"summary": "Delete one route"},
-			},
-			"/api/admin/pricing-profiles": map[string]any{
-				"get":  map[string]any{"summary": "List pricing profiles"},
-				"post": map[string]any{"summary": "Create pricing profile"},
-			},
-			"/api/admin/pricing-profiles/{id}": map[string]any{
-				"put":    map[string]any{"summary": "Update one pricing profile"},
-				"delete": map[string]any{"summary": "Delete one pricing profile"},
-			},
-			"/api/admin/integrations": map[string]any{
-				"get":  map[string]any{"summary": "List integrations"},
-				"post": map[string]any{"summary": "Create integration"},
-			},
-			"/api/admin/integrations/{id}": map[string]any{
-				"put":    map[string]any{"summary": "Update one integration"},
-				"delete": map[string]any{"summary": "Delete one integration"},
-			},
-			"/api/admin/integrations/{id}/sync": map[string]any{
-				"post": map[string]any{"summary": "Sync one integration"},
-			},
-			"/api/admin/integrations/{id}/checkin": map[string]any{
-				"post": map[string]any{"summary": "Run one integration daily checkin"},
-			},
-			"/api/admin/gateway-keys": map[string]any{
-				"get":  map[string]any{"summary": "List gateway keys"},
-				"post": map[string]any{"summary": "Create gateway key"},
-			},
-			"/api/admin/gateway-keys/{id}": map[string]any{
-				"put":    map[string]any{"summary": "Update gateway key"},
-				"delete": map[string]any{"summary": "Delete gateway key"},
-			},
-			"/api/admin/pricing-aliases": map[string]any{
-				"get": map[string]any{"summary": "List pricing alias rules"},
-				"put": map[string]any{"summary": "Replace pricing alias rules"},
-			},
-			"/api/admin/request-history": map[string]any{
-				"get": map[string]any{"summary": "List request history with filters"},
-			},
-			"/api/admin/request-history/{id}": map[string]any{
-				"get": map[string]any{"summary": "Get one request history record"},
-			},
-			"/api/admin/request-history/{id}/attempts": map[string]any{
-				"get": map[string]any{"summary": "Get recorded upstream attempts for one request"},
-			},
-			"/api/admin/runtime/sessions": map[string]any{
-				"get": map[string]any{"summary": "List live runtime sessions currently tracked by the gateway"},
-			},
-			"/api/admin/runtime/sticky-bindings": map[string]any{
-				"get": map[string]any{"summary": "List live sticky routing bindings"},
-			},
-			"/api/admin/runtime/sticky-bindings/reset": map[string]any{
-				"post": map[string]any{"summary": "Reset live sticky routing bindings"},
-			},
-			"/api/admin/runtime/provider-usage": map[string]any{
-				"get": map[string]any{"summary": "List live provider runtime windows currently tracked by the gateway"},
-			},
-			"/api/admin/runtime/circuits": map[string]any{
-				"get": map[string]any{"summary": "List passive circuit states for provider endpoints"},
-			},
-			"/api/admin/runtime/circuits/reset": map[string]any{
-				"post": map[string]any{"summary": "Reset passive circuit state for matching endpoints"},
-			},
-			"/api/admin/stats/summary": map[string]any{
-				"get": map[string]any{"summary": "Get aggregate request statistics"},
-			},
-			"/api/admin/stats/by-key": map[string]any{
-				"get": map[string]any{"summary": "Get request statistics grouped by gateway key"},
-			},
-			"/api/admin/stats/by-provider": map[string]any{
-				"get": map[string]any{"summary": "Get request statistics grouped by provider"},
-			},
-			"/api/admin/stats/by-model": map[string]any{
-				"get": map[string]any{"summary": "Get request statistics grouped by routed model"},
-			},
-			"/api/admin/maintenance/probes": map[string]any{
-				"post": map[string]any{"summary": "Probe all provider endpoints"},
-			},
-			"/api/admin/maintenance/checkins": map[string]any{
-				"post": map[string]any{"summary": "Run check-ins for all enabled integrations that support daily checkin"},
-			},
-			"/api/admin/maintenance/pricing-sync": map[string]any{
-				"post": map[string]any{"summary": "Refresh managed pricing profiles from the public catalog"},
-			},
-			"/api/admin/openapi.json": map[string]any{
-				"get": map[string]any{"summary": "OpenAPI document"},
-			},
-		},
-	}
-}
-
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1800,14 +1685,6 @@ func readOptionalBoolValue(raw, field string) (*bool, error) {
 		return nil, fmt.Errorf("%s must be a boolean", field)
 	}
 	return &value, nil
-}
-
-func bearerToken(value string) string {
-	scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
-		return ""
-	}
-	return strings.TrimSpace(token)
 }
 
 type resourceError struct {

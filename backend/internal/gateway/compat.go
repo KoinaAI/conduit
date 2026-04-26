@@ -148,67 +148,6 @@ func cloneJSONMap(value map[string]any) map[string]any {
 	return cloned
 }
 
-func flattenAnthropicSystem(value any) string {
-	switch current := value.(type) {
-	case string:
-		return strings.TrimSpace(current)
-	case []any:
-		parts := make([]string, 0, len(current))
-		for _, item := range current {
-			if block, ok := item.(map[string]any); ok {
-				if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
-					parts = append(parts, strings.TrimSpace(text))
-				}
-			}
-		}
-		return strings.Join(parts, "\n\n")
-	default:
-		return ""
-	}
-}
-
-func flattenAnthropicContent(value any) string {
-	switch current := value.(type) {
-	case string:
-		return current
-	case []any:
-		parts := make([]string, 0, len(current))
-		for _, item := range current {
-			block, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if blockType, _ := block["type"].(string); blockType != "" && blockType != "text" {
-				continue
-			}
-			if text, ok := block["text"].(string); ok && text != "" {
-				parts = append(parts, text)
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
-		return ""
-	}
-}
-
-func flattenGeminiParts(value any) string {
-	items, ok := value.([]any)
-	if !ok {
-		return ""
-	}
-	parts := make([]string, 0, len(items))
-	for _, item := range items {
-		part, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		if text, ok := part["text"].(string); ok && strings.TrimSpace(text) != "" {
-			parts = append(parts, text)
-		}
-	}
-	return strings.Join(parts, "\n")
-}
-
 func (s *Service) writeProxyResponse(w http.ResponseWriter, resp *http.Response, observer *UsageObserver, exchange upstreamExchange, publicAlias string, transformers []model.RouteTransformer, candidate resolvedCandidate) error {
 	if exchange.ResponseMode == responseModePassthrough {
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {

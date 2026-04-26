@@ -66,13 +66,14 @@ func runStats(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	baseURL := fs.String("base-url", "http://127.0.0.1:8080", "Conduit base URL")
-	adminToken := fs.String("admin-token", "", "Admin token")
+	adminToken := fs.String("admin-token", "", "Admin token (defaults to GATEWAY_ADMIN_TOKEN)")
 	window := fs.String("window", "7d", "Stats window (today, 7d, 30d)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if strings.TrimSpace(*adminToken) == "" {
-		fmt.Fprintln(stderr, "--admin-token is required")
+	token := resolveAdminToken(*adminToken)
+	if token == "" {
+		fmt.Fprintln(stderr, "--admin-token is required (or set GATEWAY_ADMIN_TOKEN)")
 		return 2
 	}
 
@@ -81,7 +82,7 @@ func runStats(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "build stats request failed: %v\n", err)
 		return 1
 	}
-	req.Header.Set("X-Admin-Token", strings.TrimSpace(*adminToken))
+	req.Header.Set("X-Admin-Token", token)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -105,15 +106,16 @@ func runCreateKey(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("create-key", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	baseURL := fs.String("base-url", "http://127.0.0.1:8080", "Conduit base URL")
-	adminToken := fs.String("admin-token", "", "Admin token")
+	adminToken := fs.String("admin-token", "", "Admin token (defaults to GATEWAY_ADMIN_TOKEN)")
 	name := fs.String("name", "", "Gateway key name")
 	notes := fs.String("notes", "", "Gateway key notes")
 	models := fs.String("models", "", "Comma-separated allowed model aliases")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if strings.TrimSpace(*adminToken) == "" || strings.TrimSpace(*name) == "" {
-		fmt.Fprintln(stderr, "--admin-token and --name are required")
+	token := resolveAdminToken(*adminToken)
+	if token == "" || strings.TrimSpace(*name) == "" {
+		fmt.Fprintln(stderr, "--admin-token (or GATEWAY_ADMIN_TOKEN) and --name are required")
 		return 2
 	}
 
@@ -142,7 +144,7 @@ func runCreateKey(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Admin-Token", strings.TrimSpace(*adminToken))
+	req.Header.Set("X-Admin-Token", token)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -181,6 +183,17 @@ func runPrintEnv(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "export ANTHROPIC_BASE_URL=%q\n", base)
 	fmt.Fprintf(stdout, "export ANTHROPIC_API_KEY=%q\n", strings.TrimSpace(*apiKey))
 	return 0
+}
+
+// resolveAdminToken returns the first non-empty token from the explicit flag
+// or the GATEWAY_ADMIN_TOKEN environment variable, with surrounding whitespace
+// trimmed. Using the env var avoids leaking the token into shell history and
+// process listings.
+func resolveAdminToken(flagValue string) string {
+	if v := strings.TrimSpace(flagValue); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_TOKEN"))
 }
 
 func printUsage(w io.Writer) {

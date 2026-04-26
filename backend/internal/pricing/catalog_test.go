@@ -44,7 +44,7 @@ func TestFetchProfilesParsesModelsDevCatalog(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService(server.URL, server.Client())
+	service := NewService(server.URL, server.Client(), WithAllowPrivateSourceForTests())
 	profiles, err := service.FetchProfiles(context.Background())
 	if err != nil {
 		t.Fatalf("fetch profiles: %v", err)
@@ -138,7 +138,7 @@ func TestFetchProfilesRejectsOversizedCatalogResponses(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service := NewService(server.URL, server.Client())
+	service := NewService(server.URL, server.Client(), WithAllowPrivateSourceForTests())
 	_, err := service.FetchProfiles(context.Background())
 	if err == nil {
 		t.Fatalf("expected oversized catalog response to be rejected")

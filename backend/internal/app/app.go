@@ -37,6 +37,9 @@ func New(cfg config.Config) (*App, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if cfg.GatewaySecretBcryptCost > 0 {
+		model.SetGatewaySecretBcryptCost(cfg.GatewaySecretBcryptCost)
+	}
 	store, err := store.Open(cfg.StoreLocator(), store.WithRequestHistoryLimit(cfg.RequestHistory))
 	if err != nil {
 		return nil, err
@@ -55,10 +58,11 @@ func New(cfg config.Config) (*App, error) {
 		admin:       adminHandlers,
 		integration: integrationService,
 		gateway:     gatewayService,
-		scheduler: scheduler.New(
+		scheduler: scheduler.NewWithCheckinInterval(
 			adminHandlers,
 			time.Duration(cfg.ProbeIntervalSeconds)*time.Second,
 			pricingSyncInterval(cfg),
+			time.Duration(cfg.CheckinIntervalSeconds)*time.Second,
 		),
 		startedAt: time.Now().UTC(),
 	}, nil
@@ -70,51 +74,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", a.Healthz)
 
 	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("POST /api/admin/integrations/sync", a.admin.SyncAllIntegrations)
-	adminMux.HandleFunc("GET /api/admin/providers", a.admin.ListProviders)
-	adminMux.HandleFunc("POST /api/admin/providers", a.admin.CreateProvider)
-	adminMux.HandleFunc("GET /api/admin/providers/{id}", a.admin.GetProvider)
-	adminMux.HandleFunc("PUT /api/admin/providers/{id}", a.admin.UpdateProvider)
-	adminMux.HandleFunc("DELETE /api/admin/providers/{id}", a.admin.DeleteProvider)
-	adminMux.HandleFunc("GET /api/admin/routes", a.admin.ListRoutes)
-	adminMux.HandleFunc("POST /api/admin/routes", a.admin.CreateRoute)
-	adminMux.HandleFunc("GET /api/admin/routes/{alias}", a.admin.GetRoute)
-	adminMux.HandleFunc("PUT /api/admin/routes/{alias}", a.admin.UpdateRoute)
-	adminMux.HandleFunc("DELETE /api/admin/routes/{alias}", a.admin.DeleteRoute)
-	adminMux.HandleFunc("GET /api/admin/pricing-profiles", a.admin.ListPricingProfiles)
-	adminMux.HandleFunc("POST /api/admin/pricing-profiles", a.admin.CreatePricingProfile)
-	adminMux.HandleFunc("PUT /api/admin/pricing-profiles/{id}", a.admin.UpdatePricingProfile)
-	adminMux.HandleFunc("DELETE /api/admin/pricing-profiles/{id}", a.admin.DeletePricingProfile)
-	adminMux.HandleFunc("GET /api/admin/integrations", a.admin.ListIntegrations)
-	adminMux.HandleFunc("POST /api/admin/integrations", a.admin.CreateIntegration)
-	adminMux.HandleFunc("PUT /api/admin/integrations/{id}", a.admin.UpdateIntegration)
-	adminMux.HandleFunc("DELETE /api/admin/integrations/{id}", a.admin.DeleteIntegration)
-	adminMux.HandleFunc("POST /api/admin/integrations/{id}/sync", a.admin.SyncIntegration)
-	adminMux.HandleFunc("POST /api/admin/integrations/{id}/checkin", a.admin.CheckinIntegration)
-	adminMux.HandleFunc("GET /api/admin/gateway-keys", a.admin.ListGatewayKeys)
-	adminMux.HandleFunc("POST /api/admin/gateway-keys", a.admin.CreateGatewayKey)
-	adminMux.HandleFunc("PUT /api/admin/gateway-keys/{id}", a.admin.UpdateGatewayKey)
-	adminMux.HandleFunc("DELETE /api/admin/gateway-keys/{id}", a.admin.DeleteGatewayKey)
-	adminMux.HandleFunc("GET /api/admin/pricing-aliases", a.admin.GetPricingAliases)
-	adminMux.HandleFunc("PUT /api/admin/pricing-aliases", a.admin.UpdatePricingAliases)
-	adminMux.HandleFunc("GET /api/admin/request-history", a.admin.ListRequestHistory)
-	adminMux.HandleFunc("GET /api/admin/request-history/{id}", a.admin.GetRequestHistoryRecord)
-	adminMux.HandleFunc("GET /api/admin/request-history/{id}/attempts", a.admin.GetRequestAttempts)
-	adminMux.HandleFunc("GET /api/admin/runtime/sessions", a.admin.ListActiveSessions)
-	adminMux.HandleFunc("GET /api/admin/runtime/sticky-bindings", a.admin.GetStickyBindings)
-	adminMux.HandleFunc("POST /api/admin/runtime/sticky-bindings/reset", a.admin.ResetStickyBindings)
-	adminMux.HandleFunc("GET /api/admin/runtime/provider-usage", a.admin.GetProviderUsage)
-	adminMux.HandleFunc("GET /api/admin/runtime/circuits", a.admin.GetCircuitStatus)
-	adminMux.HandleFunc("POST /api/admin/runtime/circuits/reset", a.admin.ResetCircuits)
-	adminMux.HandleFunc("GET /api/admin/stats/summary", a.admin.GetStatsSummary)
-	adminMux.HandleFunc("GET /api/admin/stats/by-key", a.admin.GetStatsByGatewayKey)
-	adminMux.HandleFunc("GET /api/admin/stats/by-provider", a.admin.GetStatsByProvider)
-	adminMux.HandleFunc("GET /api/admin/stats/by-model", a.admin.GetStatsByModel)
-	adminMux.HandleFunc("GET /api/admin/meta", a.admin.GetMeta)
-	adminMux.HandleFunc("GET /api/admin/openapi.json", a.admin.OpenAPI)
-	adminMux.HandleFunc("POST /api/admin/maintenance/checkins", a.admin.CheckinAllIntegrations)
-	adminMux.HandleFunc("POST /api/admin/maintenance/probes", a.admin.ProbeAllProviders)
-	adminMux.HandleFunc("POST /api/admin/maintenance/pricing-sync", a.admin.SyncPricingCatalog)
+	admin.RegisterRoutes(adminMux, a.admin)
 	mux.Handle("/api/admin/", withCORS(
 		a.admin.Middleware(adminMux),
 		a.cfg,

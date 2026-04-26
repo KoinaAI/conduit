@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+// RouteSpec describes a single admin endpoint. The same registry drives HTTP
+// route registration and OpenAPI document generation so the two cannot drift.
 type RouteSpec struct {
 	Method      string
 	Pattern     string
@@ -60,13 +62,15 @@ var adminRouteSpecs = []RouteSpec{
 	{Method: http.MethodPost, Pattern: "/api/admin/maintenance/pricing-sync", Summary: "Refresh managed pricing profiles from the public catalog", HandlerName: "SyncPricingCatalog"},
 }
 
+// RouteSpecs returns a copy of the admin route registry.
 func RouteSpecs() []RouteSpec {
 	return append([]RouteSpec(nil), adminRouteSpecs...)
 }
 
+// RegisterRoutes wires every entry in the admin route registry to the supplied
+// mux. The registry is also the source of truth for the OpenAPI document.
 func RegisterRoutes(mux *http.ServeMux, handlers *Handlers) {
 	for _, spec := range adminRouteSpecs {
-		spec := spec
 		handler := adminRouteHandler(spec.HandlerName)
 		mux.HandleFunc(spec.Method+" "+spec.Pattern, func(w http.ResponseWriter, r *http.Request) {
 			handler(handlers, w, r)

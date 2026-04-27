@@ -193,7 +193,7 @@ func TestAcquireGatewayKeyEnforcesRollingBudgets(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			runtime := newRuntimeState()
-			runtime.keyWindows[tc.key.ID] = &gatewayKeyWindow{SpendEvents: tc.events}
+			runtime.keyWindows[tc.key.ID] = &gatewayKeyWindow{Spend: newGatewaySpendLedger(now, tc.events)}
 			if err := runtime.acquireGatewayKey(tc.key, now); !errors.Is(err, tc.want) {
 				t.Fatalf("expected %v, got %v", tc.want, err)
 			}
@@ -213,8 +213,9 @@ func TestReleaseGatewayKeyAppendsRollingSpendEvent(t *testing.T) {
 	if window.InFlight != 0 {
 		t.Fatalf("expected in-flight counter to be decremented, got %+v", window)
 	}
-	if len(window.SpendEvents) != 1 || window.SpendEvents[0].CostUSD != 1.25 {
-		t.Fatalf("expected rolling spend event to be recorded, got %+v", window.SpendEvents)
+	events := window.Spend.Events()
+	if len(events) != 1 || events[0].CostUSD != 1.25 {
+		t.Fatalf("expected rolling spend event to be recorded, got %+v", events)
 	}
 }
 
@@ -275,7 +276,7 @@ func TestAcquireProviderEnforcesRollingBudgets(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			runtime := newRuntimeState()
-			runtime.providerWindows[tc.key] = &gatewayKeyWindow{SpendEvents: tc.events}
+			runtime.providerWindows[tc.key] = &gatewayKeyWindow{Spend: newGatewaySpendLedger(now, tc.events)}
 			if err := runtime.acquireProvider(tc.limits, now); !errors.Is(err, tc.want) {
 				t.Fatalf("expected %v, got %v", tc.want, err)
 			}
@@ -295,8 +296,9 @@ func TestReleaseProviderAppendsRollingSpendEvent(t *testing.T) {
 	if window.InFlight != 0 {
 		t.Fatalf("expected in-flight counter to be decremented, got %+v", window)
 	}
-	if len(window.SpendEvents) != 1 || window.SpendEvents[0].CostUSD != 1.25 {
-		t.Fatalf("expected rolling spend event to be recorded, got %+v", window.SpendEvents)
+	events := window.Spend.Events()
+	if len(events) != 1 || events[0].CostUSD != 1.25 {
+		t.Fatalf("expected rolling spend event to be recorded, got %+v", events)
 	}
 }
 
@@ -406,9 +408,9 @@ func TestRuntimeSweepRemovesIdleGatewayAndProviderWindows(t *testing.T) {
 	}
 	runtime.keyWindows["budget-key"] = &gatewayKeyWindow{
 		MinuteBucket: now.Add(-time.Minute),
-		SpendEvents: []gatewaySpendEvent{
+		Spend: newGatewaySpendLedger(now, []gatewaySpendEvent{
 			{At: now.Add(-time.Hour), CostUSD: 1},
-		},
+		}),
 	}
 
 	runtime.mu.Lock()

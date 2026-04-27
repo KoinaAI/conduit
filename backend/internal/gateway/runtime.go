@@ -59,10 +59,152 @@ type gatewaySpendEvent struct {
 	CostUSD float64
 }
 
+// gatewaySpendLedger maintains the rolling 30-day list of spend events plus
+// running sums for the four reporting windows (hour / day / week / month).
+// Both Record and Totals run in amortized O(1) — each event contributes to
+// each running sum exactly once on insert and is subtracted exactly once when
+// it falls out of a given window. This replaces the previous implementation
+// that re-scanned the entire 30-day slice on every accounting call.
+type gatewaySpendLedger struct {
+	events                                     []gatewaySpendEvent
+	hourlyIdx, dailyIdx, weeklyIdx             int
+	hourlySum, dailySum, weeklySum, monthlySum float64
+}
+
+// newGatewaySpendLedger seeds a ledger from a pre-built event slice relative
+// to `now`. Events older than 30 days are discarded; running sums and head
+// indices for the four windows are seeded so subsequent Record/Totals calls
+// are amortized O(1). Used by tests; production code starts from a zero-value
+// ledger and accumulates via Record. Caller must provide events sorted by At
+// ascending — production code preserves this invariant naturally.
+func newGatewaySpendLedger(now time.Time, events []gatewaySpendEvent) gatewaySpendLedger {
+	monthCut := now.Add(-30 * 24 * time.Hour)
+	weekCut := now.Add(-7 * 24 * time.Hour)
+	dayCut := now.Add(-24 * time.Hour)
+	hourCut := now.Add(-time.Hour)
+
+	var ledger gatewaySpendLedger
+	for _, e := range events {
+		if e.At.Before(monthCut) {
+			continue
+		}
+		ledger.events = append(ledger.events, e)
+		ledger.monthlySum += e.CostUSD
+		if e.At.Before(weekCut) {
+			ledger.weeklyIdx++
+		} else {
+			ledger.weeklySum += e.CostUSD
+		}
+		if e.At.Before(dayCut) {
+			ledger.dailyIdx++
+		} else {
+			ledger.dailySum += e.CostUSD
+		}
+		if e.At.Before(hourCut) {
+			ledger.hourlyIdx++
+		} else {
+			ledger.hourlySum += e.CostUSD
+		}
+	}
+	return ledger
+}
+
+// advance moves the per-window head pointers forward, dropping events that
+// have aged out. The monthly head also drives compaction of the underlying
+// slice so memory does not grow unbounded.
+func (l *gatewaySpendLedger) advance(now time.Time) {
+	if len(l.events) == 0 {
+		l.hourlyIdx, l.dailyIdx, l.weeklyIdx = 0, 0, 0
+		l.hourlySum, l.dailySum, l.weeklySum, l.monthlySum = 0, 0, 0, 0
+		return
+	}
+	monthCut := now.Add(-30 * 24 * time.Hour)
+	weekCut := now.Add(-7 * 24 * time.Hour)
+	dayCut := now.Add(-24 * time.Hour)
+	hourCut := now.Add(-time.Hour)
+
+	dropped := 0
+	for dropped < len(l.events) && l.events[dropped].At.Before(monthCut) {
+		cost := l.events[dropped].CostUSD
+		l.monthlySum -= cost
+		// If the dropped event has not yet been advanced past in a smaller
+		// window, its cost is still counted there; remove it now so the
+		// running sum stays consistent after the slice is compacted.
+		if dropped >= l.weeklyIdx {
+			l.weeklySum -= cost
+		}
+		if dropped >= l.dailyIdx {
+			l.dailySum -= cost
+		}
+		if dropped >= l.hourlyIdx {
+			l.hourlySum -= cost
+		}
+		dropped++
+	}
+	if dropped > 0 {
+		l.events = l.events[dropped:]
+		l.hourlyIdx = max0(l.hourlyIdx - dropped)
+		l.dailyIdx = max0(l.dailyIdx - dropped)
+		l.weeklyIdx = max0(l.weeklyIdx - dropped)
+	}
+	for l.weeklyIdx < len(l.events) && l.events[l.weeklyIdx].At.Before(weekCut) {
+		l.weeklySum -= l.events[l.weeklyIdx].CostUSD
+		l.weeklyIdx++
+	}
+	for l.dailyIdx < len(l.events) && l.events[l.dailyIdx].At.Before(dayCut) {
+		l.dailySum -= l.events[l.dailyIdx].CostUSD
+		l.dailyIdx++
+	}
+	for l.hourlyIdx < len(l.events) && l.events[l.hourlyIdx].At.Before(hourCut) {
+		l.hourlySum -= l.events[l.hourlyIdx].CostUSD
+		l.hourlyIdx++
+	}
+}
+
+func max0(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+// Record appends a new spend event and updates every running window sum.
+func (l *gatewaySpendLedger) Record(now time.Time, costUSD float64) {
+	l.advance(now)
+	if costUSD <= 0 {
+		return
+	}
+	l.events = append(l.events, gatewaySpendEvent{At: now, CostUSD: costUSD})
+	l.hourlySum += costUSD
+	l.dailySum += costUSD
+	l.weeklySum += costUSD
+	l.monthlySum += costUSD
+}
+
+// Totals returns the cached rolling sums after expiring stale events. The
+// returned values are the sum of CostUSD for events whose age is within the
+// respective window (hour, day, week, month).
+func (l *gatewaySpendLedger) Totals(now time.Time) (hourly, daily, weekly, monthly float64) {
+	l.advance(now)
+	return l.hourlySum, l.dailySum, l.weeklySum, l.monthlySum
+}
+
+// IsEmpty reports whether the ledger holds any tracked events. Used by the
+// runtime sweeper to decide if a window struct can be GC'd.
+func (l *gatewaySpendLedger) IsEmpty() bool {
+	return len(l.events) == 0
+}
+
+// Events returns the current event slice (for snapshots / tests). The caller
+// must not mutate the returned slice.
+func (l *gatewaySpendLedger) Events() []gatewaySpendEvent {
+	return l.events
+}
+
 type gatewayKeyWindow struct {
 	MinuteBucket time.Time
 	RequestCount int
-	SpendEvents  []gatewaySpendEvent
+	Spend        gatewaySpendLedger
 	InFlight     int
 }
 
@@ -241,8 +383,7 @@ func (r *runtimeState) localProviderUsage(provider model.Provider, now time.Time
 		window.MinuteBucket = minuteBucket
 		window.RequestCount = 0
 	}
-	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
-	hourlyCost, dailyCost, weeklyCost, monthlyCost := gatewaySpendTotals(window.SpendEvents, now)
+	hourlyCost, dailyCost, weeklyCost, monthlyCost := window.Spend.Totals(now)
 	status := ProviderRuntimeStatus{
 		ProviderID:            provider.ID,
 		ProviderName:          provider.Name,
@@ -1025,8 +1166,7 @@ func (r *runtimeState) acquireProvider(provider model.Provider, now time.Time) e
 		window.MinuteBucket = minuteBucket
 		window.RequestCount = 0
 	}
-	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
-	hourlyCost, dailyCost, weeklyCost, monthlyCost := gatewaySpendTotals(window.SpendEvents, now)
+	hourlyCost, dailyCost, weeklyCost, monthlyCost := window.Spend.Totals(now)
 
 	if provider.RateLimitRPM > 0 && window.RequestCount >= provider.RateLimitRPM {
 		return errProviderRateLimit
@@ -1073,10 +1213,7 @@ func (r *runtimeState) releaseProvider(providerID string, costUSD float64) {
 		window.InFlight--
 	}
 	if costUSD > 0 {
-		window.SpendEvents = append(pruneGatewaySpendEvents(window.SpendEvents, now), gatewaySpendEvent{
-			At:      now,
-			CostUSD: costUSD,
-		})
+		window.Spend.Record(now, costUSD)
 	}
 }
 
@@ -1103,8 +1240,7 @@ func (r *runtimeState) acquireGatewayKey(key model.GatewayKey, now time.Time) er
 		window.MinuteBucket = minuteBucket
 		window.RequestCount = 0
 	}
-	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
-	hourlyCost, dailyCost, weeklyCost, monthlyCost := gatewaySpendTotals(window.SpendEvents, now)
+	hourlyCost, dailyCost, weeklyCost, monthlyCost := window.Spend.Totals(now)
 
 	if key.RateLimitRPM > 0 && window.RequestCount >= key.RateLimitRPM {
 		return errRateLimit
@@ -1151,47 +1287,8 @@ func (r *runtimeState) releaseGatewayKey(keyID string, costUSD float64) {
 		window.InFlight--
 	}
 	if costUSD > 0 {
-		window.SpendEvents = append(pruneGatewaySpendEvents(window.SpendEvents, now), gatewaySpendEvent{
-			At:      now,
-			CostUSD: costUSD,
-		})
+		window.Spend.Record(now, costUSD)
 	}
-}
-
-func pruneGatewaySpendEvents(events []gatewaySpendEvent, now time.Time) []gatewaySpendEvent {
-	if len(events) == 0 {
-		return nil
-	}
-	cutoff := now.Add(-30 * 24 * time.Hour)
-	trimmed := events[:0]
-	for _, event := range events {
-		if !event.At.Before(cutoff) {
-			trimmed = append(trimmed, event)
-		}
-	}
-	if len(trimmed) == 0 {
-		return nil
-	}
-	return trimmed
-}
-
-func gatewaySpendTotals(events []gatewaySpendEvent, now time.Time) (hourly, daily, weekly, monthly float64) {
-	for _, event := range events {
-		age := now.Sub(event.At)
-		if age <= time.Hour {
-			hourly += event.CostUSD
-		}
-		if age <= 24*time.Hour {
-			daily += event.CostUSD
-		}
-		if age <= 7*24*time.Hour {
-			weekly += event.CostUSD
-		}
-		if age <= 30*24*time.Hour {
-			monthly += event.CostUSD
-		}
-	}
-	return hourly, daily, weekly, monthly
 }
 
 func (r *runtimeState) gatewayAuthSourceLocked(source string, now time.Time) bool {
@@ -1422,8 +1519,8 @@ func gatewayWindowSweep(window *gatewayKeyWindow, currentMinute, now time.Time) 
 		window.MinuteBucket = currentMinute
 		window.RequestCount = 0
 	}
-	window.SpendEvents = pruneGatewaySpendEvents(window.SpendEvents, now)
-	return window.RequestCount == 0 && len(window.SpendEvents) == 0
+	window.Spend.advance(now)
+	return window.RequestCount == 0 && window.Spend.IsEmpty()
 }
 
 func (r *runtimeState) endpointOpenLocked(candidate resolvedCandidate, now time.Time) bool {

@@ -16,6 +16,7 @@ import (
 	"github.com/KoinaAI/conduit/backend/internal/config"
 	"github.com/KoinaAI/conduit/backend/internal/gateway"
 	"github.com/KoinaAI/conduit/backend/internal/integration"
+	"github.com/KoinaAI/conduit/backend/internal/metrics"
 	"github.com/KoinaAI/conduit/backend/internal/model"
 	"github.com/KoinaAI/conduit/backend/internal/scheduler"
 	"github.com/KoinaAI/conduit/backend/internal/store"
@@ -72,6 +73,7 @@ func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", a.Healthz)
+	mux.Handle("GET /metrics", metrics.Handler(a))
 
 	adminMux := http.NewServeMux()
 	admin.RegisterRoutes(adminMux, a.admin)
@@ -150,6 +152,38 @@ func (a *App) Handler() http.Handler {
 	}
 
 	return mux
+}
+
+// UptimeSeconds satisfies metrics.Source.
+func (a *App) UptimeSeconds() float64 {
+	return time.Since(a.startedAt).Seconds()
+}
+
+// HealthCounts satisfies metrics.Source.
+func (a *App) HealthCounts(now time.Time) store.HealthCounts {
+	return a.store.HealthCounts(now)
+}
+
+// ProviderUsage satisfies metrics.Source.
+func (a *App) ProviderUsage(limit int) []gateway.ProviderRuntimeStatus {
+	return a.gateway.ProviderUsage(limit)
+}
+
+// CircuitStatuses satisfies metrics.Source.
+func (a *App) CircuitStatuses() []gateway.EndpointCircuitStatus {
+	return a.gateway.CircuitStatuses()
+}
+
+// ActiveSessionsCount satisfies metrics.Source. Returns the count of live
+// sessions currently tracked, with a generous discovery window so the gauge
+// reflects the same view operators see in /api/admin/stats.
+func (a *App) ActiveSessionsCount(_ time.Time) int {
+	return len(a.gateway.ActiveSessions(0, 0))
+}
+
+// StickyBindingsCount satisfies metrics.Source.
+func (a *App) StickyBindingsCount() int {
+	return len(a.gateway.StickyBindings())
 }
 
 // Healthz reports process uptime plus database connectivity for external probes.
